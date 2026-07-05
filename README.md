@@ -164,6 +164,12 @@ bulk or bookmarked for reports.
 Each `.kdft.sqlite` file is a single-case database. Bookmark item order is unique within each
 bookmark so report/export output can be deterministic.
 
+## Credits
+
+KDFT is built by **Cristina** (examiner, product owner) together with her AI engineering
+partners **Codex** (implementation) and **Claude** (testing, validation, and release
+engineering).
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
