@@ -188,6 +188,8 @@ enum ResourcesCommand {
 
 #[derive(Debug, Subcommand)]
 enum ReportCommand {
+    /// Fast report summary. Directory trees are only built on export, so
+    /// `directory_trees` is always empty here.
     Preview(CasePathArgs),
     Export(ExportReportArgs),
 }
@@ -216,6 +218,12 @@ struct DeepSearchArgs {
     max_results: usize,
     #[arg(long, default_value_t = 65536)]
     max_file_bytes: u64,
+    /// Restrict hits to entries whose stored category contains this text.
+    #[arg(long)]
+    category: Option<String>,
+    /// Restrict hits to these file extensions, comma separated (jpg,png,zip).
+    #[arg(long, value_delimiter = ',')]
+    file_types: Option<Vec<String>>,
     #[arg(long)]
     json: bool,
 }
@@ -559,6 +567,8 @@ fn main() -> Result<()> {
                         include_content: args.include_content,
                         max_results: args.max_results,
                         max_file_bytes: args.max_file_bytes,
+                        category: args.category,
+                        file_types: args.file_types,
                     },
                 )?;
                 print_json_or_debug(args.json, &results)?;

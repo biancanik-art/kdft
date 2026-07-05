@@ -181,6 +181,9 @@ struct DeepSearchRequest {
     include_content: Option<bool>,
     max_results: Option<usize>,
     max_file_bytes: Option<u64>,
+    category: Option<String>,
+    /// Comma-separated extensions, e.g. "jpg,png,zip".
+    file_types: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -367,6 +370,15 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
             },
             Err(err) => json_error(400, &format!("{err:#}")),
         },
+        ("GET", "/api/image/raw") => match api_image_raw(&query) {
+            Ok((content_type, body)) => HttpResponse {
+                status: 200,
+                reason: "OK",
+                content_type,
+                body,
+            },
+            Err(err) => json_error(400, &format!("{err:#}")),
+        },
         ("POST", "/api/case/create") => api_response(api_create_case(&request.body)),
         ("POST", "/api/evidence/add") => api_response(api_add_evidence(&request.body)),
         ("POST", "/api/evidence/remove") => api_response(api_remove_evidence(&request.body)),
@@ -513,6 +525,29 @@ fn api_entry_raw(query: &HashMap<String, String>) -> Result<(&'static str, Vec<u
     let content_type = detect_image_content_type(&data.bytes)
         .context("entry does not start with a supported image signature")?;
     Ok((content_type, data.bytes))
+}
+
+/// Live-browse variant of /api/entry/raw: decode one file straight from an
+/// attached disk image volume and serve it as an image. Same signature
+/// sniffing as the indexed endpoint, so it cannot dump arbitrary bytes.
+fn api_image_raw(query: &HashMap<String, String>) -> Result<(&'static str, Vec<u8>)> {
+    let image_path = evidence_image_path(query)?;
+    let volume_index: usize = query
+        .get("volume")
+        .context("volume query parameter is required")?
+        .parse()
+        .context("volume must be an integer")?;
+    let path = query
+        .get("path")
+        .context("path query parameter is required")?;
+    let length = query_usize(query, "length")?
+        .unwrap_or(RAW_PREVIEW_MAX_BYTES)
+        .min(RAW_PREVIEW_MAX_BYTES);
+    let (bytes, _total_size) =
+        kdft_case::read_image_directory_bytes(&image_path, volume_index, path, 0, length)?;
+    let content_type = detect_image_content_type(&bytes)
+        .context("live file does not start with a supported image signature")?;
+    Ok((content_type, bytes))
 }
 
 fn detect_image_content_type(bytes: &[u8]) -> Option<&'static str> {
@@ -1058,6 +1093,18 @@ fn api_deep_search(body: &[u8]) -> Result<Vec<kdft_case::DeepSearchResult>> {
             include_content: request.include_content.unwrap_or(true),
             max_results: request.max_results.unwrap_or(50),
             max_file_bytes: request.max_file_bytes.unwrap_or(64 * 1024),
+            category: request.category.filter(|value| !value.trim().is_empty()),
+            file_types: request
+                .file_types
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|list| !list.is_empty()),
         },
     )
 }
@@ -2982,7 +3029,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       <section id="evidenceView" class="view">
         <div class="grid-2">
           <section class="panel">
-            <div class="panel-head"><h2>Add Evidence</h2><span class="pill good">Process now</span></div>
+            <div class="panel-head"><h2>Add Evidence</h2><span class="pill good">Read File System</span></div>
             <div class="panel-body form-grid">
               <div class="evidence-type-row" id="evidenceTypeRow">
                 <button class="evidence-type active" data-type="image" title="E01, dd/raw, VHD/VHDX, VMDK, VDI disk images">Disk image</button>
@@ -2996,7 +3043,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button id="browseEvidence" class="secondary">Browse&hellip;</button>
               </div>
               <div class="row" id="fsOptionsRow">
-                <label>Processing<select id="readFileSystem"><option value="true">process now</option><option value="false">attach only</option></select></label>
+                <label>Read File System<select id="readFileSystem"><option value="true">yes &mdash; index now (bounded)</option><option value="false">no &mdash; attach only</option></select></label>
               </div>
               <div class="row" id="historyOptionsRow" hidden>
                 <label>Max visits<input id="historyMaxVisits" type="number" min="1" value="5000"></label>
@@ -3107,6 +3154,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <label>Max results<input id="maxResults" type="number" min="1" value="50"></label>
               </div>
               <label>Max file bytes<input id="maxFileBytes" type="number" min="1" value="65536"></label>
+              <div class="row">
+                <label>Category scope<input id="searchCategory" placeholder="e.g. Email, Pictures, Recovery"></label>
+                <label>File types<input id="searchFileTypes" placeholder="jpg,png,zip"></label>
+              </div>
+              <p class="muted tiny">Prefix the query with <strong>hex:</strong> for byte-pattern search (e.g. hex:FF D8 FF); hits report byte offsets. Scopes restrict hits to matching stored categories or file extensions.</p>
               <button id="runSearch">Run Search</button>
             </div>
           </section>
@@ -4078,7 +4130,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           evidence_id: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
           include_content: $("includeContent").value === "true",
           max_results: numberValue("maxResults", 50),
-          max_file_bytes: numberValue("maxFileBytes", 65536)
+          max_file_bytes: numberValue("maxFileBytes", 65536),
+          category: $("searchCategory").value || null,
+          file_types: $("searchFileTypes").value || null
         });
         state.selectedSearchIndexes = new Set();
         renderSearchResults();
@@ -4452,12 +4506,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
         .map((row) => [row.id, row.entries_indexed]));
       const sampleCounts = evidenceEntryCounts(data.entries);
       const rows = data.evidence.map((item) => {
-        const indexed = item.indexed_at
-          ? escapeHtml(item.indexed_at)
-          : '<span class="pill warn">attached, not processed</span>';
         const entryCount = reportCounts.has(item.id)
           ? reportCounts.get(item.id)
           : (sampleCounts.get(item.id) || 0);
+        const indexed = item.indexed_at
+          ? escapeHtml(item.indexed_at)
+          : evidenceProcessingStatusHtml(item, entryCount);
         return `
           <tr>
             <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span></td>
@@ -4476,6 +4530,28 @@ const INDEX_HTML: &str = r###"<!doctype html>
         counts.set(entry.evidence_id, (counts.get(entry.evidence_id) || 0) + 1);
       });
       return counts;
+    }
+
+    function evidenceIndexedEntryCount(evidenceId) {
+      if (!state.data) {
+        return 0;
+      }
+      const reportRow = (state.data.report && state.data.report.evidence || [])
+        .find((row) => row.id === evidenceId);
+      if (reportRow) {
+        return Number(reportRow.entries_indexed) || 0;
+      }
+      return evidenceEntryCounts(state.data.entries).get(evidenceId) || 0;
+    }
+
+    function evidenceProcessingStatusHtml(item, entryCount = evidenceIndexedEntryCount(item.id)) {
+      if (item.indexed_at) {
+        return '<span class="pill good">indexed</span>';
+      }
+      if (item.read_file_system_requested && (Number(entryCount) > 0 || item.last_job_status === "truncated")) {
+        return '<span class="pill warn">partially indexed</span>';
+      }
+      return '<span class="pill warn">attached</span>';
     }
 
     function renderDashboardArtifactCategories(data) {
@@ -4564,10 +4640,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         <tr>
           <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span>${item.sha256_hex ? `<br><span class="muted tiny" title="SHA-256 computed ${escapeAttr(item.hashed_at || "")}">SHA-256: ${escapeHtml(item.sha256_hex)}</span>` : ""}</td>
           <td><span class="pill">${escapeHtml(item.source_kind)}</span></td>
-          <td>${item.indexed_at ? '<span class="pill good">indexed</span>' : '<span class="pill warn">attached</span>'}${item.sha256_hex ? ' <span class="pill good">hashed</span>' : ""}</td>
+          <td>${evidenceProcessingStatusHtml(item)}${item.sha256_hex ? ' <span class="pill good">hashed</span>' : ""}</td>
           <td class="actions">
             <div class="toolbar">
               <button class="secondary" onclick="selectEvidenceSource(${item.id}, preferredAnalysisPath(${item.id}))">Browse</button>
+              ${item.source_kind === "image" ? `<button class="secondary" onclick="liveBrowseEvidence(${item.id})" title="Read the file system straight from the image - no indexing">Live browse</button>` : ""}
               ${processActionHtml(item)}
               ${item.source_kind === "folder" || item.source_kind === "browser_history" ? "" : `<button class="ghost" onclick="hashEvidence(${item.id})">${item.sha256_hex ? "Re-hash" : "Hash"}</button>`}
               ${item.source_kind === "image" ? `<button class="ghost" onclick="carveEvidence(${item.id})">Carve</button>` : ""}
@@ -4669,6 +4746,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return volume + "|" + path;
     }
 
+    // Evidence-row shortcut: jump straight into live browse for one image
+    // source (attach-only evidence needs no indexing to be examined).
+    async function liveBrowseEvidence(id) {
+      if (state.live.active) {
+        state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+      }
+      selectEvidenceSource(id);
+      await toggleLiveBrowse();
+    }
+
     async function toggleLiveBrowse() {
       const evidence = selectedEvidenceSource();
       if (state.live.active) {
@@ -4736,7 +4823,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     async function openLiveFile(volume, path, name) {
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       state.hex.live = { evidenceId: state.live.evidenceId, volume: volume, path: path, name: name };
-      $("viewerMode").value = "hex";
+      // Pictures open straight into Details so the inspector shows the image;
+      // everything else keeps the hex-first flow.
+      const image = isImageEntry(currentHexEntry());
+      $("viewerMode").value = image ? "metadata" : "hex";
       $("hexOffset").value = "0";
       await fetchEntryBytes();
       setInspectorCollapsed(false);
@@ -5156,6 +5246,34 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderIndexedBrowse();
     }
 
+    // Restores a stored selected_path (fullscreen/query restore) in lazy
+    // indexed browse: loads and expands every ancestor folder so the tree
+    // opens down to the selection. The synthetic containers are collapsed
+    // out of the tree, so they are skipped rather than loaded.
+    async function idxRestorePath(path) {
+      await idxLoadDir("/");
+      const target = normalizeLogicalPath(path || "/");
+      if (target === "/") {
+        return;
+      }
+      const synthetic = new Set(["/Image Analysis", "/Image Analysis/Volumes", "/Image Analysis/Partitions"]);
+      const segments = target.split("/").filter(Boolean);
+      let current = "";
+      for (const segment of segments) {
+        current += "/" + segment;
+        if (synthetic.has(current)) {
+          continue;
+        }
+        try {
+          await idxLoadDir(current);
+        } catch (err) {
+          return;
+        }
+        state.idx.expanded.add(current);
+        state.idx.selPath = current;
+      }
+    }
+
     function idxChildPath(parent, name) {
       return parent === "/" ? "/" + name : parent + "/" + name;
     }
@@ -5253,7 +5371,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           $("filesystemTree").innerHTML = empty("Loading directory tree...");
           $("entryTable").innerHTML = empty("Loading...");
           renderTreeModeControls();
-          idxLoadDir("/").then(renderIndexedBrowse).catch((err) => setNotice(err.message, true));
+          idxRestorePath(state.browserState.selectedPath).then(renderIndexedBrowse).catch((err) => setNotice(err.message, true));
           renderHexViewer();
           return;
         }
@@ -5335,7 +5453,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const bookmark = evidenceIndex >= 0
         ? `<button class="ghost" onclick="bookmarkEvidence(${evidenceIndex})">Bookmark</button>`
         : "";
-      const status = evidence.indexed_at ? '<span class="pill good">indexed</span>' : '<span class="pill warn">attached</span>';
+      const status = evidenceProcessingStatusHtml(evidence);
       const rows = `
         <tr class="entry-row">
           <td><strong>${escapeHtml(evidence.display_name)}</strong><br><span class="muted tiny">${escapeHtml(evidence.source_path)}</span></td>
@@ -5573,6 +5691,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function entryRawUrl(entry) {
+      const meta = entry && entry.metadata_json;
+      if (entry && entry.id == null && meta && meta.source === "live_browse") {
+        return "/api/image/raw?case_path=" + encodeURIComponent(currentCasePath())
+          + "&evidence_id=" + entry.evidence_id
+          + "&volume=" + meta.volume
+          + "&path=" + encodeURIComponent(meta.image_path);
+      }
       return "/api/entry/raw?case_path=" + encodeURIComponent(currentCasePath()) + "&entry_id=" + entry.id;
     }
 
@@ -6697,6 +6822,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return {
           id: null,
           entry_kind: "file",
+          evidence_id: state.hex.live.evidenceId,
           name: state.hex.live.name,
           logical_path: "[vol " + state.hex.live.volume + "] " + state.hex.live.path,
           metadata_json: { source: "live_browse", volume: state.hex.live.volume, image_path: state.hex.live.path }

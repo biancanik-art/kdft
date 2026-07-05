@@ -1,17 +1,25 @@
 ﻿# Kristiee's Digital Forensic Tool v1
 
 This is the professional rewrite base for Kristiee's Digital Forensic Tool (KDFT): a
-local-only digital forensic workbench for attaching evidence, browsing file systems inside
-disk images, deep searching, bookmarking, and reporting.
+**cross-platform** (Windows, macOS, Linux), local-only digital forensic workbench for
+attaching evidence, browsing file systems inside disk images, deep searching (text and
+hex byte patterns), bookmarking, and reporting. One small self-contained executable per
+platform - no installer, no runtime dependencies.
 
 A versioned user manual (with per-release changes and bug-fix notes) will follow in a later
 release.
 
-## Download And Run (Windows)
+## Download And Run
 
-Grab `kdft-ui.exe` from the latest
-[GitHub release](https://github.com/biancanik-art/kdft/releases) and run it — no installer,
-no dependencies:
+Every [GitHub release](https://github.com/biancanik-art/kdft/releases) ships ready-made
+builds for all three operating systems:
+
+- **Windows x64** — `kdft-vX.Y.Z-windows-x64.zip` (or the standalone `kdft-ui.exe`)
+- **macOS** — `kdft-vX.Y.Z-macos-arm64.tar.gz` (Apple Silicon) or `-macos-x64.tar.gz`
+  (Intel); first launch: right-click `kdft-ui` and choose Open (unsigned binary)
+- **Linux x64** — `kdft-vX.Y.Z-linux-x64.tar.gz`
+
+On Windows, grab `kdft-ui.exe` and run it — no installer, no dependencies:
 
 ```powershell
 .\kdft-ui.exe --port 8780 --open

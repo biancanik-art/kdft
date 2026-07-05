@@ -89,7 +89,7 @@ pub struct EvidenceSource {
     pub attached_at: String,
     pub indexed_at: Option<String>,
     pub notes: Option<String>,
-    /// Status of the most recent indexing job ("completed", "truncated", ...),
+    /// Status of the most recent indexing/import job ("completed", "truncated", ...),
     /// so the UI can distinguish empty folders from not-yet-indexed ones.
     pub last_job_status: Option<String>,
     /// SHA-256 of the evidence source (decoded stream for disk images),
@@ -154,11 +154,19 @@ pub struct ProcessEvidenceResult {
 
 #[derive(Debug, Clone)]
 pub struct DeepSearchOptions {
+    /// Text to search for. A `hex:` prefix switches to byte-pattern mode
+    /// (e.g. `hex:FF D8 FF`), which scans indexed file content and reports
+    /// byte offsets.
     pub query: String,
     pub evidence_id: Option<i64>,
     pub include_content: bool,
     pub max_results: usize,
     pub max_file_bytes: u64,
+    /// Restrict hits to entries whose stored category fields contain this text,
+    /// case-insensitive. Examiner-added categories match the same way.
+    pub category: Option<String>,
+    /// Restrict hits to these file extensions (without the dot).
+    pub file_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -727,6 +735,7 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
                 e.indexed_at, e.notes,
                 (SELECT j.status FROM evidence_jobs j
                  WHERE j.case_id = e.case_id AND j.evidence_id = e.id
+                   AND j.job_type IN ('filesystem_index', 'browser_history_import')
                  ORDER BY j.id DESC LIMIT 1),
                 e.sha256_hex, e.hashed_at
          FROM evidence_sources e
@@ -1658,11 +1667,30 @@ pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<D
     let max_results = options.max_results.clamp(1, 1_000);
     let max_file_bytes = options.max_file_bytes.clamp(1, 10 * 1024 * 1024);
     let query_lower = query.to_ascii_lowercase();
+    let scope = SearchScope::new(options.category.as_deref(), options.file_types.as_deref())?;
 
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     if let Some(evidence_id) = options.evidence_id {
         ensure_evidence_source(&conn, case_id, evidence_id)?;
+    }
+
+    // Byte-pattern mode: `hex:FF D8 FF` scans indexed content and reports
+    // byte offsets. Path/metadata text search does not apply to raw bytes.
+    if let Some(pattern_text) = strip_hex_query_prefix(query) {
+        let needle = parse_hex_pattern(pattern_text)?;
+        let mut results = Vec::new();
+        content_hex_search_results(
+            &conn,
+            case_id,
+            options.evidence_id,
+            &needle,
+            max_file_bytes,
+            max_results,
+            &scope,
+            &mut results,
+        )?;
+        return Ok(results);
     }
 
     let mut results = path_search_results(
@@ -1672,6 +1700,7 @@ pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<D
         query,
         &query_lower,
         max_results,
+        &scope,
     )?;
     if options.include_content && results.len() < max_results {
         content_search_results(
@@ -1681,10 +1710,105 @@ pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<D
             query,
             max_file_bytes,
             max_results,
+            &scope,
             &mut results,
         )?;
     }
     Ok(results)
+}
+
+/// Category/file-type restriction for Deep Search, compiled once into an SQL
+/// clause so LIMIT-bounded queries never drop in-scope hits behind
+/// out-of-scope rows.
+struct SearchScope {
+    sql_clause: String,
+}
+
+impl SearchScope {
+    fn new(category: Option<&str>, file_types: Option<&[String]>) -> Result<Self> {
+        let mut sql_clause = String::new();
+        if let Some(category) = category.map(str::trim).filter(|value| !value.is_empty()) {
+            let literal = category.to_ascii_lowercase().replace('\'', "''");
+            sql_clause.push_str(&format!(
+                " AND instr(lower(\
+                 coalesce(json_extract(fe.metadata_json,'$.category_main'),'') || ' ' || \
+                 coalesce(json_extract(fe.metadata_json,'$.category_sub'),'') || ' ' || \
+                 coalesce(json_extract(fe.metadata_json,'$.category_detail'),'') || ' ' || \
+                 coalesce(json_extract(fe.metadata_json,'$.analysis_category'),'') || ' ' || \
+                 coalesce(json_extract(fe.metadata_json,'$.category_tags'),'')\
+                ), '{literal}') > 0"
+            ));
+        }
+        if let Some(types) = file_types {
+            let mut likes = Vec::new();
+            for raw in types {
+                let ext = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+                if ext.is_empty() {
+                    continue;
+                }
+                if !ext
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
+                {
+                    bail!("file type filter contains unsupported characters: {raw}");
+                }
+                likes.push(format!("lower(fe.name) LIKE '%.{ext}'"));
+            }
+            if !likes.is_empty() {
+                sql_clause.push_str(&format!(" AND ({})", likes.join(" OR ")));
+            }
+        }
+        Ok(Self { sql_clause })
+    }
+}
+
+fn strip_hex_query_prefix(query: &str) -> Option<&str> {
+    let (prefix, rest) = query.split_at_checked(4)?;
+    prefix.eq_ignore_ascii_case("hex:").then_some(rest)
+}
+
+/// Parses `FF D8 FF`, `ff,d8,ff`, `0xFFD8FF`, `FF-D8-FF` style byte patterns.
+fn parse_hex_pattern(text: &str) -> Result<Vec<u8>> {
+    let cleaned = text.replace("0x", "").replace("0X", "");
+    let cleaned: String = cleaned
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, ',' | '-' | ':'))
+        .collect();
+    if cleaned.is_empty() {
+        bail!("hex search needs at least one byte, e.g. hex:FF D8 FF");
+    }
+    if !cleaned.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("hex pattern may only contain hex digits and space/comma/dash separators");
+    }
+    if cleaned.len() % 2 != 0 {
+        bail!("hex pattern must contain whole bytes (an even number of hex digits)");
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&cleaned[index..index + 2], 16).context("parsing hex byte"))
+        .collect()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn hex_match_preview(bytes: &[u8], offset: usize, length: usize) -> String {
+    let start = offset.saturating_sub(8);
+    let end = offset
+        .saturating_add(length)
+        .saturating_add(8)
+        .min(bytes.len());
+    bytes[start..end]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn list_filesystem_entries(
@@ -1722,6 +1846,11 @@ const INDEXED_DIR_SCAN_LIMIT: usize = 400_000;
 /// Lists the immediate children of `dir_path` for one evidence source directly
 /// from the case database. Handles both real entries and folders that exist
 /// only implicitly in descendant paths (e.g. the synthetic image containers).
+///
+/// Old-Ecase display model: an image device reads as device -> volume ->
+/// folders, so the indexer's synthetic `/Image Analysis[/Volumes|/Partitions]`
+/// containers are collapsed out of the root listing. Children keep their real
+/// `logical_path`, so navigation, bookmarks, and deeper listings are unchanged.
 pub fn list_indexed_directory(
     case_path: &Path,
     evidence_id: i64,
@@ -1731,7 +1860,53 @@ pub fn list_indexed_directory(
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     ensure_evidence_source(&conn, case_id, evidence_id)?;
+    let mut dir = list_indexed_directory_inner(&conn, case_id, evidence_id, dir_path, limit)?;
 
+    let is_root = dir_path.trim().trim_end_matches('/').is_empty();
+    let synthetic_root = dir
+        .children
+        .iter()
+        .position(|child| child.is_dir && child.logical_path == "/Image Analysis");
+    if let (true, Some(index)) = (is_root, synthetic_root) {
+        dir.children.remove(index);
+        let inner =
+            list_indexed_directory_inner(&conn, case_id, evidence_id, "/Image Analysis", limit)?;
+        dir.truncated |= inner.truncated;
+        for child in inner.children {
+            let is_container = child.is_dir
+                && (child.logical_path == "/Image Analysis/Volumes"
+                    || child.logical_path == "/Image Analysis/Partitions");
+            if is_container {
+                let nested = list_indexed_directory_inner(
+                    &conn,
+                    case_id,
+                    evidence_id,
+                    &child.logical_path,
+                    limit,
+                )?;
+                dir.truncated |= nested.truncated;
+                dir.children
+                    .extend(nested.children.into_iter().map(hoisted_indexed_child));
+            } else {
+                dir.children.push(hoisted_indexed_child(child));
+            }
+        }
+        sort_indexed_children(&mut dir.children);
+        if dir.children.len() > limit {
+            dir.children.truncate(limit);
+            dir.truncated = true;
+        }
+    }
+    Ok(dir)
+}
+
+fn list_indexed_directory_inner(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    dir_path: &str,
+    limit: usize,
+) -> Result<IndexedDirectory> {
     let trimmed = dir_path.trim().trim_end_matches('/');
     let normalized = if trimmed.is_empty() {
         "/".to_string()
@@ -1825,15 +2000,7 @@ pub fn list_indexed_directory(
     }
 
     let mut children: Vec<IndexedChild> = children.into_values().collect();
-    children.sort_by(|left, right| {
-        (right.is_dir as u8)
-            .cmp(&(left.is_dir as u8))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-    });
+    sort_indexed_children(&mut children);
     if children.len() > limit {
         children.truncate(limit);
         truncated = true;
@@ -1870,6 +2037,30 @@ pub fn list_indexed_directory(
         children,
         truncated,
     })
+}
+
+// Children hoisted from the synthetic containers take their path basename as
+// the display name; the stored names ("part0" for both a volume and its
+// partition record) collide once they share the device root.
+fn hoisted_indexed_child(mut child: IndexedChild) -> IndexedChild {
+    if let Some(segment) = child.logical_path.rsplit('/').next() {
+        if !segment.is_empty() {
+            child.name = segment.to_string();
+        }
+    }
+    child
+}
+
+fn sort_indexed_children(children: &mut [IndexedChild]) {
+    children.sort_by(|left, right| {
+        (right.is_dir as u8)
+            .cmp(&(left.is_dir as u8))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
 }
 
 fn escape_like(value: &str) -> String {
@@ -2505,6 +2696,21 @@ pub fn report_data_with_directory_structure(
                 .filter(|part| !part.is_empty())
                 .map(str::to_string)
                 .collect();
+            // Old-Ecase display model: strip the indexer's synthetic
+            // containers so report trees read device -> volume -> folders.
+            if parts.first().map(String::as_str) == Some("Image Analysis") {
+                parts.remove(0);
+                if matches!(
+                    parts.first().map(String::as_str),
+                    Some("Volumes") | Some("Partitions")
+                ) {
+                    parts.remove(0);
+                }
+                // The container folders themselves collapse away entirely.
+                if parts.is_empty() {
+                    continue;
+                }
+            }
             if parts.is_empty() {
                 parts.push(name);
             }
@@ -4538,7 +4744,9 @@ fn classify_entry(
     }
     if ext_in(
         ext.as_deref(),
-        &["pst", "ost", "eml", "msg", "mbox", "olm", "dbx", "nsf"],
+        &[
+            "pst", "ost", "nst", "eml", "msg", "mbox", "olm", "dbx", "nsf",
+        ],
     ) {
         return category(
             "Email and Communications",
@@ -4940,7 +5148,10 @@ fn insert_optional_string(
 }
 
 fn is_email_store_extension(ext: &str) -> bool {
-    matches!(ext, "pst" | "ost" | "msg" | "mbox" | "olm" | "dbx" | "nsf")
+    matches!(
+        ext,
+        "pst" | "ost" | "nst" | "msg" | "mbox" | "olm" | "dbx" | "nsf"
+    )
 }
 
 fn is_text_rfc822_email_candidate(ext: &str, logical_path: &str, name: &str) -> bool {
@@ -6088,9 +6299,18 @@ pub fn read_image_directory_bytes(
                 .with_context(|| format!("opening FAT file {relative}"))?;
             let total = file.seek(SeekFrom::End(0))?;
             file.seek(SeekFrom::Start(offset))?;
+            // fatfs returns at most one cluster per read call; fill the whole
+            // window or the request truncates at ~4 KiB.
             let mut buffer = vec![0_u8; length];
-            let read = file.read(&mut buffer)?;
-            buffer.truncate(read);
+            let mut filled = 0_usize;
+            while filled < buffer.len() {
+                let read = file.read(&mut buffer[filled..])?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            buffer.truncate(filled);
             Ok((buffer, total))
         }
         "NTFS" => {
@@ -9799,8 +10019,9 @@ fn path_search_results(
     query: &str,
     query_lower: &str,
     max_results: usize,
+    scope: &SearchScope,
 ) -> Result<Vec<DeepSearchResult>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.metadata_json
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
@@ -9809,10 +10030,11 @@ fn path_search_results(
                 instr(lower(fe.logical_path), ?3) > 0
                 OR instr(lower(fe.name), ?3) > 0
                 OR instr(lower(fe.metadata_json), ?3) > 0
-           )
+           ){}
          ORDER BY fe.evidence_id, fe.logical_path, fe.id
          LIMIT ?4",
-    )?;
+        scope.sql_clause
+    ))?;
     let rows = stmt.query_map(
         params![case_id, evidence_id, query_lower, max_results as i64],
         |row| {
@@ -9891,21 +10113,23 @@ fn content_search_results(
     query: &str,
     max_file_bytes: u64,
     max_results: usize,
+    scope: &SearchScope,
     results: &mut Vec<DeepSearchResult>,
 ) -> Result<()> {
     const CONTENT_SEARCH_MAX_FILES: usize = 100_000;
     // Content Deep Search is an index lookup over the first CONTENT_INDEX_BYTES of each processed
     // non-media file. Matches beyond that window, media files, and entries from existing cases that
     // have not been reprocessed are not indexed and therefore keep content_head NULL.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.content_head
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
-           AND fe.entry_kind = 'file'
+           AND fe.entry_kind = 'file'{}
          ORDER BY fe.evidence_id, fe.logical_path, fe.id
          LIMIT ?3",
-    )?;
+        scope.sql_clause
+    ))?;
     let rows = stmt.query_map(
         params![case_id, evidence_id, CONTENT_SEARCH_MAX_FILES as i64],
         |row| {
@@ -9942,6 +10166,74 @@ fn content_search_results(
                 hit,
                 results,
             );
+        }
+    }
+    Ok(())
+}
+
+/// Byte-pattern Deep Search over the same indexed content windows the text
+/// content search uses. Reports the byte offset and length of each match.
+#[allow(clippy::too_many_arguments)]
+fn content_hex_search_results(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    needle: &[u8],
+    max_file_bytes: u64,
+    max_results: usize,
+    scope: &SearchScope,
+    results: &mut Vec<DeepSearchResult>,
+) -> Result<()> {
+    const CONTENT_SEARCH_MAX_FILES: usize = 100_000;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.content_head
+         FROM filesystem_entries fe
+         WHERE fe.case_id = ?1
+           AND (?2 IS NULL OR fe.evidence_id = ?2)
+           AND fe.entry_kind = 'file'
+           AND fe.content_head IS NOT NULL{}
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id
+         LIMIT ?3",
+        scope.sql_clause
+    ))?;
+    let rows = stmt.query_map(
+        params![case_id, evidence_id, CONTENT_SEARCH_MAX_FILES as i64],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        if results.len() >= max_results {
+            break;
+        }
+        let (entry_id, evidence_id, logical_path, display_name, entry_kind, content_head) =
+            row.context("reading hex search candidate")?;
+        let Some(content_head) = content_head else {
+            continue;
+        };
+        let read_len = usize::try_from(max_file_bytes)
+            .unwrap_or(usize::MAX)
+            .min(content_head.len());
+        let bytes = &content_head[..read_len];
+        if let Some(offset) = find_bytes(bytes, needle) {
+            results.push(DeepSearchResult {
+                evidence_id,
+                entry_id,
+                logical_path,
+                display_name,
+                entry_kind,
+                match_kind: "content".to_string(),
+                selection_offset: Some(offset as i64),
+                selection_length: Some(needle.len() as i64),
+                data_preview: Some(hex_match_preview(bytes, offset, needle.len())),
+            });
         }
     }
     Ok(())
@@ -11135,6 +11427,27 @@ fn bookmark_item_from_raw(raw: RawBookmarkItem) -> Result<BookmarkItem> {
     })
 }
 
+/// Report display form of an entry path: the indexer's synthetic containers
+/// are stripped so paths read volume-first (old-Ecase device -> volume view).
+/// Stored logical paths are never rewritten; this is display-only.
+fn display_entry_path(path: &str) -> String {
+    for prefix in [
+        "/Image Analysis/Volumes",
+        "/Image Analysis/Partitions",
+        "/Image Analysis",
+    ] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            if rest.is_empty() {
+                return "/".to_string();
+            }
+            if rest.starts_with('/') {
+                return rest.to_string();
+            }
+        }
+    }
+    path.to_string()
+}
+
 fn render_report_items_html(html: &mut String, items: &[BookmarkItem]) {
     if items.is_empty() {
         html.push_str("<p class=\"meta\">No bookmark items.</p>");
@@ -11148,7 +11461,9 @@ fn render_report_items_html(html: &mut String, items: &[BookmarkItem]) {
         html.push_str("</td><td>");
         html.push_str(&escape_html(item.display_name.as_deref().unwrap_or("")));
         html.push_str("</td><td>");
-        html.push_str(&escape_html(item.logical_path.as_deref().unwrap_or("")));
+        html.push_str(&escape_html(&display_entry_path(
+            item.logical_path.as_deref().unwrap_or(""),
+        )));
         html.push_str("</td><td>");
         if let Some(offset) = item.selection_offset {
             html.push_str("offset ");
@@ -11224,8 +11539,18 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
         return;
     }
     html.push_str("<pre>");
+    let mut item_ref_value = item.item_ref_json.clone();
+    if let Some(object) = item_ref_value.as_object_mut() {
+        for key in ["logical_path", "path", "relative_path"] {
+            if let Some(value) = object.get_mut(key) {
+                if let Some(text) = value.as_str() {
+                    *value = serde_json::Value::String(display_entry_path(text));
+                }
+            }
+        }
+    }
     let item_ref =
-        serde_json::to_string_pretty(&item.item_ref_json).unwrap_or_else(|_| "{}".to_string());
+        serde_json::to_string_pretty(&item_ref_value).unwrap_or_else(|_| "{}".to_string());
     html.push_str(&escape_html(&item_ref));
     html.push_str("</pre>");
 }
@@ -11242,7 +11567,19 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
         return false;
     }
     html.push_str("<dl class=\"activity-details\"><dt>Artifact</dt><dd>Forensic Finding</dd>");
-    push_activity_detail(html, item_ref, "Path", &["logical_path", "relative_path"]);
+    if let Some(path) = item_ref
+        .get("logical_path")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            item_ref
+                .get("relative_path")
+                .and_then(|value| value.as_str())
+        })
+    {
+        html.push_str("<dt>Path</dt><dd>");
+        html.push_str(&escape_html(&display_entry_path(path)));
+        html.push_str("</dd>");
+    }
     push_activity_detail(html, item_ref, "Extension", &["file_extension"]);
     push_activity_detail(html, item_ref, "Detected Type", &["detected_signature"]);
     push_activity_detail(html, item_ref, "Signature Status", &["signature_status"]);
@@ -11355,7 +11692,14 @@ fn render_email_details_html(html: &mut String, item_ref: &serde_json::Value) ->
     push_activity_detail(html, item_ref, "In Reply To", &["email_in_reply_to"]);
     push_activity_detail(html, item_ref, "Body Preview", &["email_body_preview"]);
     push_activity_detail(html, item_ref, "Parser Error", &["email_parser_error"]);
-    push_activity_detail(html, item_ref, "Path", &["logical_path"]);
+    if let Some(path) = item_ref
+        .get("logical_path")
+        .and_then(|value| value.as_str())
+    {
+        html.push_str("<dt>Path</dt><dd>");
+        html.push_str(&escape_html(&display_entry_path(path)));
+        html.push_str("</dd>");
+    }
     html.push_str("</dl>");
     true
 }
@@ -13028,6 +13372,214 @@ mod tests {
     }
 
     #[test]
+    fn deep_search_hex_pattern_and_scoped_filters() -> Result<()> {
+        let case_path = unique_case_path("deep-hex");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("deep-hex-source");
+        let image_path = evidence_dir.join("fat-disk.img");
+        create_test_fat_mbr_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Byte-pattern mode: "FAT ev" = 46 41 54 20 65 76 at offset 0 of note.txt.
+        let base = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: String::new(),
+            evidence_id: None,
+            include_content: true,
+            max_results: 50,
+            max_file_bytes: 65_536,
+        };
+        let hex_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "hex:46 41 54 20 65 76".to_string(),
+                ..base.clone()
+            },
+        )?;
+        let hit = hex_hits
+            .iter()
+            .find(|hit| hit.logical_path.ends_with("/DFIR/note.txt"))
+            .expect("hex pattern should hit note.txt content");
+        assert_eq!(hit.match_kind, "content");
+        assert_eq!(hit.selection_offset, Some(0));
+        assert_eq!(hit.selection_length, Some(6));
+        assert!(hit
+            .data_preview
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("46 41 54"));
+
+        // File-type scope: txt keeps the hit, jpg excludes it.
+        let txt_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "artifact".to_string(),
+                file_types: Some(vec!["txt".to_string()]),
+                ..base.clone()
+            },
+        )?;
+        assert!(txt_hits
+            .iter()
+            .any(|hit| hit.logical_path.ends_with("/DFIR/note.txt")));
+        let jpg_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "artifact".to_string(),
+                file_types: Some(vec!["jpg".to_string()]),
+                ..base.clone()
+            },
+        )?;
+        assert!(!jpg_hits
+            .iter()
+            .any(|hit| hit.logical_path.ends_with("/DFIR/note.txt")));
+
+        // Category scope: the entry's own stored main category and subcategory both match, while
+        // a bogus one excludes.
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let note = entries
+            .iter()
+            .find(|entry| entry.logical_path.ends_with("/DFIR/note.txt"))
+            .expect("note.txt entry");
+        let stored_category = note.metadata_json["category_main"]
+            .as_str()
+            .expect("stored category_main")
+            .to_string();
+        let scoped = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "artifact".to_string(),
+                category: Some(stored_category),
+                ..base.clone()
+            },
+        )?;
+        assert!(scoped
+            .iter()
+            .any(|hit| hit.logical_path.ends_with("/DFIR/note.txt")));
+        let stored_subcategory = note.metadata_json["category_sub"]
+            .as_str()
+            .expect("stored category_sub")
+            .to_string();
+        let subcategory_scoped = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "artifact".to_string(),
+                category: Some(stored_subcategory),
+                ..base.clone()
+            },
+        )?;
+        assert!(subcategory_scoped
+            .iter()
+            .any(|hit| hit.logical_path.ends_with("/DFIR/note.txt")));
+        let excluded = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "artifact".to_string(),
+                category: Some("no-such-category".to_string()),
+                ..base
+            },
+        )?;
+        assert!(excluded.is_empty());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_directory_root_collapses_synthetic_image_containers() -> Result<()> {
+        let case_path = unique_case_path("idx-collapse");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("idx-collapse-source");
+        let image_path = evidence_dir.join("fat-disk.img");
+        create_test_fat_mbr_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        let root = list_indexed_directory(&case_path, evidence_id, "/", 1000)?;
+        assert!(
+            !root
+                .children
+                .iter()
+                .any(|child| child.name == "Image Analysis"),
+            "root listing must not expose the synthetic Image Analysis container"
+        );
+        let volume = root
+            .children
+            .iter()
+            .find(|child| child.logical_path == "/Image Analysis/Volumes/001-part0")
+            .expect("volume folder should surface at the device root");
+        assert!(volume.is_dir);
+        assert!(root.children.iter().any(|child| {
+            child.logical_path == "/Image Analysis/Container.record" && !child.is_dir
+        }));
+        let volume_children = list_indexed_directory(
+            &case_path,
+            evidence_id,
+            "/Image Analysis/Volumes/001-part0",
+            1000,
+        )?;
+        assert!(volume_children
+            .children
+            .iter()
+            .any(|child| child.name == "DFIR" && child.is_dir));
+
+        // Report directory trees collapse the same synthetic containers.
+        let report = report_data_with_directory_structure(&case_path, 1000)?;
+        let tree = report
+            .directory_trees
+            .iter()
+            .find(|tree| tree.evidence_id == evidence_id)
+            .expect("image evidence should have a report tree");
+        assert!(
+            !tree
+                .lines
+                .iter()
+                .any(|line| line.name == "Image Analysis" || line.name == "Volumes"),
+            "report tree must not contain synthetic containers"
+        );
+        let volume_line = tree
+            .lines
+            .iter()
+            .find(|line| line.name == "001-part0")
+            .expect("volume folder should be a report tree root");
+        assert_eq!(volume_line.depth, 0);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn image_process_indexes_fat_partition_entries() -> Result<()> {
         let case_path = unique_case_path("image-fat");
         create_test_case(&case_path)?;
@@ -13110,6 +13662,8 @@ mod tests {
         let content_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "FAT evidence artifact".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14225,6 +14779,8 @@ mod tests {
         let path_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "history.txt".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: false,
@@ -14237,6 +14793,8 @@ mod tests {
         let content_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "keyword".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14299,6 +14857,8 @@ mod tests {
         let hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "deep search token".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14372,6 +14932,8 @@ mod tests {
         let large_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "visiblenameinlargebinary".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14390,6 +14952,8 @@ mod tests {
         let utf16_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "utf16 secret".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14410,6 +14974,8 @@ mod tests {
         let odd_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "classifiedsecret".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14430,6 +14996,8 @@ mod tests {
         let hex_hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "hex:DE AD BE EF".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14488,6 +15056,8 @@ mod tests {
         let hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "needle-beyond-old-cap".to_string(),
                 evidence_id: Some(evidence_id),
                 include_content: true,
@@ -14722,6 +15292,8 @@ mod tests {
         let hits = deep_search(
             &case_path,
             DeepSearchOptions {
+                category: None,
+                file_types: None,
                 query: "example.com/path".to_string(),
                 evidence_id: Some(imported.evidence_id),
                 include_content: false,
