@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release -p kdft-ui -p kdft-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item target/release/kdft-ui.exe, target/release/kdft.exe, README.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "kdft-$tag-windows-x64.zip"
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release create "$tag" --verify-tag --title "KDFT $tag" \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            || true
+          gh release upload "$tag" "kdft-$tag-windows-x64.zip" target/release/kdft-ui.exe target/release/kdft.exe --clobber
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release -p kdft-ui -p kdft-cli
+      - name: Package
+        run: |
+          tag="${{ github.ref_name }}"
+          mkdir -p pkg
+          cp target/release/kdft-ui target/release/kdft README.md LICENSE pkg/
+          tar -czf "kdft-$tag-linux-x64.tar.gz" -C pkg kdft-ui kdft README.md LICENSE
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release create "$tag" --verify-tag --title "KDFT $tag" \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            || true
+          gh release upload "$tag" "kdft-$tag-linux-x64.tar.gz" --clobber
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (Apple Silicon and Intel)
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release -p kdft-ui -p kdft-cli
+          cargo build --release --target x86_64-apple-darwin -p kdft-ui -p kdft-cli
+      - name: Package
+        run: |
+          tag="${{ github.ref_name }}"
+          mkdir -p pkg-arm64 pkg-x64
+          cp target/release/kdft-ui target/release/kdft README.md LICENSE pkg-arm64/
+          cp target/x86_64-apple-darwin/release/kdft-ui target/x86_64-apple-darwin/release/kdft README.md LICENSE pkg-x64/
+          tar -czf "kdft-$tag-macos-arm64.tar.gz" -C pkg-arm64 kdft-ui kdft README.md LICENSE
+          tar -czf "kdft-$tag-macos-x64.tar.gz" -C pkg-x64 kdft-ui kdft README.md LICENSE
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release create "$tag" --verify-tag --title "KDFT $tag" \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            || true
+          gh release upload "$tag" "kdft-$tag-macos-arm64.tar.gz" "kdft-$tag-macos-x64.tar.gz" --clobber
