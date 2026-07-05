@@ -1,0 +1,19 @@
+﻿[package]
+name = "kdft-case"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+disk-forensic.workspace = true
+ext4-view.workspace = true
+fatfs.workspace = true
+ntfs.workspace = true
+positioned-io2.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+vdi.workspace = true

@@ -1,0 +1,39 @@
+target/
+demo-output/
+ui-output/
+
+# Examiner output and case data must never reach the repository.
+cases/
+evidence/
+exports/
+recovered/
+*.kdft.sqlite
+*.kdft1.sqlite
+
+# Forensic images and containers.
+*.E01
+*.Ex01
+*.L01
+*.raw
+*.dd
+*.vhd
+*.vhdx
+*.vmdk
+*.vdi
+*.aff4
+
+# Local documents, notes, manuals, instructions, references, and agent
+# working dialogue stay off the repository. Only README.md is published.
+docs/
+notes/
+dist/
+CLAUDE.md
+AGENT_NOTES.md
+RESUME_STATE.md
+*.md
+!README.md
+*.pdf
+*.doc
+*.docx
+*.rtf
+*.log
