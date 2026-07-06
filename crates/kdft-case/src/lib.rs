@@ -1528,39 +1528,55 @@ pub fn import_chromium_history(
     case_path: &Path,
     options: ImportBrowserHistoryOptions,
 ) -> Result<BrowserHistoryImportResult> {
+    import_browser_history(case_path, options)
+}
+
+pub fn import_browser_history(
+    case_path: &Path,
+    options: ImportBrowserHistoryOptions,
+) -> Result<BrowserHistoryImportResult> {
     if options.max_visits == 0 {
         bail!("max_visits must be greater than zero");
     }
     let max_visits = options.max_visits.min(100_000);
-    let profile_paths = chromium_profile_paths(&options.history_path)?;
-    let source_metadata = fs::metadata(&profile_paths.history_path).with_context(|| {
+    let family = detect_browser_family(&options.history_path)?;
+    let import_data = match family {
+        BrowserFamily::Chromium => {
+            collect_chromium_history_import(&options.history_path, max_visits)?
+        }
+        BrowserFamily::Firefox => {
+            collect_firefox_history_import(&options.history_path, max_visits)?
+        }
+        BrowserFamily::Safari => collect_safari_history_import(&options.history_path, max_visits)?,
+    };
+    persist_browser_history_import(case_path, options.evidence_name, import_data)
+}
+
+fn persist_browser_history_import(
+    case_path: &Path,
+    evidence_name: Option<String>,
+    import_data: BrowserHistoryImportData,
+) -> Result<BrowserHistoryImportResult> {
+    let source_metadata = fs::metadata(&import_data.primary_db_path).with_context(|| {
         format!(
             "reading history database {}",
-            profile_paths.history_path.display()
+            import_data.primary_db_path.display()
         )
     })?;
-    let source_path = stable_path_string(&profile_paths.profile_dir);
-    let display_name = trim_optional_string(options.evidence_name)
-        .unwrap_or_else(|| default_history_display_name(&profile_paths.profile_dir));
-    let history_rows = read_chromium_history_rows(&profile_paths.history_path, max_visits)?;
-    let visit_records =
-        browser_history_visit_records(&history_rows.rows, &profile_paths.history_path);
-    let bookmark_records = read_chromium_bookmark_records(&profile_paths.bookmarks_path)?;
-    let preference_records = read_chromium_preference_records(&profile_paths.preferences_path)?;
-    let url_records = read_chromium_url_records(&profile_paths.history_path, max_visits);
-    let search_records = read_chromium_search_records(&profile_paths.history_path, max_visits);
-    let download_records = read_chromium_download_records(&profile_paths.history_path, max_visits);
-    let login_records = read_chromium_login_records(&profile_paths.profile_dir, max_visits);
-    let cookie_records = read_chromium_cookie_records(&profile_paths.profile_dir, max_visits);
-    let truncated = history_rows.total_visits > history_rows.rows.len();
-    let entries_indexed = visit_records.len()
-        + bookmark_records.len()
-        + preference_records.len()
-        + url_records.len()
-        + search_records.len()
-        + download_records.len()
-        + login_records.len()
-        + cookie_records.len();
+    let display_name = trim_optional_string(evidence_name)
+        .unwrap_or_else(|| import_data.default_display_name.clone());
+    let truncated = import_data.total_visits > import_data.visit_records.len();
+    let entries_indexed = import_data.visit_records.len()
+        + import_data.bookmark_records.len()
+        + import_data.preference_records.len()
+        + import_data.url_records.len()
+        + import_data.search_records.len()
+        + import_data.download_records.len()
+        + import_data.login_records.len()
+        + import_data.cookie_records.len();
+    let visits_indexed = import_data.visit_records.len();
+    let bookmarks_indexed = import_data.bookmark_records.len();
+    let preferences_indexed = import_data.preference_records.len();
 
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
@@ -1569,23 +1585,15 @@ pub fn import_chromium_history(
     let evidence_id = upsert_browser_history_evidence(
         &tx,
         case_id,
-        &source_path,
+        &import_data.source_path,
         &display_name,
+        import_data.family,
         i64::try_from(source_metadata.len()).context("history database size exceeds i64")?,
     )?;
-    let parameters_json = serde_json::json!({
-        "history_path": source_path,
-        "profile_dir": profile_paths.profile_dir.to_string_lossy(),
-        "history_db": profile_paths.history_path.to_string_lossy(),
-        "bookmarks_file": profile_paths.bookmarks_path.to_string_lossy(),
-        "preferences_file": profile_paths.preferences_path.to_string_lossy(),
-        "max_visits": max_visits
-    })
-    .to_string();
     tx.execute(
         "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
          VALUES (?1, ?2, 'browser_history_import', 'running', ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![case_id, evidence_id, parameters_json],
+        params![case_id, evidence_id, import_data.parameters_json],
     )?;
     let job_id = tx.last_insert_rowid();
 
@@ -1593,15 +1601,16 @@ pub fn import_chromium_history(
         "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
         params![case_id, evidence_id],
     )?;
-    for record in visit_records
+    for record in import_data
+        .visit_records
         .iter()
-        .chain(bookmark_records.iter())
-        .chain(preference_records.iter())
-        .chain(url_records.iter())
-        .chain(search_records.iter())
-        .chain(download_records.iter())
-        .chain(login_records.iter())
-        .chain(cookie_records.iter())
+        .chain(import_data.bookmark_records.iter())
+        .chain(import_data.preference_records.iter())
+        .chain(import_data.url_records.iter())
+        .chain(import_data.search_records.iter())
+        .chain(import_data.download_records.iter())
+        .chain(import_data.login_records.iter())
+        .chain(import_data.cookie_records.iter())
     {
         upsert_filesystem_entry(
             &tx,
@@ -1641,7 +1650,7 @@ pub fn import_chromium_history(
             evidence_id,
             entries_indexed as i64,
             if truncated { 1 } else { 0 },
-            source_path,
+            import_data.source_path,
         ],
     )?;
     tx.commit()?;
@@ -1649,11 +1658,11 @@ pub fn import_chromium_history(
     Ok(BrowserHistoryImportResult {
         evidence_id,
         job_id,
-        source_path,
+        source_path: import_data.source_path,
         entries_indexed,
-        visits_indexed: visit_records.len(),
-        bookmarks_indexed: bookmark_records.len(),
-        preferences_indexed: preference_records.len(),
+        visits_indexed,
+        bookmarks_indexed,
+        preferences_indexed,
         truncated,
         status: status.to_string(),
     })
@@ -3109,12 +3118,68 @@ struct ChromiumProfilePaths {
     preferences_path: PathBuf,
 }
 
+struct FirefoxProfilePaths {
+    profile_dir: PathBuf,
+    places_path: PathBuf,
+    formhistory_path: PathBuf,
+    cookies_path: PathBuf,
+    logins_path: PathBuf,
+}
+
+struct SafariProfilePaths {
+    profile_dir: PathBuf,
+    history_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserFamily {
+    Chromium,
+    Firefox,
+    Safari,
+}
+
+impl BrowserFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chromium => "chromium",
+            Self::Firefox => "firefox",
+            Self::Safari => "safari",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chromium => "Chromium",
+            Self::Firefox => "Firefox",
+            Self::Safari => "Safari",
+        }
+    }
+}
+
+struct BrowserHistoryImportData {
+    family: BrowserFamily,
+    source_path: String,
+    primary_db_path: PathBuf,
+    default_display_name: String,
+    parameters_json: String,
+    visit_records: Vec<BrowserActivityRecord>,
+    bookmark_records: Vec<BrowserActivityRecord>,
+    preference_records: Vec<BrowserActivityRecord>,
+    url_records: Vec<BrowserActivityRecord>,
+    search_records: Vec<BrowserActivityRecord>,
+    download_records: Vec<BrowserActivityRecord>,
+    login_records: Vec<BrowserActivityRecord>,
+    cookie_records: Vec<BrowserActivityRecord>,
+    total_visits: usize,
+}
+
 struct BrowserActivityRecord {
     logical_path: String,
     display_name: String,
     metadata_json: String,
 }
 
+#[derive(Default)]
 struct ChromiumHistoryRows {
     rows: Vec<ChromiumHistoryRow>,
     total_visits: usize,
@@ -3151,6 +3216,86 @@ impl ChromiumHistoryRow {
         format!(
             "/Browser Activities/Visits/{}/{}-{}.record",
             host, self.visit_time, self.visit_id
+        )
+    }
+}
+
+#[derive(Default)]
+struct FirefoxHistoryRows {
+    rows: Vec<FirefoxHistoryRow>,
+    total_visits: usize,
+}
+
+struct FirefoxHistoryRow {
+    visit_id: i64,
+    place_id: i64,
+    url: String,
+    title: Option<String>,
+    visit_date: Option<i64>,
+    visit_type: Option<i64>,
+    visit_count: Option<i64>,
+    typed: Option<i64>,
+    last_visit_date: Option<i64>,
+    frecency: Option<i64>,
+}
+
+impl FirefoxHistoryRow {
+    fn display_name(&self) -> String {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.url)
+            .chars()
+            .take(180)
+            .collect()
+    }
+
+    fn logical_path(&self) -> String {
+        let host = sanitize_logical_segment(&host_from_url(&self.url));
+        format!(
+            "/Browser Activities/Visits/{}/{}-{}.record",
+            host,
+            self.visit_date.unwrap_or_default(),
+            self.visit_id
+        )
+    }
+}
+
+#[derive(Default)]
+struct SafariHistoryRows {
+    rows: Vec<SafariHistoryRow>,
+    total_visits: usize,
+}
+
+struct SafariHistoryRow {
+    visit_id: i64,
+    history_item_id: i64,
+    url: String,
+    title: Option<String>,
+    visit_time: Option<f64>,
+    visit_count: Option<i64>,
+    domain_expansion: Option<String>,
+}
+
+impl SafariHistoryRow {
+    fn display_name(&self) -> String {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.url)
+            .chars()
+            .take(180)
+            .collect()
+    }
+
+    fn logical_path(&self) -> String {
+        let host = sanitize_logical_segment(&host_from_url(&self.url));
+        let visit_time = self.visit_time.unwrap_or_default();
+        format!(
+            "/Browser Activities/Visits/{}/{}-{}.record",
+            host, visit_time, self.visit_id
         )
     }
 }
@@ -3386,6 +3531,173 @@ fn open_sqlite_copy_read_only(path: &Path) -> Result<(Connection, TempFileGuard)
     let conn = Connection::open_with_flags(&guard.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening browser database copy {}", guard.path.display()))?;
     Ok((conn, guard))
+}
+
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type IN ('table', 'view') AND name = ?1
+            LIMIT 1
+        )",
+        params![table_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .context("checking SQLite schema table")
+}
+
+fn sqlite_column_exists(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
+    let escaped = table_name.replace('\'', "''");
+    let pragma = format!("PRAGMA table_info('{escaped}')");
+    let mut stmt = conn.prepare(&pragma)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row?.eq_ignore_ascii_case(column_name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_chromium_history_import(
+    input_path: &Path,
+    max_visits: usize,
+) -> Result<BrowserHistoryImportData> {
+    let profile_paths = chromium_profile_paths(input_path)?;
+    let history_rows =
+        read_chromium_history_rows(&profile_paths.history_path, max_visits).unwrap_or_default();
+    let visit_records =
+        browser_history_visit_records(&history_rows.rows, &profile_paths.history_path);
+    let bookmark_records =
+        read_chromium_bookmark_records(&profile_paths.bookmarks_path).unwrap_or_default();
+    let preference_records =
+        read_chromium_preference_records(&profile_paths.preferences_path).unwrap_or_default();
+    let url_records = read_chromium_url_records(&profile_paths.history_path, max_visits);
+    let search_records = read_chromium_search_records(&profile_paths.history_path, max_visits);
+    let download_records = read_chromium_download_records(&profile_paths.history_path, max_visits);
+    let login_records = read_chromium_login_records(&profile_paths.profile_dir, max_visits);
+    let cookie_records = read_chromium_cookie_records(&profile_paths.profile_dir, max_visits);
+    let source_path = stable_path_string(&profile_paths.profile_dir);
+    let parameters_json = serde_json::json!({
+        "browser_family": BrowserFamily::Chromium.as_str(),
+        "history_path": source_path,
+        "profile_dir": profile_paths.profile_dir.to_string_lossy(),
+        "history_db": profile_paths.history_path.to_string_lossy(),
+        "bookmarks_file": profile_paths.bookmarks_path.to_string_lossy(),
+        "preferences_file": profile_paths.preferences_path.to_string_lossy(),
+        "max_visits": max_visits
+    })
+    .to_string();
+    Ok(BrowserHistoryImportData {
+        family: BrowserFamily::Chromium,
+        source_path,
+        primary_db_path: profile_paths.history_path.clone(),
+        default_display_name: default_browser_history_display_name(
+            BrowserFamily::Chromium,
+            &profile_paths.profile_dir,
+        ),
+        parameters_json,
+        visit_records,
+        bookmark_records,
+        preference_records,
+        url_records,
+        search_records,
+        download_records,
+        login_records,
+        cookie_records,
+        total_visits: history_rows.total_visits,
+    })
+}
+
+fn collect_firefox_history_import(
+    input_path: &Path,
+    max_visits: usize,
+) -> Result<BrowserHistoryImportData> {
+    let profile_paths = firefox_profile_paths(input_path)?;
+    let history_rows =
+        read_firefox_history_rows(&profile_paths.places_path, max_visits).unwrap_or_default();
+    let visit_records =
+        firefox_history_visit_records(&history_rows.rows, &profile_paths.places_path);
+    let bookmark_records = read_firefox_bookmark_records(&profile_paths.places_path, max_visits);
+    let preference_records = Vec::new();
+    let url_records = read_firefox_url_records(&profile_paths.places_path, max_visits);
+    let search_records = read_firefox_search_records(&profile_paths.formhistory_path, max_visits);
+    let download_records = read_firefox_download_records(&profile_paths.places_path, max_visits);
+    let login_records = read_firefox_login_records(&profile_paths.logins_path, max_visits);
+    let cookie_records = read_firefox_cookie_records(&profile_paths.cookies_path, max_visits);
+    let source_path = stable_path_string(&profile_paths.profile_dir);
+    let parameters_json = serde_json::json!({
+        "browser_family": BrowserFamily::Firefox.as_str(),
+        "history_path": source_path,
+        "profile_dir": profile_paths.profile_dir.to_string_lossy(),
+        "places_file": profile_paths.places_path.to_string_lossy(),
+        "formhistory_file": profile_paths.formhistory_path.to_string_lossy(),
+        "cookies_file": profile_paths.cookies_path.to_string_lossy(),
+        "logins_file": profile_paths.logins_path.to_string_lossy(),
+        "max_visits": max_visits
+    })
+    .to_string();
+    Ok(BrowserHistoryImportData {
+        family: BrowserFamily::Firefox,
+        source_path,
+        primary_db_path: profile_paths.places_path.clone(),
+        default_display_name: default_browser_history_display_name(
+            BrowserFamily::Firefox,
+            &profile_paths.profile_dir,
+        ),
+        parameters_json,
+        visit_records,
+        bookmark_records,
+        preference_records,
+        url_records,
+        search_records,
+        download_records,
+        login_records,
+        cookie_records,
+        total_visits: history_rows.total_visits,
+    })
+}
+
+fn collect_safari_history_import(
+    input_path: &Path,
+    max_visits: usize,
+) -> Result<BrowserHistoryImportData> {
+    let profile_paths = safari_profile_paths(input_path)?;
+    let history_rows =
+        read_safari_history_rows(&profile_paths.history_path, max_visits).unwrap_or_default();
+    let visit_records =
+        safari_history_visit_records(&history_rows.rows, &profile_paths.history_path);
+    let url_records = read_safari_url_records(&profile_paths.history_path, max_visits);
+    let source_path = stable_path_string(&profile_paths.profile_dir);
+    let parameters_json = serde_json::json!({
+        "browser_family": BrowserFamily::Safari.as_str(),
+        "history_path": source_path,
+        "profile_dir": profile_paths.profile_dir.to_string_lossy(),
+        "history_db": profile_paths.history_path.to_string_lossy(),
+        "unsupported_artifacts": ["bookmarks_plist", "downloads_plist"],
+        "max_visits": max_visits
+    })
+    .to_string();
+    Ok(BrowserHistoryImportData {
+        family: BrowserFamily::Safari,
+        source_path,
+        primary_db_path: profile_paths.history_path.clone(),
+        default_display_name: default_browser_history_display_name(
+            BrowserFamily::Safari,
+            &profile_paths.profile_dir,
+        ),
+        parameters_json,
+        visit_records,
+        bookmark_records: Vec::new(),
+        preference_records: Vec::new(),
+        url_records,
+        search_records: Vec::new(),
+        download_records: Vec::new(),
+        login_records: Vec::new(),
+        cookie_records: Vec::new(),
+        total_visits: history_rows.total_visits,
+    })
 }
 
 /// Unique URL rows from the Chromium `urls` table ("URLs" DFIR category, distinct from
@@ -4047,8 +4359,10 @@ fn upsert_browser_history_evidence(
     case_id: i64,
     source_path: &str,
     display_name: &str,
+    family: BrowserFamily,
     size_bytes: i64,
 ) -> Result<i64> {
+    let notes = format!("Imported {} browser history", family.label());
     if let Some(existing_id) = conn
         .query_row(
             "SELECT id FROM evidence_sources WHERE case_id = ?1 AND source_path = ?2",
@@ -4063,9 +4377,9 @@ fn upsert_browser_history_evidence(
                  display_name = ?1,
                  size_bytes = ?2,
                  read_file_system_requested = 0,
-                 notes = 'Imported Chromium browser history'
-             WHERE id = ?3 AND case_id = ?4",
-            params![display_name, size_bytes, existing_id, case_id],
+                 notes = ?3
+             WHERE id = ?4 AND case_id = ?5",
+            params![display_name, size_bytes, notes, existing_id, case_id],
         )?;
         return Ok(existing_id);
     }
@@ -4074,8 +4388,8 @@ fn upsert_browser_history_evidence(
         "INSERT INTO evidence_sources(
              case_id, source_kind, source_path, display_name, size_bytes,
              read_file_system_requested, notes
-         ) VALUES (?1, 'browser_history', ?2, ?3, ?4, 0, 'Imported Chromium browser history')",
-        params![case_id, source_path, display_name, size_bytes],
+         ) VALUES (?1, 'browser_history', ?2, ?3, ?4, 0, ?5)",
+        params![case_id, source_path, display_name, size_bytes, notes],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -4113,6 +4427,739 @@ fn browser_history_metadata_json(
         "record",
     );
     metadata.to_string()
+}
+
+fn read_firefox_history_rows(places_path: &Path, max_visits: usize) -> Result<FirefoxHistoryRows> {
+    let (conn, _guard) = open_sqlite_copy_read_only(places_path)?;
+    if !sqlite_table_exists(&conn, "moz_historyvisits")?
+        || !sqlite_table_exists(&conn, "moz_places")?
+    {
+        return Ok(FirefoxHistoryRows::default());
+    }
+    let total_visits: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.place_id, p.url, p.title, v.visit_date, v.visit_type,
+                p.visit_count, p.typed, p.last_visit_date, p.frecency
+         FROM moz_historyvisits v
+         JOIN moz_places p ON p.id = v.place_id
+         ORDER BY v.visit_date DESC, v.id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_visits as i64], |row| {
+        Ok(FirefoxHistoryRow {
+            visit_id: row.get(0)?,
+            place_id: row.get(1)?,
+            url: row.get(2)?,
+            title: row.get(3)?,
+            visit_date: row.get(4)?,
+            visit_type: row.get(5)?,
+            visit_count: row.get(6)?,
+            typed: row.get(7)?,
+            last_visit_date: row.get(8)?,
+            frecency: row.get(9)?,
+        })
+    })?;
+    Ok(FirefoxHistoryRows {
+        rows: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        total_visits: usize::try_from(total_visits).unwrap_or(usize::MAX),
+    })
+}
+
+fn firefox_history_visit_records(
+    rows: &[FirefoxHistoryRow],
+    places_path: &Path,
+) -> Vec<BrowserActivityRecord> {
+    let source_metadata = source_artifact_metadata(places_path, "places.sqlite");
+    rows.iter()
+        .map(|row| {
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "browser_history_visit",
+                "browser_family": "firefox",
+                "visit_id": row.visit_id,
+                "place_id": row.place_id,
+                "url": row.url,
+                "title": row.title,
+                "host": host_from_url(&row.url),
+                "visit_time_prtime": row.visit_date,
+                "visit_time_utc": row.visit_date.and_then(unix_micros_to_rfc3339),
+                "last_visit_time_prtime": row.last_visit_date,
+                "last_visit_time_utc": row.last_visit_date.and_then(unix_micros_to_rfc3339),
+                "visit_count": row.visit_count,
+                "typed": row.typed.map(|value| value != 0),
+                "visit_type": row.visit_type,
+                "visit_type_label": row.visit_type.map(firefox_visit_type_label),
+                "frecency": row.frecency,
+                "search_text": format!("{} {} {}", row.url, row.title.as_deref().unwrap_or(""), host_from_url(&row.url)),
+            });
+            merge_json_object(&mut metadata, &source_metadata);
+            let logical_path = row.logical_path();
+            let display_name = row.display_name();
+            add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+            BrowserActivityRecord {
+                logical_path,
+                display_name,
+                metadata_json: metadata.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn read_firefox_url_records(places_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
+    read_firefox_url_records_inner(places_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_url_records_inner(
+    places_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    let (conn, _guard) = open_sqlite_copy_read_only(places_path)?;
+    if !sqlite_table_exists(&conn, "moz_places")? {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(places_path, "places.sqlite");
+    let mut stmt = conn.prepare(
+        "SELECT id, url, title, visit_count, typed, last_visit_date, frecency
+         FROM moz_places
+         ORDER BY COALESCE(last_visit_date, 0) DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, url, title, visit_count, typed, last_visit_date, frecency) = row?;
+        let host = host_from_url(&url);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_url",
+            "browser_family": "firefox",
+            "place_id": id,
+            "url": url,
+            "title": title,
+            "host": host,
+            "visit_count": visit_count,
+            "typed": typed.map(|value| value != 0),
+            "last_visit_time_prtime": last_visit_date,
+            "last_visit_time_utc": last_visit_date.and_then(unix_micros_to_rfc3339),
+            "frecency": frecency,
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let display_name = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&url)
+            .chars()
+            .take(180)
+            .collect::<String>();
+        let logical_path = format!(
+            "/Browser Activities/URLs/{}/{}.record",
+            sanitize_logical_segment(&host),
+            id
+        );
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_firefox_bookmark_records(
+    places_path: &Path,
+    max_rows: usize,
+) -> Vec<BrowserActivityRecord> {
+    read_firefox_bookmark_records_inner(places_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_bookmark_records_inner(
+    places_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    let (conn, _guard) = open_sqlite_copy_read_only(places_path)?;
+    if !sqlite_table_exists(&conn, "moz_bookmarks")? || !sqlite_table_exists(&conn, "moz_places")? {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(places_path, "places.sqlite");
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.fk, b.title, p.title, p.url, b.parent, parent.title,
+                b.dateAdded, b.lastModified
+         FROM moz_bookmarks b
+         JOIN moz_places p ON p.id = b.fk
+         LEFT JOIN moz_bookmarks parent ON parent.id = b.parent
+         WHERE b.type = 1
+         ORDER BY b.dateAdded DESC, b.id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            bookmark_id,
+            place_id,
+            bookmark_title,
+            page_title,
+            url,
+            parent_id,
+            parent_title,
+            date_added,
+            last_modified,
+        ) = row?;
+        let folder = parent_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Bookmarks");
+        let name = bookmark_title
+            .as_deref()
+            .or(page_title.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&url);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_bookmark",
+            "browser_family": "firefox",
+            "bookmark_id": bookmark_id,
+            "place_id": place_id,
+            "name": bookmark_title,
+            "page_title": page_title,
+            "url": url,
+            "host": host_from_url(&url),
+            "parent_id": parent_id,
+            "folder": folder,
+            "date_added_prtime": date_added,
+            "date_added_utc": date_added.and_then(unix_micros_to_rfc3339),
+            "last_modified_prtime": last_modified,
+            "last_modified_utc": last_modified.and_then(unix_micros_to_rfc3339),
+            "search_text": format!("{name} {url} {} {folder}", host_from_url(&url)),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Bookmarks/{}/{}.record",
+            sanitize_logical_segment(folder),
+            bookmark_id
+        );
+        let display_name = name.chars().take(180).collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_firefox_search_records(
+    formhistory_path: &Path,
+    max_rows: usize,
+) -> Vec<BrowserActivityRecord> {
+    read_firefox_search_records_inner(formhistory_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_search_records_inner(
+    formhistory_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    if !formhistory_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let (conn, _guard) = open_sqlite_copy_read_only(formhistory_path)?;
+    if !sqlite_table_exists(&conn, "moz_formhistory")? {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(formhistory_path, "formhistory.sqlite");
+    let mut stmt = conn.prepare(
+        "SELECT id, fieldname, value, timesUsed, firstUsed, lastUsed
+         FROM moz_formhistory
+         WHERE fieldname = 'searchbar-history'
+         ORDER BY COALESCE(lastUsed, 0) DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, fieldname, value, times_used, first_used, last_used) = row?;
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_search_term",
+            "browser_family": "firefox",
+            "formhistory_id": id,
+            "fieldname": fieldname,
+            "search_term": value,
+            "times_used": times_used,
+            "first_used_prtime": first_used,
+            "first_used_utc": first_used.and_then(unix_micros_to_rfc3339),
+            "last_used_prtime": last_used,
+            "last_used_utc": last_used.and_then(unix_micros_to_rfc3339),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Searches/{}-{}.record",
+            sanitize_logical_segment(&value),
+            id
+        );
+        let display_name = format!("Search: {value}")
+            .chars()
+            .take(180)
+            .collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_firefox_download_records(
+    places_path: &Path,
+    max_rows: usize,
+) -> Vec<BrowserActivityRecord> {
+    read_firefox_download_records_inner(places_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_download_records_inner(
+    places_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    let (conn, _guard) = open_sqlite_copy_read_only(places_path)?;
+    if !sqlite_table_exists(&conn, "moz_annos")?
+        || !sqlite_table_exists(&conn, "moz_anno_attributes")?
+        || !sqlite_table_exists(&conn, "moz_places")?
+    {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(places_path, "places.sqlite");
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.place_id, aa.name, a.content, a.dateAdded, a.lastModified,
+                p.url, p.title
+         FROM moz_annos a
+         JOIN moz_anno_attributes aa ON aa.id = a.anno_attribute_id
+         JOIN moz_places p ON p.id = a.place_id
+         WHERE aa.name IN ('downloads/destinationFileURI', 'downloads/metaData')
+         ORDER BY a.dateAdded DESC, a.id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, place_id, annotation_name, content, date_added, last_modified, source_url, title) =
+            row?;
+        let file_name = content
+            .as_deref()
+            .and_then(file_name_from_pathish)
+            .unwrap_or_else(|| format!("download-{id}"));
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_download",
+            "browser_family": "firefox",
+            "annotation_id": id,
+            "place_id": place_id,
+            "annotation_name": annotation_name,
+            "annotation_content": content,
+            "file_name": file_name,
+            "source_url": source_url,
+            "title": title,
+            "host": host_from_url(&source_url),
+            "date_added_prtime": date_added,
+            "date_added_utc": date_added.and_then(unix_micros_to_rfc3339),
+            "last_modified_prtime": last_modified,
+            "last_modified_utc": last_modified.and_then(unix_micros_to_rfc3339),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Downloads/{}-{}.record",
+            id,
+            sanitize_logical_segment(&file_name)
+        );
+        let display_name = file_name.chars().take(180).collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_firefox_login_records(logins_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
+    read_firefox_login_records_inner(logins_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_login_records_inner(
+    logins_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    if !logins_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(logins_path)
+        .with_context(|| format!("reading Firefox logins file {}", logins_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing Firefox logins file {}", logins_path.display()))?;
+    let source_metadata = source_artifact_metadata(logins_path, "logins.json");
+    let mut logins = value
+        .get("logins")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    logins.sort_by(|left, right| {
+        let left_time = chrome_json_time_value(left.get("timeLastUsed"))
+            .or_else(|| chrome_json_time_value(left.get("timeCreated")))
+            .unwrap_or_default();
+        let right_time = chrome_json_time_value(right.get("timeLastUsed"))
+            .or_else(|| chrome_json_time_value(right.get("timeCreated")))
+            .unwrap_or_default();
+        right_time.cmp(&left_time)
+    });
+    let mut records = Vec::new();
+    for (index, login) in logins.into_iter().take(max_rows).enumerate() {
+        let hostname = login
+            .get("hostname")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let http_realm = login
+            .get("httpRealm")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let time_created = chrome_json_time_value(login.get("timeCreated"));
+        let time_last_used = chrome_json_time_value(login.get("timeLastUsed"));
+        let time_password_changed = chrome_json_time_value(login.get("timePasswordChanged"));
+        let times_used = chrome_json_time_value(login.get("timesUsed"));
+        let host_label = hostname.as_deref().unwrap_or("unknown-host");
+        let host = host_from_url(host_label);
+        let realm_label = http_realm
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("saved-login");
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_login",
+            "browser_family": "firefox",
+            "hostname": hostname,
+            "http_realm": http_realm,
+            "host": host,
+            "time_created_ms": time_created,
+            "time_created_utc": time_created.and_then(unix_millis_to_rfc3339),
+            "time_last_used_ms": time_last_used,
+            "time_last_used_utc": time_last_used.and_then(unix_millis_to_rfc3339),
+            "time_password_changed_ms": time_password_changed,
+            "time_password_changed_utc": time_password_changed.and_then(unix_millis_to_rfc3339),
+            "times_used": times_used,
+            "password_note": "encrypted username/password fields not extracted",
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Logins/{}/{}-{}.record",
+            sanitize_logical_segment(&host),
+            sanitize_logical_segment(realm_label),
+            index
+        );
+        let display_name = format!("{realm_label} @ {host}")
+            .chars()
+            .take(180)
+            .collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_firefox_cookie_records(cookies_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
+    read_firefox_cookie_records_inner(cookies_path, max_rows).unwrap_or_default()
+}
+
+fn read_firefox_cookie_records_inner(
+    cookies_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    if !cookies_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let (conn, _guard) = open_sqlite_copy_read_only(cookies_path)?;
+    if !sqlite_table_exists(&conn, "moz_cookies")? {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(cookies_path, "cookies.sqlite");
+    let mut stmt = conn.prepare(
+        "SELECT id, host, name, path, creationTime, lastAccessed, expiry, isSecure, isHttpOnly
+         FROM moz_cookies
+         ORDER BY COALESCE(creationTime, 0) DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, host, name, path, creation, last_accessed, expiry, is_secure, is_httponly) = row?;
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_cookie",
+            "browser_family": "firefox",
+            "cookie_id": id,
+            "host": host,
+            "cookie_name": name,
+            "cookie_path": path,
+            "creation_prtime": creation,
+            "creation_utc": creation.and_then(unix_micros_to_rfc3339),
+            "last_accessed_prtime": last_accessed,
+            "last_accessed_utc": last_accessed.and_then(unix_micros_to_rfc3339),
+            "expiry_unix": expiry,
+            "expiry_utc": expiry.and_then(unix_seconds_to_rfc3339),
+            "is_secure": is_secure.map(|value| value != 0),
+            "is_httponly": is_httponly.map(|value| value != 0),
+            "value_note": "cookie value not extracted",
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Cookies/{}/{}-{}.record",
+            sanitize_logical_segment(&host),
+            sanitize_logical_segment(&name),
+            id
+        );
+        let display_name = format!("{name} ({host})")
+            .chars()
+            .take(180)
+            .collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn read_safari_history_rows(history_path: &Path, max_visits: usize) -> Result<SafariHistoryRows> {
+    let (conn, _guard) = open_sqlite_copy_read_only(history_path)?;
+    if !sqlite_table_exists(&conn, "history_visits")?
+        || !sqlite_table_exists(&conn, "history_items")?
+    {
+        return Ok(SafariHistoryRows::default());
+    }
+    let total_visits: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM history_visits v JOIN history_items i ON i.id = v.history_item",
+        [],
+        |row| row.get(0),
+    )?;
+    let domain_select = if sqlite_column_exists(&conn, "history_items", "domain_expansion")? {
+        "i.domain_expansion"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT v.id, v.history_item, i.url, v.title, v.visit_time, i.visit_count,
+                {domain_select}
+         FROM history_visits v
+         JOIN history_items i ON i.id = v.history_item
+         ORDER BY v.visit_time DESC, v.id DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![max_visits as i64], |row| {
+        Ok(SafariHistoryRow {
+            visit_id: row.get(0)?,
+            history_item_id: row.get(1)?,
+            url: row.get(2)?,
+            title: row.get(3)?,
+            visit_time: row.get(4)?,
+            visit_count: row.get(5)?,
+            domain_expansion: row.get(6)?,
+        })
+    })?;
+    Ok(SafariHistoryRows {
+        rows: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        total_visits: usize::try_from(total_visits).unwrap_or(usize::MAX),
+    })
+}
+
+fn safari_history_visit_records(
+    rows: &[SafariHistoryRow],
+    history_path: &Path,
+) -> Vec<BrowserActivityRecord> {
+    let source_metadata = source_artifact_metadata(history_path, "History.db");
+    rows.iter()
+        .map(|row| {
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "browser_history_visit",
+                "browser_family": "safari",
+                "visit_id": row.visit_id,
+                "history_item_id": row.history_item_id,
+                "url": row.url,
+                "title": row.title,
+                "host": host_from_url(&row.url),
+                "visit_time_safari": row.visit_time,
+                "visit_time_utc": row.visit_time.and_then(safari_time_to_rfc3339),
+                "visit_count": row.visit_count,
+                "domain_expansion": row.domain_expansion,
+                "search_text": format!("{} {} {}", row.url, row.title.as_deref().unwrap_or(""), host_from_url(&row.url)),
+            });
+            merge_json_object(&mut metadata, &source_metadata);
+            let logical_path = row.logical_path();
+            let display_name = row.display_name();
+            add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+            BrowserActivityRecord {
+                logical_path,
+                display_name,
+                metadata_json: metadata.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn read_safari_url_records(history_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
+    read_safari_url_records_inner(history_path, max_rows).unwrap_or_default()
+}
+
+fn read_safari_url_records_inner(
+    history_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    let (conn, _guard) = open_sqlite_copy_read_only(history_path)?;
+    if !sqlite_table_exists(&conn, "history_items")? {
+        return Ok(Vec::new());
+    }
+    let domain_select = if sqlite_column_exists(&conn, "history_items", "domain_expansion")? {
+        "domain_expansion"
+    } else {
+        "NULL"
+    };
+    let source_metadata = source_artifact_metadata(history_path, "History.db");
+    let sql = format!(
+        "SELECT id, url, visit_count, {domain_select}
+         FROM history_items
+         ORDER BY COALESCE(visit_count, 0) DESC, id DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![max_rows as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, url, visit_count, domain_expansion) = row?;
+        let host = host_from_url(&url);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_url",
+            "browser_family": "safari",
+            "history_item_id": id,
+            "url": url,
+            "host": host,
+            "visit_count": visit_count,
+            "domain_expansion": domain_expansion,
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/URLs/{}/{}.record",
+            sanitize_logical_segment(&host),
+            id
+        );
+        let display_name = url.chars().take(180).collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn file_name_from_pathish(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches(['/', '\\']);
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let name = without_query
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(without_query)
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn firefox_visit_type_label(visit_type: i64) -> &'static str {
+    match visit_type {
+        1 => "link",
+        2 => "typed",
+        3 => "bookmark",
+        4 => "embed",
+        5 => "redirect_permanent",
+        6 => "redirect_temporary",
+        7 => "download",
+        8 => "framed_link",
+        9 => "reload",
+        _ => "unknown",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -12132,6 +13179,168 @@ fn chromium_profile_paths(input_path: &Path) -> Result<ChromiumProfilePaths> {
     })
 }
 
+fn firefox_profile_paths(input_path: &Path) -> Result<FirefoxProfilePaths> {
+    let metadata = fs::metadata(input_path)
+        .with_context(|| format!("reading Firefox profile path {}", input_path.display()))?;
+    let profile_dir = if metadata.is_dir() {
+        input_path.to_path_buf()
+    } else if metadata.is_file() {
+        input_path
+            .parent()
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "Firefox places.sqlite file has no parent: {}",
+                    input_path.display()
+                )
+            })?
+    } else {
+        bail!(
+            "Firefox profile/history path is not a file or directory: {}",
+            input_path.display()
+        );
+    };
+    let places_path = if metadata.is_file() {
+        input_path.to_path_buf()
+    } else {
+        profile_dir.join("places.sqlite")
+    };
+    if !places_path.is_file() {
+        bail!(
+            "Firefox places.sqlite database was not found: {}",
+            places_path.display()
+        );
+    }
+    Ok(FirefoxProfilePaths {
+        formhistory_path: profile_dir.join("formhistory.sqlite"),
+        cookies_path: profile_dir.join("cookies.sqlite"),
+        logins_path: profile_dir.join("logins.json"),
+        profile_dir,
+        places_path,
+    })
+}
+
+fn safari_profile_paths(input_path: &Path) -> Result<SafariProfilePaths> {
+    let metadata = fs::metadata(input_path)
+        .with_context(|| format!("reading Safari history path {}", input_path.display()))?;
+    let profile_dir = if metadata.is_dir() {
+        input_path.to_path_buf()
+    } else if metadata.is_file() {
+        input_path
+            .parent()
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "Safari History.db file has no parent: {}",
+                    input_path.display()
+                )
+            })?
+    } else {
+        bail!(
+            "Safari history path is not a file or directory: {}",
+            input_path.display()
+        );
+    };
+    let history_path = if metadata.is_file() {
+        input_path.to_path_buf()
+    } else {
+        profile_dir.join("History.db")
+    };
+    if !history_path.is_file() {
+        bail!(
+            "Safari History.db database was not found: {}",
+            history_path.display()
+        );
+    }
+    Ok(SafariProfilePaths {
+        profile_dir,
+        history_path,
+    })
+}
+
+fn detect_browser_family(input_path: &Path) -> Result<BrowserFamily> {
+    let metadata = fs::metadata(input_path)
+        .with_context(|| format!("reading browser history path {}", input_path.display()))?;
+    if metadata.is_dir() {
+        let candidates = [
+            (BrowserFamily::Chromium, input_path.join("History")),
+            (BrowserFamily::Firefox, input_path.join("places.sqlite")),
+            (BrowserFamily::Safari, input_path.join("History.db")),
+        ];
+        let matches = candidates
+            .iter()
+            .filter(|(_, path)| path.is_file())
+            .map(|(family, path)| (*family, path.clone()))
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [(family, _)] => Ok(*family),
+            [] => bail!(
+                "no supported browser history database was found in {}; point at a Chromium History, Firefox places.sqlite, or Safari History.db file",
+                input_path.display()
+            ),
+            _ => {
+                let names = matches
+                    .iter()
+                    .map(|(_, path)| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "ambiguous browser profile directory {}; multiple supported history databases were found ({names}); point at the specific DB file",
+                    input_path.display()
+                )
+            }
+        };
+    }
+    if !metadata.is_file() {
+        bail!(
+            "browser history/profile path is not a file or directory: {}",
+            input_path.display()
+        );
+    }
+    let file_name = input_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match file_name.as_str() {
+        "history" => Ok(BrowserFamily::Chromium),
+        "places.sqlite" => Ok(BrowserFamily::Firefox),
+        "history.db" => Ok(BrowserFamily::Safari),
+        _ => sniff_browser_family_from_sqlite(input_path),
+    }
+}
+
+fn sniff_browser_family_from_sqlite(input_path: &Path) -> Result<BrowserFamily> {
+    let (conn, _guard) = open_sqlite_copy_read_only(input_path).with_context(|| {
+        format!(
+            "sniffing browser history SQLite schema from {}",
+            input_path.display()
+        )
+    })?;
+    let mut matches = Vec::new();
+    if sqlite_table_exists(&conn, "moz_places")? {
+        matches.push(BrowserFamily::Firefox);
+    }
+    if sqlite_table_exists(&conn, "history_items")? && sqlite_table_exists(&conn, "history_visits")?
+    {
+        matches.push(BrowserFamily::Safari);
+    }
+    if sqlite_table_exists(&conn, "urls")? && sqlite_table_exists(&conn, "visits")? {
+        matches.push(BrowserFamily::Chromium);
+    }
+    match matches.as_slice() {
+        [family] => Ok(*family),
+        [] => bail!(
+            "could not identify browser history database schema in {}; expected Firefox moz_places, Safari history_items/history_visits, or Chromium urls/visits tables",
+            input_path.display()
+        ),
+        _ => bail!(
+            "ambiguous browser history database schema in {}; point at a specific supported browser history DB",
+            input_path.display()
+        ),
+    }
+}
+
 fn temp_history_copy_path(history_path: &Path) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12149,12 +13358,12 @@ fn temp_history_copy_path(history_path: &Path) -> PathBuf {
     ))
 }
 
-fn default_history_display_name(profile_dir: &Path) -> String {
+fn default_browser_history_display_name(family: BrowserFamily, profile_dir: &Path) -> String {
     let profile = profile_dir
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("Profile");
-    format!("Chromium History - {profile}")
+    format!("{} History - {profile}", family.label())
 }
 
 fn chrome_time_to_rfc3339(chrome_time: i64) -> Option<String> {
@@ -12162,6 +13371,44 @@ fn chrome_time_to_rfc3339(chrome_time: i64) -> Option<String> {
     let unix_micros = chrome_time.checked_sub(CHROME_TO_UNIX_EPOCH_MICROS)?;
     let seconds = unix_micros.div_euclid(1_000_000);
     let nanos = unix_micros.rem_euclid(1_000_000) * 1_000;
+    DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
+}
+
+fn unix_micros_to_rfc3339(unix_micros: i64) -> Option<String> {
+    let seconds = unix_micros.div_euclid(1_000_000);
+    let nanos = unix_micros.rem_euclid(1_000_000) * 1_000;
+    DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
+}
+
+fn unix_millis_to_rfc3339(unix_millis: i64) -> Option<String> {
+    let seconds = unix_millis.div_euclid(1_000);
+    let nanos = unix_millis.rem_euclid(1_000) * 1_000_000;
+    DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
+}
+
+fn unix_seconds_to_rfc3339(unix_seconds: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(unix_seconds, 0).map(|value| value.to_rfc3339())
+}
+
+fn safari_time_to_rfc3339(safari_time: f64) -> Option<String> {
+    const SAFARI_TO_UNIX_EPOCH_SECONDS: f64 = 978_307_200.0;
+    if !safari_time.is_finite() {
+        return None;
+    }
+    let unix_seconds = safari_time + SAFARI_TO_UNIX_EPOCH_SECONDS;
+    if unix_seconds < i64::MIN as f64 || unix_seconds > i64::MAX as f64 {
+        return None;
+    }
+    let mut seconds = unix_seconds.floor() as i64;
+    let mut nanos = ((unix_seconds - seconds as f64) * 1_000_000_000.0).round() as i64;
+    if nanos >= 1_000_000_000 {
+        seconds = seconds.checked_add(1)?;
+        nanos -= 1_000_000_000;
+    }
+    if nanos < 0 {
+        seconds = seconds.checked_sub(1)?;
+        nanos += 1_000_000_000;
+    }
     DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
 }
 
@@ -15340,6 +16587,213 @@ mod tests {
     }
 
     #[test]
+    fn firefox_history_import_reads_profile_artifacts_and_truncates() -> Result<()> {
+        let case_path = unique_case_path("firefox-history-import");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-history-source");
+        create_test_firefox_profile(&profile_dir)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 10,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 2);
+        assert_eq!(imported.bookmarks_indexed, 2);
+        assert_eq!(imported.preferences_indexed, 0);
+        assert_eq!(imported.entries_indexed, 9);
+        assert_eq!(imported.status, "completed");
+
+        let evidence = list_evidence(&case_path)?;
+        assert_eq!(evidence[0].source_kind, "browser_history");
+        assert!(evidence[0].display_name.starts_with("Firefox History - "));
+
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_history_visit"), 2);
+        assert_eq!(artifact_count(&entries, "browser_url"), 2);
+        assert_eq!(artifact_count(&entries, "browser_bookmark"), 2);
+        assert_eq!(artifact_count(&entries, "browser_search_term"), 1);
+        assert_eq!(artifact_count(&entries, "browser_cookie"), 1);
+        assert_eq!(artifact_count(&entries, "browser_login"), 1);
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.metadata_json["browser_family"].as_str() == Some("firefox") }));
+
+        let visit = entry_with_artifact(&entries, "browser_history_visit");
+        assert_eq!(
+            visit.metadata_json["category_main"].as_str(),
+            Some("Web Activity")
+        );
+        assert_eq!(
+            visit.metadata_json["visit_time_utc"].as_str(),
+            Some("2009-12-11T00:00:00+00:00")
+        );
+        let login = entry_with_artifact(&entries, "browser_login");
+        assert_eq!(
+            login.metadata_json["category_main"].as_str(),
+            Some("Accounts and Identity")
+        );
+        let login_json = login.metadata_json.to_string();
+        assert!(!login_json.contains("encrypted-user"));
+        assert!(!login_json.contains("encrypted-pass"));
+        let cookie_json = entry_with_artifact(&entries, "browser_cookie")
+            .metadata_json
+            .to_string();
+        assert!(!cookie_json.contains("cookie-secret"));
+
+        let truncated = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 1,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(truncated.evidence_id, imported.evidence_id);
+        assert_eq!(truncated.visits_indexed, 1);
+        assert!(truncated.truncated);
+        assert_eq!(truncated.status, "truncated");
+        let truncated_entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(
+            artifact_count(&truncated_entries, "browser_history_visit"),
+            1
+        );
+        assert_eq!(artifact_count(&truncated_entries, "browser_url"), 1);
+        assert_eq!(artifact_count(&truncated_entries, "browser_bookmark"), 1);
+        assert_eq!(artifact_count(&truncated_entries, "browser_search_term"), 1);
+        assert_eq!(artifact_count(&truncated_entries, "browser_cookie"), 1);
+        assert_eq!(artifact_count(&truncated_entries, "browser_login"), 1);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn safari_history_import_reads_visits_urls_and_core_data_time() -> Result<()> {
+        let case_path = unique_case_path("safari-history-import");
+        create_test_case(&case_path)?;
+        let history_dir = unique_temp_dir("safari-history-source");
+        let history_path = history_dir.join("History.db");
+        create_test_safari_history(&history_path)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: history_path.clone(),
+                max_visits: 10,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 2);
+        assert_eq!(imported.bookmarks_indexed, 0);
+        assert_eq!(imported.entries_indexed, 4);
+
+        let evidence = list_evidence(&case_path)?;
+        assert!(evidence[0].display_name.starts_with("Safari History - "));
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_history_visit"), 2);
+        assert_eq!(artifact_count(&entries, "browser_url"), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| { entry.metadata_json["browser_family"].as_str() == Some("safari") }));
+        let known_visit = entries
+            .iter()
+            .find(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("browser_history_visit")
+                    && entry.metadata_json["url"].as_str() == Some("https://apple.example/history")
+            })
+            .expect("known Safari visit should be imported");
+        assert_eq!(
+            known_visit.metadata_json["visit_time_utc"].as_str(),
+            Some("2009-12-11T00:00:00+00:00")
+        );
+        assert_eq!(
+            known_visit.metadata_json["category_main"].as_str(),
+            Some("Web Activity")
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![imported.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["unsupported_artifacts"][0].as_str(),
+            Some("bookmarks_plist")
+        );
+        assert_eq!(
+            parameters["unsupported_artifacts"][1].as_str(),
+            Some("downloads_plist")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(history_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_family_detection_handles_names_sniffing_and_ambiguity() -> Result<()> {
+        let root = unique_temp_dir("browser-detection");
+        let chromium_file = root.join("HISTORY");
+        let firefox_file = root.join("PLACES.SQLITE");
+        let safari_file = root.join("History.DB");
+        fs::write(&chromium_file, b"")?;
+        fs::write(&firefox_file, b"")?;
+        fs::write(&safari_file, b"")?;
+        assert_eq!(
+            detect_browser_family(&chromium_file)?,
+            BrowserFamily::Chromium
+        );
+        assert_eq!(
+            detect_browser_family(&firefox_file)?,
+            BrowserFamily::Firefox
+        );
+        assert_eq!(detect_browser_family(&safari_file)?, BrowserFamily::Safari);
+
+        let sniff_firefox = root.join("unknown-firefox.sqlite");
+        Connection::open(&sniff_firefox)?
+            .execute_batch("CREATE TABLE moz_places(id INTEGER PRIMARY KEY);")?;
+        assert_eq!(
+            detect_browser_family(&sniff_firefox)?,
+            BrowserFamily::Firefox
+        );
+        let sniff_safari = root.join("unknown-safari.sqlite");
+        Connection::open(&sniff_safari)?.execute_batch(
+            "CREATE TABLE history_items(id INTEGER PRIMARY KEY);
+             CREATE TABLE history_visits(id INTEGER PRIMARY KEY);",
+        )?;
+        assert_eq!(detect_browser_family(&sniff_safari)?, BrowserFamily::Safari);
+        let sniff_chromium = root.join("unknown-chromium.sqlite");
+        Connection::open(&sniff_chromium)?.execute_batch(
+            "CREATE TABLE urls(id INTEGER PRIMARY KEY);
+             CREATE TABLE visits(id INTEGER PRIMARY KEY);",
+        )?;
+        assert_eq!(
+            detect_browser_family(&sniff_chromium)?,
+            BrowserFamily::Chromium
+        );
+
+        let ambiguous_dir = root.join("ambiguous");
+        fs::create_dir_all(&ambiguous_dir)?;
+        fs::write(ambiguous_dir.join("History"), b"")?;
+        fs::write(ambiguous_dir.join("places.sqlite"), b"")?;
+        let err = detect_browser_family(&ambiguous_dir)
+            .expect_err("multiple browser databases in one directory should be ambiguous")
+            .to_string();
+        assert!(err.contains("ambiguous browser profile directory"));
+        assert!(err.contains("point at the specific DB file"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn evidence_process_respects_entry_limit() -> Result<()> {
         let case_path = unique_case_path("process-limit");
         create_test_case(&case_path)?;
@@ -16175,6 +17629,23 @@ mod tests {
         }
     }
 
+    fn artifact_count(entries: &[FilesystemEntry], artifact_kind: &str) -> usize {
+        entries
+            .iter()
+            .filter(|entry| entry.metadata_json["artifact_kind"].as_str() == Some(artifact_kind))
+            .count()
+    }
+
+    fn entry_with_artifact<'a>(
+        entries: &'a [FilesystemEntry],
+        artifact_kind: &str,
+    ) -> &'a FilesystemEntry {
+        entries
+            .iter()
+            .find(|entry| entry.metadata_json["artifact_kind"].as_str() == Some(artifact_kind))
+            .expect("expected artifact entry")
+    }
+
     fn create_test_chromium_history(history_path: &Path) -> Result<()> {
         let conn = Connection::open(history_path)?;
         conn.execute_batch(
@@ -16335,6 +17806,171 @@ mod tests {
                 }
             })
             .to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn create_test_firefox_profile(profile_dir: &Path) -> Result<()> {
+        let places_path = profile_dir.join("places.sqlite");
+        let conn = Connection::open(&places_path)?;
+        conn.execute_batch(
+            "CREATE TABLE moz_places(
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT,
+                visit_count INTEGER,
+                typed INTEGER,
+                last_visit_date INTEGER,
+                frecency INTEGER
+             );
+             CREATE TABLE moz_historyvisits(
+                id INTEGER PRIMARY KEY,
+                place_id INTEGER NOT NULL,
+                visit_date INTEGER,
+                visit_type INTEGER
+             );
+             CREATE TABLE moz_bookmarks(
+                id INTEGER PRIMARY KEY,
+                type INTEGER NOT NULL,
+                fk INTEGER,
+                parent INTEGER,
+                title TEXT,
+                dateAdded INTEGER,
+                lastModified INTEGER
+             );",
+        )?;
+        let base = 1_260_489_600_000_000_i64;
+        conn.execute(
+            "INSERT INTO moz_places(id, url, title, visit_count, typed, last_visit_date, frecency)
+             VALUES (1, 'https://example.org/firefox?q=keyword', 'Firefox Example', 4, 1, ?1, 99)",
+            params![base],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_places(id, url, title, visit_count, typed, last_visit_date, frecency)
+             VALUES (2, 'https://mozilla.example/docs', 'Mozilla Docs', 2, 0, ?1, 50)",
+            params![base - 1_000_000],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_historyvisits(id, place_id, visit_date, visit_type)
+             VALUES (10, 1, ?1, 2)",
+            params![base],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_historyvisits(id, place_id, visit_date, visit_type)
+             VALUES (9, 2, ?1, 1)",
+            params![base - 1_000_000],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_bookmarks(id, type, fk, parent, title, dateAdded, lastModified)
+             VALUES (100, 2, NULL, NULL, 'Bookmarks Menu', ?1, ?1)",
+            params![base - 3_000_000],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_bookmarks(id, type, fk, parent, title, dateAdded, lastModified)
+             VALUES (101, 1, 1, 100, 'Firefox Bookmark', ?1, ?1)",
+            params![base - 2_000_000],
+        )?;
+        conn.execute(
+            "INSERT INTO moz_bookmarks(id, type, fk, parent, title, dateAdded, lastModified)
+             VALUES (102, 1, 2, 100, 'Docs Bookmark', ?1, ?1)",
+            params![base - 1_000_000],
+        )?;
+
+        let form_conn = Connection::open(profile_dir.join("formhistory.sqlite"))?;
+        form_conn.execute_batch(
+            "CREATE TABLE moz_formhistory(
+                id INTEGER PRIMARY KEY,
+                fieldname TEXT NOT NULL,
+                value TEXT NOT NULL,
+                timesUsed INTEGER,
+                firstUsed INTEGER,
+                lastUsed INTEGER
+             );",
+        )?;
+        form_conn.execute(
+            "INSERT INTO moz_formhistory(id, fieldname, value, timesUsed, firstUsed, lastUsed)
+             VALUES (1, 'searchbar-history', 'keyword', 3, ?1, ?2)",
+            params![base - 5_000_000, base - 4_000_000],
+        )?;
+
+        let cookie_conn = Connection::open(profile_dir.join("cookies.sqlite"))?;
+        cookie_conn.execute_batch(
+            "CREATE TABLE moz_cookies(
+                id INTEGER PRIMARY KEY,
+                host TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value TEXT,
+                path TEXT,
+                expiry INTEGER,
+                lastAccessed INTEGER,
+                creationTime INTEGER,
+                isSecure INTEGER,
+                isHttpOnly INTEGER
+             );",
+        )?;
+        cookie_conn.execute(
+            "INSERT INTO moz_cookies(id, host, name, value, path, expiry, lastAccessed,
+                creationTime, isSecure, isHttpOnly)
+             VALUES (1, '.example.org', 'sid', 'cookie-secret', '/', 1260493200, ?1, ?2, 1, 1)",
+            params![base - 2_000_000, base - 3_000_000],
+        )?;
+
+        fs::write(
+            profile_dir.join("logins.json"),
+            serde_json::json!({
+                "logins": [{
+                    "id": 1,
+                    "hostname": "https://example.org",
+                    "httpRealm": "Members",
+                    "encryptedUsername": "encrypted-user",
+                    "encryptedPassword": "encrypted-pass",
+                    "timeCreated": 1260489600000_i64,
+                    "timeLastUsed": 1260493200000_i64,
+                    "timePasswordChanged": 1260496800000_i64,
+                    "timesUsed": 2
+                }]
+            })
+            .to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn create_test_safari_history(history_path: &Path) -> Result<()> {
+        let conn = Connection::open(history_path)?;
+        conn.execute_batch(
+            "CREATE TABLE history_items(
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                visit_count INTEGER,
+                domain_expansion TEXT
+             );
+             CREATE TABLE history_visits(
+                id INTEGER PRIMARY KEY,
+                history_item INTEGER NOT NULL,
+                visit_time REAL,
+                title TEXT
+             );",
+        )?;
+        let safari_2009_12_11 = 1_260_489_600_f64 - 978_307_200_f64;
+        conn.execute(
+            "INSERT INTO history_items(id, url, visit_count, domain_expansion)
+             VALUES (1, 'https://apple.example/history', 3, 'apple.example')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO history_items(id, url, visit_count, domain_expansion)
+             VALUES (2, 'https://webkit.example/docs', 1, 'webkit.example')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO history_visits(id, history_item, visit_time, title)
+             VALUES (10, 1, ?1, 'Safari Example')",
+            params![safari_2009_12_11],
+        )?;
+        conn.execute(
+            "INSERT INTO history_visits(id, history_item, visit_time, title)
+             VALUES (9, 2, ?1, 'WebKit Docs')",
+            params![safari_2009_12_11 - 60.0],
         )?;
         Ok(())
     }

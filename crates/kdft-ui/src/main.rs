@@ -3,7 +3,7 @@ use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, carve_evidence, case_info,
     category_entry_counts, clear_all_findings, create_bookmark, create_bookmark_folder,
     create_case, deep_search, export_image_file, export_image_tree, filesystem_entry_count,
-    hash_evidence, import_chromium_history, list_bookmark_folders, list_bookmark_items,
+    hash_evidence, import_browser_history, list_bookmark_folders, list_bookmark_items,
     list_bookmarks, list_evidence, list_filesystem_entries_limited, max_filesystem_entry_id,
     process_evidence, read_filesystem_entry_bytes, record_live_export, record_live_tree_export,
     record_report_export, recover_filesystem_entry, remove_evidence, render_report, report_data,
@@ -909,8 +909,165 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
 }
 
 #[cfg(not(windows))]
-fn run_native_pick_dialog(_mode: &str, _filter: &str, _start: &str) -> Result<Option<String>> {
-    bail!("native browse is only available on Windows in this build; type the path manually")
+#[cfg(target_os = "macos")]
+fn run_native_pick_dialog(mode: &str, _filter: &str, start: &str) -> Result<Option<String>> {
+    let prompt = if mode == "folder" {
+        "Select folder"
+    } else {
+        "Select evidence file"
+    };
+    let command = if mode == "folder" {
+        "choose folder"
+    } else {
+        "choose file"
+    };
+    let mut script = format!(
+        "POSIX path of ({command} with prompt \"{}\"",
+        escape_applescript_string(prompt)
+    );
+    if let Some(location) = picker_existing_start_location(start) {
+        script.push_str(&format!(
+            " default location (POSIX file \"{}\")",
+            escape_applescript_string(&location)
+        ));
+    }
+    script.push(')');
+
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("launching macOS file dialog")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) && stderr.contains("User canceled") {
+            return Ok(None);
+        }
+        bail!("file dialog failed: {}", stderr.trim());
+    }
+    let picked = trim_picker_stdout(&output.stdout);
+    if picked.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(picked))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn escape_applescript_string(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars().filter(|ch| !ch.is_control()) {
+        if ch == '"' || ch == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn picker_existing_start_location(start: &str) -> Option<String> {
+    let start = start.trim();
+    if start.is_empty() {
+        return None;
+    }
+    let path = Path::new(start);
+    if path.is_dir() {
+        Some(start.to_string())
+    } else if path.is_file() {
+        path.parent()
+            .filter(|parent| parent.exists())
+            .map(|parent| parent.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn trim_picker_stdout(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout)
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_native_pick_dialog(mode: &str, filter: &str, start: &str) -> Result<Option<String>> {
+    match run_zenity_pick_dialog(mode, filter, start) {
+        Ok(path) => return Ok(path),
+        Err(err) if is_command_not_found(&err) => {}
+        Err(err) => return Err(err),
+    }
+    match run_kdialog_pick_dialog(mode, start) {
+        Ok(path) => Ok(path),
+        Err(err) if is_command_not_found(&err) => {
+            bail!("no graphical file picker found; install zenity or type the path manually")
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_zenity_pick_dialog(mode: &str, filter: &str, start: &str) -> Result<Option<String>> {
+    let mut command = Command::new("zenity");
+    command.arg("--file-selection");
+    if mode == "folder" {
+        command.arg("--directory");
+    }
+    if let Some(location) = picker_existing_start_location(start) {
+        let filename = if location.ends_with('/') {
+            location
+        } else {
+            format!("{location}/")
+        };
+        command.arg(format!("--filename={filename}"));
+    }
+    if mode == "file" && filter == "image" {
+        command.arg("--file-filter=Disk images | *.E01 *.EX01 *.L01 *.dd *.raw *.img *.001 *.vhd *.vhdx *.vmdk *.vdi *.iso");
+        command.arg("--file-filter=All files | *");
+    }
+    let output = command.output().context("launching zenity file dialog")?;
+    handle_unix_picker_output(output, "zenity file dialog")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_kdialog_pick_dialog(mode: &str, start: &str) -> Result<Option<String>> {
+    let mut command = Command::new("kdialog");
+    if mode == "folder" {
+        command.arg("--getexistingdirectory");
+    } else {
+        command.arg("--getopenfilename");
+    }
+    if let Some(location) = picker_existing_start_location(start) {
+        command.arg(location);
+    }
+    let output = command.output().context("launching kdialog file dialog")?;
+    handle_unix_picker_output(output, "kdialog file dialog")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn handle_unix_picker_output(output: std::process::Output, label: &str) -> Result<Option<String>> {
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{label} failed: {}", stderr.trim());
+    }
+    let picked = trim_picker_stdout(&output.stdout);
+    if picked.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(picked))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_command_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false)
+    })
 }
 
 fn filesystem_roots() -> Vec<String> {
@@ -1072,7 +1229,7 @@ fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResu
     let request: ImportHistoryRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let history_path = request_path(&request.history_path, "history_path")?;
-    import_chromium_history(
+    import_browser_history(
         &case_path,
         ImportBrowserHistoryOptions {
             history_path,
@@ -1245,11 +1402,65 @@ fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 }
 
 fn request_path(value: &str, field: &str) -> Result<PathBuf> {
-    let trimmed = trim_balanced_path_quotes(value);
-    if trimmed.is_empty() {
+    let normalized = normalize_request_path(value);
+    if normalized.is_empty() {
         bail!("{field} is required");
     }
-    Ok(PathBuf::from(trimmed))
+    if let Some(corrected) = existence_gated_path_correction(&normalized) {
+        return Ok(PathBuf::from(corrected));
+    }
+    Ok(PathBuf::from(normalized))
+}
+
+// Cross-prefix paste rescue ("/home/a/Downloads//media/usb/x.dd"): the pure
+// doubling detector only trusts a repeat of the path's own leading prefix, so
+// a paste that switches roots needs this second chance. Rewriting is gated on
+// the filesystem: only when the typed path does not exist and the candidate
+// does can the rewrite never redirect a valid evidence path.
+fn existence_gated_path_correction(value: &str) -> Option<String> {
+    if Path::new(value).exists() {
+        return None;
+    }
+    let restart = last_wellknown_root_restart(value)?;
+    let corrected = value[restart..].trim();
+    if !corrected.is_empty() && Path::new(corrected).exists() {
+        Some(corrected.to_string())
+    } else {
+        None
+    }
+}
+
+fn last_wellknown_root_restart(value: &str) -> Option<usize> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    const PREFIXES: [&str; 6] = [
+        "/Users/",
+        "/home/",
+        "/Volumes/",
+        "/mnt/",
+        "/media/",
+        "/tmp/",
+    ];
+    let mut restart = None;
+    for prefix in PREFIXES {
+        let mut offset = 1;
+        while offset < value.len() {
+            let Some(position) = value[offset..].find(prefix) else {
+                break;
+            };
+            let index = offset + position;
+            restart = Some(restart.map_or(index, |current: usize| current.max(index)));
+            offset = index + prefix.len();
+        }
+    }
+    restart
+}
+
+fn normalize_request_path(value: &str) -> String {
+    let trimmed = trim_balanced_path_quotes(value);
+    let without_file_url = strip_file_url_prefix(&trimmed);
+    correct_doubled_absolute_path(&without_file_url).unwrap_or(without_file_url)
 }
 
 fn trim_balanced_path_quotes(value: &str) -> String {
@@ -1273,9 +1484,159 @@ fn trim_balanced_path_quotes(value: &str) -> String {
     trimmed.to_string()
 }
 
+fn strip_file_url_prefix(value: &str) -> String {
+    let Some(prefix) = value.get(..7) else {
+        return value.to_string();
+    };
+    if !prefix.eq_ignore_ascii_case("file://") {
+        return value.to_string();
+    }
+    let mut path = decode_percent_20(&value[7..]);
+    if is_drive_marker_at(path.as_bytes(), 1) {
+        path.remove(0);
+    }
+    path
+}
+
+fn decode_percent_20(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let mut lookahead = chars.clone();
+            if matches!(lookahead.next(), Some(next) if next.eq_ignore_ascii_case(&'2'))
+                && matches!(lookahead.next(), Some('0'))
+            {
+                chars.next();
+                chars.next();
+                decoded.push(' ');
+                continue;
+            }
+        }
+        decoded.push(ch);
+    }
+    decoded
+}
+
+fn correct_doubled_absolute_path(value: &str) -> Option<String> {
+    let restart = [
+        last_drive_restart(value),
+        last_posix_restart(value),
+        last_repeated_leading_prefix(value),
+    ]
+    .into_iter()
+    .flatten()
+    .max()?;
+    let corrected = value[restart..].trim();
+    if corrected.is_empty() {
+        None
+    } else {
+        Some(corrected.to_string())
+    }
+}
+
+fn last_drive_restart(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut restart = None;
+    for index in 1..bytes.len().saturating_sub(2) {
+        if is_drive_marker_at(bytes, index) && !drive_marker_inside_long_prefix(bytes, index) {
+            restart = Some(index);
+        }
+    }
+    restart
+}
+
+fn is_drive_marker_at(bytes: &[u8], index: usize) -> bool {
+    index + 2 < bytes.len()
+        && bytes[index].is_ascii_alphabetic()
+        && bytes[index + 1] == b':'
+        && matches!(bytes[index + 2], b'\\' | b'/')
+}
+
+fn drive_marker_inside_long_prefix(bytes: &[u8], index: usize) -> bool {
+    if index < 4 {
+        return false;
+    }
+    let prefix = &bytes[index - 4..index];
+    prefix == b"\\\\?\\" || prefix == b"\\\\.\\" || prefix == b"//?/" || prefix == b"//./"
+}
+
+fn last_posix_restart(value: &str) -> Option<usize> {
+    // Only the path's own leading components restarting mid-string is a safe
+    // doubling signal; well-known roots like "/media/" or "/Users/" are legal
+    // mid-path names ("/home/beel/media/photos" must not be rewritten).
+    let leading = leading_posix_prefix(value)?;
+    let mut offset = 1;
+    let mut restart = None;
+    while offset < value.len() {
+        let Some(position) = value[offset..].find(leading) else {
+            break;
+        };
+        let index = offset + position;
+        restart = Some(index);
+        offset = index + leading.len();
+    }
+    restart
+}
+
+fn leading_posix_prefix(value: &str) -> Option<&str> {
+    if !value.starts_with('/') || value.len() < 4 || value.as_bytes()[1] == b'/' {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let first = bytes[1..].iter().position(|byte| *byte == b'/')? + 1;
+    let second = bytes[first + 1..].iter().position(|byte| *byte == b'/')? + first + 1;
+    if second == first + 1 {
+        return None;
+    }
+    Some(&value[..=second])
+}
+
+fn last_repeated_leading_prefix(value: &str) -> Option<usize> {
+    let prefix = leading_double_slash_prefix(value)?;
+    let mut offset = 1;
+    let mut restart = None;
+    while offset < value.len() {
+        let Some(position) = value[offset..].find(prefix) else {
+            break;
+        };
+        let index = offset + position;
+        restart = Some(index);
+        offset = index + prefix.len();
+    }
+    restart
+}
+
+fn leading_double_slash_prefix(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 4 || !is_separator(bytes[0]) || bytes[0] != bytes[1] {
+        return None;
+    }
+    let first = bytes[2..]
+        .iter()
+        .position(|byte| is_separator(*byte))
+        .map(|position| position + 2)?;
+    if first == 2 || first + 1 >= bytes.len() {
+        return None;
+    }
+    let second = bytes[first + 1..]
+        .iter()
+        .position(|byte| is_separator(*byte))
+        .map(|position| position + first + 1);
+    match second {
+        Some(index) if index > first + 1 => Some(&value[..index]),
+        None => Some(value),
+        _ => None,
+    }
+}
+
+fn is_separator(byte: u8) -> bool {
+    matches!(byte, b'\\' | b'/')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::trim_balanced_path_quotes;
+    use super::{normalize_request_path, trim_balanced_path_quotes};
 
     #[test]
     fn path_quote_trimming_accepts_pasted_windows_paths() {
@@ -1290,6 +1651,88 @@ mod tests {
         assert_eq!(
             trim_balanced_path_quotes(r#"C:\Users\xt\Downloads\case file.E01"#),
             r#"C:\Users\xt\Downloads\case file.E01"#
+        );
+    }
+
+    #[test]
+    fn path_normalization_corrects_concatenated_posix_paths() {
+        assert_eq!(
+            normalize_request_path(
+                "/Users/cristina.niculescu/Downloads//Users/cristina.niculescu/Downloads/image.E01"
+            ),
+            "/Users/cristina.niculescu/Downloads/image.E01"
+        );
+        assert_eq!(
+            normalize_request_path("/home/xt/old/home/xt/new/image.E01"),
+            "/home/xt/new/image.E01"
+        );
+    }
+
+    #[test]
+    fn path_normalization_keeps_wellknown_roots_used_as_folder_names() {
+        assert_eq!(
+            normalize_request_path("/home/beel/media/photos/image.E01"),
+            "/home/beel/media/photos/image.E01"
+        );
+        assert_eq!(
+            normalize_request_path("/Users/kris/Documents/Users/report.pdf"),
+            "/Users/kris/Documents/Users/report.pdf"
+        );
+        assert_eq!(
+            normalize_request_path("/home/beel/backup/home/old.dd"),
+            "/home/beel/backup/home/old.dd"
+        );
+        assert_eq!(
+            normalize_request_path("/tmp/case/tmp.dd"),
+            "/tmp/case/tmp.dd"
+        );
+    }
+
+    #[test]
+    fn path_normalization_corrects_concatenated_windows_paths() {
+        assert_eq!(
+            normalize_request_path(r#"C:\Evidence\oldC:\Evidence\new\image.E01"#),
+            r#"C:\Evidence\new\image.E01"#
+        );
+        assert_eq!(
+            normalize_request_path("C:/Evidence/oldD:/Evidence/new/image.E01"),
+            "D:/Evidence/new/image.E01"
+        );
+    }
+
+    #[test]
+    fn path_normalization_preserves_leading_unc_and_long_paths() {
+        assert_eq!(
+            normalize_request_path(r#"\\server\share\image.E01"#),
+            r#"\\server\share\image.E01"#
+        );
+        assert_eq!(
+            normalize_request_path(r#"\\?\C:\very\long\image.E01"#),
+            r#"\\?\C:\very\long\image.E01"#
+        );
+    }
+
+    #[test]
+    fn path_normalization_corrects_repeated_unc_prefix() {
+        assert_eq!(
+            normalize_request_path(r#"\\server\share\old\\server\share\new.E01"#),
+            r#"\\server\share\new.E01"#
+        );
+        assert_eq!(
+            normalize_request_path(r#"\\?\C:\old\\?\C:\new\image.E01"#),
+            r#"\\?\C:\new\image.E01"#
+        );
+    }
+
+    #[test]
+    fn path_normalization_strips_file_url_prefix_and_percent_20() {
+        assert_eq!(
+            normalize_request_path("file:///Users/xt/Downloads/case%20file.E01"),
+            "/Users/xt/Downloads/case file.E01"
+        );
+        assert_eq!(
+            normalize_request_path("file:///C:/Users/xt/Downloads/case%20file.E01"),
+            "C:/Users/xt/Downloads/case file.E01"
         );
     }
 }
@@ -1386,7 +1829,9 @@ fn json_ok<T: Serialize>(value: T) -> HttpResponse {
 fn api_response<T: Serialize>(result: Result<T>) -> HttpResponse {
     match result {
         Ok(value) => json_ok(value),
-        Err(err) => json_error(400, &err.to_string()),
+        // {err:#} keeps the cause chain (e.g. "... : No such file or directory")
+        // so the UI notice explains WHY, not just where, an operation failed.
+        Err(err) => json_error(400, &format!("{err:#}")),
     }
 }
 
@@ -3035,7 +3480,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button class="evidence-type active" data-type="image" title="E01, dd/raw, VHD/VHDX, VMDK, VDI disk images">Disk image</button>
                 <button class="evidence-type" data-type="folder" title="A local folder of files">Folder</button>
                 <button class="evidence-type" data-type="file" title="A single local file">Single file</button>
-                <button class="evidence-type" data-type="browser_history" title="Chrome/Edge/Chromium profile folder or History SQLite database">Browser history</button>
+                <button class="evidence-type" data-type="browser_history" title="Chrome/Edge/Chromium or Firefox profile folder, or a History / places.sqlite / History.db file">Browser history</button>
               </div>
               <p id="evidenceTypeHint" class="muted tiny">E01, dd/raw, VHD/VHDX, VMDK, VDI disk images</p>
               <div class="path-pick-row">
@@ -3315,10 +3760,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function currentEvidencePath() {
-      const value = normalizePathInput($("evidencePath").value);
-      $("evidencePath").value = value;
-      localStorage.setItem("kdft.evidencePath", value);
-      return value;
+      return currentEvidencePathDetails().value;
+    }
+
+    function currentEvidencePathDetails() {
+      const result = normalizePathInputDetails($("evidencePath").value);
+      $("evidencePath").value = result.value;
+      localStorage.setItem("kdft.evidencePath", result.value);
+      return result;
     }
 
     function currentReportPath() {
@@ -3328,6 +3777,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function normalizePathInput(value) {
+      return normalizePathInputDetails(value).value;
+    }
+
+    function normalizePathInputDetails(value) {
       let text = String(value ?? "").trim();
       while (text.length >= 2) {
         const first = text[0];
@@ -3341,7 +3794,119 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         text = text.slice(1, -1).trim();
       }
-      return text;
+      text = stripFileUrlPathPrefix(text);
+      const restart = doubledAbsolutePathRestart(text);
+      if (restart > 0) {
+        return { value: text.slice(restart).trim(), corrected: true };
+      }
+      return { value: text, corrected: false };
+    }
+
+    function stripFileUrlPathPrefix(text) {
+      if (!text.toLowerCase().startsWith("file://")) {
+        return text;
+      }
+      let path = text.slice("file://".length).replace(/%20/gi, " ");
+      if (/^\/[A-Za-z]:[\\/]/.test(path)) {
+        path = path.slice(1);
+      }
+      return path;
+    }
+
+    function doubledAbsolutePathRestart(text) {
+      let restart = -1;
+      const drivePattern = /[A-Za-z]:[\\/]/g;
+      let match = null;
+      while ((match = drivePattern.exec(text)) !== null) {
+        if (match.index > 0 && !driveMarkerInsideLongPathPrefix(text, match.index)) {
+          restart = match.index;
+        }
+      }
+      // Only a repeat of the path's own leading components is a safe doubling
+      // signal; "/media/" etc. are legal mid-path names.
+      const leading = leadingPosixPrefix(text);
+      if (leading) {
+        let index = text.indexOf(leading, 1);
+        while (index !== -1) {
+          restart = Math.max(restart, index);
+          index = text.indexOf(leading, index + leading.length);
+        }
+      }
+      restart = Math.max(restart, repeatedLeadingPrefixRestart(text));
+      return restart;
+    }
+
+    function leadingPosixPrefix(text) {
+      if (text.length < 4 || text[0] !== "/" || text[1] === "/") {
+        return "";
+      }
+      const first = text.indexOf("/", 1);
+      if (first === -1) {
+        return "";
+      }
+      const second = text.indexOf("/", first + 1);
+      if (second === -1 || second === first + 1) {
+        return "";
+      }
+      return text.slice(0, second + 1);
+    }
+
+    function driveMarkerInsideLongPathPrefix(text, index) {
+      if (index < 4) {
+        return false;
+      }
+      const prefix = text.slice(index - 4, index);
+      return prefix === "\\\\?\\" || prefix === "\\\\.\\" || prefix === "//?/" || prefix === "//./";
+    }
+
+    function repeatedLeadingPrefixRestart(text) {
+      const prefix = leadingDoubleSlashPrefix(text);
+      if (!prefix) {
+        return -1;
+      }
+      let restart = -1;
+      let index = text.indexOf(prefix, 1);
+      while (index !== -1) {
+        restart = index;
+        index = text.indexOf(prefix, index + prefix.length);
+      }
+      return restart;
+    }
+
+    function leadingDoubleSlashPrefix(text) {
+      if (text.length < 4 || !isPathSeparator(text[0]) || text[1] !== text[0]) {
+        return "";
+      }
+      const first = nextPathSeparator(text, 2);
+      if (first <= 2 || first + 1 >= text.length) {
+        return "";
+      }
+      const second = nextPathSeparator(text, first + 1);
+      if (second > first + 1) {
+        return text.slice(0, second);
+      }
+      return second === -1 ? text : "";
+    }
+
+    function nextPathSeparator(text, start) {
+      for (let index = start; index < text.length; index += 1) {
+        if (isPathSeparator(text[index])) {
+          return index;
+        }
+      }
+      return -1;
+    }
+
+    function isPathSeparator(ch) {
+      return ch === "/" || ch === "\\";
+    }
+
+    function pathCorrectionNotice(pathResult) {
+      return "Input looked like two concatenated paths; using " + pathResult.value;
+    }
+
+    function withPathCorrectionNotice(message, pathResult) {
+      return pathResult && pathResult.corrected ? pathCorrectionNotice(pathResult) + ". " + message : message;
     }
 
     function analysisWindowUrl() {
@@ -3462,7 +4027,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       image: { label: "Image path", placeholder: "C:\\Evidence\\image.E01", button: "Add Evidence", pick: "file", filter: "image", hint: "E01 (split segments auto-detected), dd/raw, split .001, VHD/VHDX, VMDK, VDI disk images" },
       folder: { label: "Folder path", placeholder: "C:\\Evidence\\source-folder", button: "Add Evidence", pick: "folder", filter: "any", hint: "A local folder of files" },
       file: { label: "File path", placeholder: "C:\\Evidence\\document.pdf", button: "Add Evidence", pick: "file", filter: "any", hint: "A single local file" },
-      browser_history: { label: "Profile folder", placeholder: "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default", button: "Import Browser History", pick: "folder", filter: "any", hint: "Chrome/Edge/Chromium profile folder (or paste a History database path)" }
+      browser_history: { label: "Profile folder or DB file", placeholder: "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default", button: "Import Browser History", pick: "folder", filter: "any", hint: "Chrome/Edge/Chromium or Firefox profile folder, or a History / places.sqlite / History.db file" }
     };
 
     function setEvidenceType(type) {
@@ -3485,11 +4050,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
         await importHistory();
         return;
       }
+      const evidencePath = currentEvidencePathDetails();
       try {
+        if (evidencePath.corrected) {
+          setNotice(pathCorrectionNotice(evidencePath) + ".");
+        }
         const processNow = $("readFileSystem").value === "true";
         const data = await apiPost("/api/evidence/add", {
           case_path: currentCasePath(),
-          path: currentEvidencePath(),
+          path: evidencePath.value,
           kind: type,
           read_file_system: processNow,
           notes: $("evidenceNotes").value
@@ -3497,7 +4066,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (!processNow) {
           await refresh();
           selectEvidenceSource(data.evidence_id, "/");
-          setNotice("Attached evidence " + data.evidence_id + ".");
+          setNotice(withPathCorrectionNotice("Attached evidence " + data.evidence_id + ".", evidencePath));
           return;
         }
         try {
@@ -3508,14 +4077,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           });
           await refresh();
           selectEvidenceSource(data.evidence_id, preferredAnalysisPath(data.evidence_id));
-          setNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries.");
+          setNotice(withPathCorrectionNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries.", evidencePath));
         } catch (processErr) {
           await refresh();
           selectEvidenceSource(data.evidence_id, "/");
-          setNotice("Attached evidence " + data.evidence_id + ", but processing failed: " + processErr.message, true);
+          setNotice(withPathCorrectionNotice("Attached evidence " + data.evidence_id + ", but processing failed: " + processErr.message, evidencePath), true);
         }
       } catch (err) {
-        setNotice(err.message, true);
+        setNotice(withPathCorrectionNotice(err.message, evidencePath), true);
       }
     }
 
@@ -3525,8 +4094,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const browseButton = $("browseEvidence");
       browseButton.disabled = true;
       setNotice(spec.pick === "folder"
-        ? "Choose the folder in the Windows dialog, then press Open."
-        : "Choose the file in the Windows dialog.");
+        ? "Choose the folder in the system dialog, then press Open."
+        : "Choose the file in the system dialog.");
       try {
         const data = await apiGet("/api/pick", {
           mode: spec.pick,
@@ -3715,19 +4284,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function importHistory() {
+      const historyPath = currentEvidencePathDetails();
       try {
+        if (historyPath.corrected) {
+          setNotice(pathCorrectionNotice(historyPath) + ".");
+        }
         const data = await apiPost("/api/history/import", {
           case_path: currentCasePath(),
-          history_path: currentEvidencePath(),
-          max_visits: numberValue("historyMaxVisits", 5000),
-          evidence_name: "Browser Activities"
+          history_path: historyPath.value,
+          max_visits: numberValue("historyMaxVisits", 5000)
         });
         const message = "Imported browser activities: " + data.entries_indexed + " records (" + data.status + ").";
         await refresh();
         selectEvidenceSource(data.evidence_id, data.visits_indexed > 0 ? "/Browser Activities/Visits" : "/Browser Activities");
-        setNotice(message);
+        setNotice(withPathCorrectionNotice(message, historyPath));
       } catch (err) {
-        setNotice(err.message, true);
+        setNotice(withPathCorrectionNotice(err.message, historyPath), true);
       }
     }
 

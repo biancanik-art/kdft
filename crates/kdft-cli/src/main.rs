@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, case_info, create_bookmark,
     create_bookmark_folder, create_case, deep_search, filesystem_entry_count, global_options,
-    import_chromium_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
+    import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
     list_evidence, list_installed_resources, process_evidence, render_report_html, report_data,
     update_global_options, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
     CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions,
@@ -576,7 +576,7 @@ fn main() -> Result<()> {
         },
         Command::History { command } => match command {
             HistoryCommand::Import(args) => {
-                let result = import_chromium_history(
+                let result = import_browser_history(
                     &args.case,
                     ImportBrowserHistoryOptions {
                         history_path: args.path,

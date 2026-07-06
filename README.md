@@ -16,7 +16,7 @@ builds for all three operating systems:
 
 - **Windows x64** — `kdft-vX.Y.Z-windows-x64.zip` (or the standalone `kdft-ui.exe`)
 - **macOS** — `kdft-vX.Y.Z-macos-arm64.tar.gz` (Apple Silicon) or `-macos-x64.tar.gz`
-  (Intel); first launch: right-click `kdft-ui` and choose Open (unsigned binary)
+  (Intel)
 - **Linux x64** — `kdft-vX.Y.Z-linux-x64.tar.gz`
 
 On Windows, grab `kdft-ui.exe` and run it — no installer, no dependencies:
@@ -30,6 +30,29 @@ opens your browser. From there: **New / Open Case** -> create the case database 
 Evidence** (disk image / folder / single file / browser history, with a native Browse dialog)
 -> Analyze, Deep Search, Bookmarks, Quick Report. Reports carry a KDFT integrity footer with a
 SHA-256 that is also recorded in the case database's audit trail.
+
+On macOS, unpack the matching tarball, then remove the download quarantine and run the
+workbench:
+
+```bash
+xattr -d com.apple.quarantine kdft-ui kdft
+./kdft-ui --port 8780 --open
+```
+
+The macOS binaries are ad-hoc signed, not notarized. Apple requires a paid Developer ID for
+Gatekeeper-clean distribution, so downloaded unsigned command-line binaries can still need the
+quarantine attribute removed before first run.
+
+On Linux, unpack the tarball and run the workbench:
+
+```bash
+chmod +x kdft-ui kdft
+./kdft-ui --port 8780 --open
+```
+
+The `chmod +x` step is only needed if the archive tool did not preserve executable bits.
+Install `zenity` for the Browse dialog when available; KDFT also tries `kdialog` and otherwise
+accepts manually typed paths.
 
 `kdft.exe` is the equivalent command-line interface for scripted workflows (see
 [Current Commands](#current-commands)).

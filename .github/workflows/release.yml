@@ -28,7 +28,7 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           gh release create "$tag" --verify-tag --title "KDFT $tag" \
-            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First run on macOS: xattr -d com.apple.quarantine kdft-ui kdft (Gatekeeper quarantine on downloaded unsigned binaries), then ./kdft-ui --port 8780 --open." \
             || true
           gh release upload "$tag" "kdft-$tag-windows-x64.zip" target/release/kdft-ui.exe target/release/kdft.exe --clobber
 
@@ -50,7 +50,7 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           gh release create "$tag" --verify-tag --title "KDFT $tag" \
-            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First run on macOS: xattr -d com.apple.quarantine kdft-ui kdft (Gatekeeper quarantine on downloaded unsigned binaries), then ./kdft-ui --port 8780 --open." \
             || true
           gh release upload "$tag" "kdft-$tag-linux-x64.tar.gz" --clobber
 
@@ -63,6 +63,10 @@ jobs:
           rustup target add x86_64-apple-darwin
           cargo build --release -p kdft-ui -p kdft-cli
           cargo build --release --target x86_64-apple-darwin -p kdft-ui -p kdft-cli
+      - name: Ad-hoc sign macOS binaries
+        run: |
+          codesign --force -s - target/release/kdft-ui target/release/kdft target/x86_64-apple-darwin/release/kdft-ui target/x86_64-apple-darwin/release/kdft
+          # Developer ID signing + notarization can be added here when certificates are available
       - name: Package
         run: |
           tag="${{ github.ref_name }}"
@@ -77,6 +81,6 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           gh release create "$tag" --verify-tag --title "KDFT $tag" \
-            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First launch on macOS: right-click kdft-ui and choose Open (unsigned binary)." \
+            --notes "Self-contained KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. First run on macOS: xattr -d com.apple.quarantine kdft-ui kdft (Gatekeeper quarantine on downloaded unsigned binaries), then ./kdft-ui --port 8780 --open." \
             || true
           gh release upload "$tag" "kdft-$tag-macos-arm64.tar.gz" "kdft-$tag-macos-x64.tar.gz" --clobber
