@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "kdft-case"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "kdft-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "kdft-ui"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "kdft-case",
