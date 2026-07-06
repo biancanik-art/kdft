@@ -2,11 +2,13 @@ use anyhow::{bail, Context, Result};
 use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, carve_evidence, case_info,
     category_entry_counts, clear_all_findings, create_bookmark, create_bookmark_folder,
-    create_case, deep_search, export_image_file, export_image_tree, filesystem_entry_count,
-    hash_evidence, import_browser_history, list_bookmark_folders, list_bookmark_items,
-    list_bookmarks, list_evidence, list_filesystem_entries_limited, max_filesystem_entry_id,
-    process_evidence, read_filesystem_entry_bytes, record_live_export, record_live_tree_export,
-    record_report_export, recover_filesystem_entry, remove_evidence, render_report, report_data,
+    create_case, deep_search, export_image_file, export_image_tree, export_local_file,
+    export_local_tree, filesystem_entry_count, hash_evidence, import_browser_history,
+    list_bookmark_folders, list_bookmark_items, list_bookmarks, list_entries_by_category,
+    list_evidence, list_filesystem_entries_limited, max_filesystem_entry_id, process_evidence,
+    read_filesystem_entry_bytes, record_live_export, record_live_export_with_source_kind,
+    record_live_tree_export, record_live_tree_export_with_source_kind, record_report_export,
+    recover_filesystem_entry, remove_evidence, render_report, report_data,
     report_data_with_directory_structure, AddEvidenceOptions, AnalyzeSignaturesOptions,
     BookmarkType, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
     CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserHistoryOptions,
@@ -356,9 +358,11 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("GET", "/api/image/volumes") => api_response(api_image_volumes(&query)),
         ("GET", "/api/image/dir") => api_response(api_image_dir(&query)),
         ("GET", "/api/image/bytes") => api_response(api_image_bytes(&query)),
+        ("GET", "/api/image/find") => api_response(api_image_find(&query)),
         ("POST", "/api/image/export") => api_response(api_image_export(&request.body)),
         ("POST", "/api/image/export-tree") => api_response(api_image_export_tree(&request.body)),
         ("GET", "/api/entries/dir") => api_response(api_entries_dir(&query)),
+        ("GET", "/api/entries/category") => api_response(api_entries_category(&query)),
         ("GET", "/api/state") => api_response(api_state(&query)),
         ("GET", "/api/entry/bytes") => api_response(api_entry_bytes(&query)),
         ("GET", "/api/entry/raw") => match api_entry_raw(&query) {
@@ -528,23 +532,36 @@ fn api_entry_raw(query: &HashMap<String, String>) -> Result<(&'static str, Vec<u
 }
 
 /// Live-browse variant of /api/entry/raw: decode one file straight from an
-/// attached disk image volume and serve it as an image. Same signature
-/// sniffing as the indexed endpoint, so it cannot dump arbitrary bytes.
+/// attached live source and serve it as an image. Same signature sniffing as
+/// the indexed endpoint, so it cannot dump arbitrary bytes.
 fn api_image_raw(query: &HashMap<String, String>) -> Result<(&'static str, Vec<u8>)> {
-    let image_path = evidence_image_path(query)?;
-    let volume_index: usize = query
-        .get("volume")
-        .context("volume query parameter is required")?
-        .parse()
-        .context("volume must be an integer")?;
+    let (case_path, source) = live_evidence_from_query(query)?;
     let path = query
         .get("path")
         .context("path query parameter is required")?;
     let length = query_usize(query, "length")?
         .unwrap_or(RAW_PREVIEW_MAX_BYTES)
         .min(RAW_PREVIEW_MAX_BYTES);
-    let (bytes, _total_size) =
-        kdft_case::read_image_directory_bytes(&image_path, volume_index, path, 0, length)?;
+    let (bytes, _total_size) = match source.source_kind.as_str() {
+        "image" => {
+            let volume_index: usize = query
+                .get("volume")
+                .context("volume query parameter is required")?
+                .parse()
+                .context("volume must be an integer")?;
+            kdft_case::read_image_directory_bytes(
+                Path::new(&source.source_path),
+                volume_index,
+                path,
+                0,
+                length,
+            )?
+        }
+        "folder" | "file" => {
+            kdft_case::read_local_evidence_bytes(&case_path, source.id, path, 0, length)?
+        }
+        other => bail!("live raw preview is not available for {other} evidence"),
+    };
     let content_type = detect_image_content_type(&bytes)
         .context("live file does not start with a supported image signature")?;
     Ok((content_type, bytes))
@@ -568,7 +585,31 @@ fn detect_image_content_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn evidence_image_path(query: &HashMap<String, String>) -> Result<PathBuf> {
+#[derive(Debug)]
+struct LiveEvidenceRef {
+    id: i64,
+    source_kind: String,
+    source_path: String,
+    display_name: String,
+    size_bytes: Option<i64>,
+}
+
+fn live_evidence_source(case_path: &Path, evidence_id: i64) -> Result<LiveEvidenceRef> {
+    let evidence = list_evidence(&case_path)?;
+    let source = evidence
+        .into_iter()
+        .find(|item| item.id == evidence_id)
+        .with_context(|| format!("evidence {evidence_id} not found"))?;
+    Ok(LiveEvidenceRef {
+        id: source.id,
+        source_kind: source.source_kind,
+        source_path: source.source_path,
+        display_name: source.display_name,
+        size_bytes: source.size_bytes,
+    })
+}
+
+fn live_evidence_from_query(query: &HashMap<String, String>) -> Result<(PathBuf, LiveEvidenceRef)> {
     let case_path = query
         .get("case_path")
         .map(String::as_str)
@@ -579,33 +620,75 @@ fn evidence_image_path(query: &HashMap<String, String>) -> Result<PathBuf> {
         .context("evidence_id query parameter is required")?
         .parse()
         .context("evidence_id must be an integer")?;
-    let evidence = list_evidence(&case_path)?;
-    let source = evidence
-        .iter()
-        .find(|item| item.id == evidence_id)
-        .with_context(|| format!("evidence {evidence_id} not found"))?;
-    if source.source_kind != "image" {
-        bail!("live browsing is only available for disk-image evidence");
-    }
-    Ok(PathBuf::from(&source.source_path))
+    let source = live_evidence_source(&case_path, evidence_id)?;
+    Ok((case_path, source))
+}
+
+fn local_live_volume(source: &LiveEvidenceRef) -> serde_json::Value {
+    let source_path = Path::new(&source.source_path);
+    let label = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&source.display_name);
+    let size_bytes = source
+        .size_bytes
+        .and_then(|value| u64::try_from(value).ok())
+        .or_else(|| {
+            fs::metadata(source_path)
+                .ok()
+                .map(|metadata| metadata.len())
+        })
+        .unwrap_or(0);
+    json!({
+        "index": 0,
+        "name": label,
+        "filesystem": "LOCAL",
+        "start_offset": 0,
+        "size_bytes": size_bytes,
+        "browsable": true,
+        "source_kind": source.source_kind,
+    })
 }
 
 fn api_image_volumes(query: &HashMap<String, String>) -> Result<serde_json::Value> {
-    let image_path = evidence_image_path(query)?;
-    let volumes = kdft_case::list_image_volumes(&image_path)?;
-    Ok(json!({ "volumes": volumes }))
+    let (_case_path, source) = live_evidence_from_query(query)?;
+    if source.source_kind == "image" {
+        let volumes = kdft_case::list_image_volumes(Path::new(&source.source_path))?;
+        return Ok(json!({ "volumes": volumes }));
+    }
+    if source.source_kind == "folder" || source.source_kind == "file" {
+        return Ok(json!({ "volumes": [local_live_volume(&source)] }));
+    }
+    bail!(
+        "live browsing is not available for {} evidence",
+        source.source_kind
+    )
 }
 
 fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
-    let image_path = evidence_image_path(query)?;
-    let volume_index: usize = query
-        .get("volume")
-        .context("volume query parameter is required")?
-        .parse()
-        .context("volume must be an integer")?;
+    let (case_path, source) = live_evidence_from_query(query)?;
     let path = query.get("path").map(String::as_str).unwrap_or("/");
-    let entries = kdft_case::list_image_directory(&image_path, volume_index, path)?;
-    Ok(json!({ "entries": entries }))
+    match source.source_kind.as_str() {
+        "image" => {
+            let volume_index: usize = query
+                .get("volume")
+                .context("volume query parameter is required")?
+                .parse()
+                .context("volume must be an integer")?;
+            let entries = kdft_case::list_image_directory(
+                Path::new(&source.source_path),
+                volume_index,
+                path,
+            )?;
+            Ok(json!({ "entries": entries }))
+        }
+        "folder" | "file" => {
+            let listing = kdft_case::list_local_directory(&case_path, source.id, path)?;
+            Ok(json!({ "entries": listing.entries, "truncated": listing.truncated }))
+        }
+        other => bail!("live browsing is not available for {other} evidence"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -621,18 +704,39 @@ fn api_image_export(body: &[u8]) -> Result<kdft_case::LiveExportResult> {
     let request: LiveExportRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let output_path = request_path(&request.output_path, "output_path")?;
-    let mut query = HashMap::new();
-    query.insert("case_path".to_string(), request.case_path.clone());
-    query.insert("evidence_id".to_string(), request.evidence_id.to_string());
-    let image_path = evidence_image_path(&query)?;
-    let result = export_image_file(&image_path, request.volume, &request.path, &output_path)?;
-    record_live_export(
-        &case_path,
-        request.evidence_id,
-        request.volume,
-        &request.path,
-        &result,
-    )?;
+    let source = live_evidence_source(&case_path, request.evidence_id)?;
+    let result = match source.source_kind.as_str() {
+        "image" => {
+            let result = export_image_file(
+                Path::new(&source.source_path),
+                request.volume,
+                &request.path,
+                &output_path,
+            )?;
+            record_live_export(
+                &case_path,
+                request.evidence_id,
+                request.volume,
+                &request.path,
+                &result,
+            )?;
+            result
+        }
+        "folder" | "file" => {
+            let result =
+                export_local_file(&case_path, request.evidence_id, &request.path, &output_path)?;
+            record_live_export_with_source_kind(
+                &case_path,
+                request.evidence_id,
+                &source.source_kind,
+                request.volume,
+                &request.path,
+                &result,
+            )?;
+            result
+        }
+        other => bail!("live export is not available for {other} evidence"),
+    };
     Ok(result)
 }
 
@@ -650,44 +754,97 @@ fn api_image_export_tree(body: &[u8]) -> Result<kdft_case::LiveTreeExportResult>
     let request: LiveTreeExportRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let output_dir = request_path(&request.output_dir, "output_dir")?;
-    let mut query = HashMap::new();
-    query.insert("case_path".to_string(), request.case_path.clone());
-    query.insert("evidence_id".to_string(), request.evidence_id.to_string());
-    let image_path = evidence_image_path(&query)?;
-    let result = export_image_tree(
-        &image_path,
-        request.volume,
-        &request.path,
-        &output_dir,
-        request.max_files,
-    )?;
-    record_live_tree_export(
-        &case_path,
-        request.evidence_id,
-        request.volume,
-        &request.path,
-        &result,
-    )?;
+    let source = live_evidence_source(&case_path, request.evidence_id)?;
+    let result = match source.source_kind.as_str() {
+        "image" => {
+            let result = export_image_tree(
+                Path::new(&source.source_path),
+                request.volume,
+                &request.path,
+                &output_dir,
+                request.max_files,
+            )?;
+            record_live_tree_export(
+                &case_path,
+                request.evidence_id,
+                request.volume,
+                &request.path,
+                &result,
+            )?;
+            result
+        }
+        "folder" => {
+            let result = export_local_tree(
+                &case_path,
+                request.evidence_id,
+                &request.path,
+                &output_dir,
+                request.max_files,
+            )?;
+            record_live_tree_export_with_source_kind(
+                &case_path,
+                request.evidence_id,
+                &source.source_kind,
+                request.volume,
+                &request.path,
+                &result,
+            )?;
+            result
+        }
+        "file" => bail!("recursive live export is not available for single-file evidence"),
+        other => bail!("live export is not available for {other} evidence"),
+    };
     Ok(result)
 }
 
 fn api_image_bytes(query: &HashMap<String, String>) -> Result<serde_json::Value> {
-    let image_path = evidence_image_path(query)?;
-    let volume_index: usize = query
-        .get("volume")
-        .context("volume query parameter is required")?
-        .parse()
-        .context("volume must be an integer")?;
-    let path = query
-        .get("path")
-        .context("path query parameter is required")?;
+    let (case_path, source) = live_evidence_from_query(query)?;
     let offset = query_u64(query, "offset")?.unwrap_or(0);
     let length = query
         .get("length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(512);
-    let (bytes, total_size) =
-        kdft_case::read_image_directory_bytes(&image_path, volume_index, path, offset, length)?;
+    if query_bool(query, "raw") {
+        if source.source_kind != "image" {
+            bail!("raw image bytes are only available for image evidence");
+        }
+        let (bytes, total_size) =
+            kdft_case::read_image_raw_bytes(&case_path, source.id, offset, length)?;
+        let bytes_read = bytes.len();
+        return Ok(json!({
+            "logical_path": "Whole device (raw)",
+            "offset": offset.min(total_size),
+            "requested_length": length.min(8 * 1024 * 1024),
+            "bytes_read": bytes_read,
+            "total_size": total_size,
+            "eof": offset.saturating_add(bytes_read as u64) >= total_size,
+            "bytes": bytes,
+            "raw": true,
+        }));
+    }
+    let path = query
+        .get("path")
+        .context("path query parameter is required")?;
+    let (bytes, total_size) = match source.source_kind.as_str() {
+        "image" => {
+            let volume_index: usize = query
+                .get("volume")
+                .context("volume query parameter is required")?
+                .parse()
+                .context("volume must be an integer")?;
+            kdft_case::read_image_directory_bytes(
+                Path::new(&source.source_path),
+                volume_index,
+                path,
+                offset,
+                length,
+            )?
+        }
+        "folder" | "file" => {
+            kdft_case::read_local_evidence_bytes(&case_path, source.id, path, offset, length)?
+        }
+        other => bail!("live byte reading is not available for {other} evidence"),
+    };
     let bytes_read = bytes.len();
     Ok(json!({
         "logical_path": path,
@@ -698,6 +855,21 @@ fn api_image_bytes(query: &HashMap<String, String>) -> Result<serde_json::Value>
         "eof": offset.saturating_add(bytes_read as u64) >= total_size,
         "bytes": bytes,
     }))
+}
+
+fn api_image_find(query: &HashMap<String, String>) -> Result<kdft_case::ImageRawFindResult> {
+    let (case_path, source) = live_evidence_from_query(query)?;
+    if source.source_kind != "image" {
+        bail!("raw image find is only available for image evidence");
+    }
+    let start = query_u64(query, "start")?.unwrap_or(0);
+    let q = query
+        .get("q")
+        .map(String::as_str)
+        .context("q query parameter is required")?;
+    let kind =
+        kdft_case::RawFindKind::parse(query.get("kind").map(String::as_str).unwrap_or("text"))?;
+    kdft_case::find_in_image_raw(&case_path, source.id, start, q, kind)
 }
 
 fn api_entries_dir(query: &HashMap<String, String>) -> Result<kdft_case::IndexedDirectory> {
@@ -717,6 +889,29 @@ fn api_entries_dir(query: &HashMap<String, String>) -> Result<kdft_case::Indexed
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10_000);
     kdft_case::list_indexed_directory(&case_path, evidence_id, path, limit)
+}
+
+fn api_entries_category(query: &HashMap<String, String>) -> Result<kdft_case::CategoryEntryPage> {
+    let case_path = query
+        .get("case_path")
+        .map(String::as_str)
+        .context("case_path query parameter is required")
+        .and_then(|value| request_path(value, "case_path"))?;
+    let evidence_id = query
+        .get("evidence_id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .context("evidence_id must be an integer")
+        })
+        .transpose()?;
+    let main = query.get("main").map(String::as_str).unwrap_or("");
+    let sub = query.get("sub").map(String::as_str);
+    let limit = query_usize(query, "limit")?.unwrap_or(1_000);
+    let offset = query_usize(query, "offset")?.unwrap_or(0);
+    list_entries_by_category(&case_path, evidence_id, main, sub, limit, offset)
 }
 
 fn api_fs_list(query: &HashMap<String, String>) -> Result<FsListing> {
@@ -1765,6 +1960,18 @@ fn query_usize(query: &HashMap<String, String>, field: &str) -> Result<Option<us
                 .with_context(|| format!("parsing {field}"))
         })
         .transpose()
+}
+
+fn query_bool(query: &HashMap<String, String>, field: &str) -> bool {
+    query
+        .get(field)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn non_empty(value: String, field: &str) -> Result<String> {
@@ -3028,6 +3235,52 @@ const INDEX_HTML: &str = r###"<!doctype html>
       background: #ffd166;
       color: #0f1716;
     }
+    .hex-info,
+    .raw-find {
+      min-width: max-content;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.12);
+      background: #142522;
+      color: #d8e8e4;
+    }
+    .hex-info {
+      color: #f0c38a;
+      font-weight: 750;
+    }
+    .raw-find {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 3;
+    }
+    .raw-find input,
+    .raw-find select {
+      min-height: 28px;
+      padding: 4px 7px;
+      border: 1px solid rgba(255,255,255,.2);
+      border-radius: 4px;
+      background: #0f1716;
+      color: #eef7f4;
+    }
+    .raw-find input {
+      width: min(320px, 45vw);
+    }
+    .raw-find button {
+      min-height: 28px;
+      padding: 4px 9px;
+      font-size: 11px;
+    }
+    .raw-find button.ghost {
+      border-color: rgba(143,213,200,.45);
+      color: #8fd5c8;
+    }
+    .raw-find-status {
+      color: #f0c38a;
+      overflow-wrap: anywhere;
+    }
     .hex-decode {
       display: grid;
       gap: 10px;
@@ -3672,7 +3925,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       document.body.classList.add("analysis-fullscreen");
     }
     function makeHexState(entryId = null, offset = 0, length = 512, data = null) {
-      return { entryId, offset, length, data, fetching: false, selStart: null, selEnd: null, live: null };
+      return {
+        entryId,
+        offset,
+        length,
+        data,
+        fetching: false,
+        selStart: null,
+        selEnd: null,
+        live: null,
+        raw: null,
+        find: { query: "", kind: "text", status: "", continuation: null, nextStart: null, active: false, lastMatch: null, matchLength: null }
+      };
     }
     const state = {
       casePath: PAGE_PARAMS.get("case_path") || localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath,
@@ -3682,6 +3946,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       browserState: { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" },
       live: { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null },
       idx: { evidenceId: null, dirCache: {}, expanded: new Set(), selPath: "/" },
+      cat: { evidenceId: null, key: null, entries: [], total: null, loading: false, error: "", pageSize: 1000 },
       expandedTreePaths: new Map(),
       inspectorCollapsed: false,
       viewerFullscreen: false,
@@ -3703,6 +3968,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     let hexSelecting = false;
     let hexSelectionAnchor = null;
     let hexPointerId = null;
+
+    function newCategoryCache(evidenceId = null, key = "") {
+      return { evidenceId, key, entries: [], total: null, loading: false, error: "", pageSize: 1000 };
+    }
 
     function setNotice(message, bad) {
       const notice = $("notice");
@@ -4076,7 +4345,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
             max_entries: 0
           });
           await refresh();
-          selectEvidenceSource(data.evidence_id, preferredAnalysisPath(data.evidence_id));
+          selectEvidenceSource(data.evidence_id, preferredAnalysisPath(data.evidence_id), "filesystem");
           setNotice(withPathCorrectionNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries.", evidencePath));
         } catch (processErr) {
           await refresh();
@@ -4128,7 +4397,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           message += " Re-linked " + data.bookmark_items_relinked + " bookmark item(s) to the new index.";
         }
         await refresh();
-        selectEvidenceSource(id, preferredAnalysisPath(id));
+        if (state.live.evidenceId === id) {
+          state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+        }
+        selectEvidenceSource(id, preferredAnalysisPath(id), "filesystem");
         setNotice(message);
       } catch (err) {
         setNotice(err.message, true);
@@ -4149,6 +4421,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (state.browserState.evidenceId === id) {
           state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
           state.selectedEntryIds = new Set();
+          state.cat = newCategoryCache();
           state.hex = makeHexState();
         }
         const message = "Removed evidence " + data.evidence_id + " and " + data.removed_entries + " indexed entries.";
@@ -4160,7 +4433,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function recoverEntry(entryId) {
-      const entry = state.data && state.data.entries.find((item) => item.id === entryId);
+      const entry = findLoadedEntry(entryId);
       if (!entry) {
         setNotice("Entry is not loaded.", true);
         return;
@@ -4185,8 +4458,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function showEntryDetails() {
-      if (!state.hex.entryId) {
-        setNotice("Select an entry before opening details.", true);
+      if (!currentHexEntry()) {
+        setNotice("Select an item before opening details.", true);
         return;
       }
       $("viewerMode").value = "metadata";
@@ -4241,7 +4514,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function analyzeDiskImageEntry(entryId) {
-      const entry = state.data && state.data.entries.find((item) => item.id === entryId);
+      const entry = findLoadedEntry(entryId);
       const evidence = selectedEvidenceSource();
       if (!entry || !evidence) {
         setNotice("Select a disk image entry first.", true);
@@ -4276,7 +4549,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         });
         const message = "Analyzed image " + imageEvidence.display_name + ": " + processed.entries_indexed + " entries (" + processed.status + ").";
         await refresh();
-        selectEvidenceSource(imageEvidence.id, preferredAnalysisPath(imageEvidence.id));
+        if (state.live.evidenceId === imageEvidence.id) {
+          state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+        }
+        selectEvidenceSource(imageEvidence.id, preferredAnalysisPath(imageEvidence.id), "filesystem");
         setNotice(message);
       } catch (err) {
         setNotice(err.message, true);
@@ -4303,13 +4579,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    function selectEvidenceSource(id, selectedPath = "/") {
+    function selectEvidenceSource(id, selectedPath = "/", treeMode = null) {
       state.browserState = {
         evidenceId: id,
         selectedPath: normalizeLogicalPath(selectedPath),
-        treeMode: state.browserState.treeMode || "filesystem",
+        treeMode: treeMode || state.browserState.treeMode || "filesystem",
         selectedCategory: ""
       };
+      state.cat = newCategoryCache();
       expandTreePath(state.browserState.selectedPath);
       state.selectedEntryIds = new Set();
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
@@ -4331,12 +4608,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function selectCategory(categoryKey) {
+      const key = categoryKey || "";
       state.browserState.treeMode = "categories";
-      state.browserState.selectedCategory = categoryKey || "";
+      state.browserState.selectedCategory = key;
+      if (state.cat.evidenceId !== state.browserState.evidenceId || state.cat.key !== key) {
+        state.cat = newCategoryCache(state.browserState.evidenceId, key);
+      }
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       renderEvidenceBrowserEntries();
       renderHexViewer();
-      setNotice("Selected category " + (categoryLabel(categoryKey) || "All Categories") + ".");
+      setNotice("Selected category " + (categoryLabel(key) || "All Categories") + ".");
     }
 
     function setBrowserTreeMode(mode) {
@@ -4442,6 +4723,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           }
         });
       }
+      (state.cat.entries || []).forEach((entry) => valid.add(entry.id));
       state.selectedEntryIds = new Set(ids.filter((id) => valid.has(id)));
     }
 
@@ -4569,9 +4851,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // Axy-style "Create export": write the selected artifacts to a CSV download with the
     // examiner-grade columns (identity, category, size, MAC times, deleted state, offsets).
     function exportSelectedCsv() {
-      const entries = state.data
-        ? state.data.entries.filter((entry) => state.selectedEntryIds.has(entry.id))
-        : [];
+      const entries = Array.from(state.selectedEntryIds || [])
+        .map((entryId) => findLoadedEntry(entryId))
+        .filter(Boolean);
       if (entries.length === 0) {
         setNotice("Select rows to export first.", true);
         return;
@@ -4623,7 +4905,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderHexViewer();
       const evidence = selectedEvidenceSource();
       if (entry.entry_kind === "file" && isPromotableDiskImageEntry(entry, evidence)) {
-        setNotice("Disk image file selected. Use Analyze image to decode the container.");
+        setNotice("Raw container bytes - use Analyze image to browse decoded contents.");
         return;
       }
       setNotice("Selected " + (entry.name || logicalName(entry.logical_path)) + ".");
@@ -4637,7 +4919,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function fetchEntryBytes() {
-      if (!state.hex.entryId && !state.hex.live) {
+      if (!state.hex.entryId && !state.hex.live && !state.hex.raw) {
         renderHexViewer();
         return;
       }
@@ -4646,7 +4928,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.hex.fetching = true;
       try {
-        const data = state.hex.live
+        const data = state.hex.raw
+          ? await apiGet("/api/image/bytes", {
+              case_path: currentCasePath(),
+              evidence_id: state.hex.raw.evidenceId,
+              raw: true,
+              offset: state.hex.offset,
+              length: state.hex.length
+            })
+          : state.hex.live
           ? await apiGet("/api/image/bytes", {
               case_path: currentCasePath(),
               evidence_id: state.hex.live.evidenceId,
@@ -4691,6 +4981,115 @@ const INDEX_HTML: &str = r###"<!doctype html>
       await fetchEntryBytes();
     }
 
+    function resetRawFindProgress() {
+      if (!state.hex || !state.hex.find) {
+        return;
+      }
+      state.hex.find.status = "";
+      state.hex.find.continuation = null;
+      state.hex.find.nextStart = null;
+      state.hex.find.lastMatch = null;
+      state.hex.find.matchLength = null;
+    }
+
+    function rawFindSetQuery(value) {
+      if (!state.hex.find) {
+        return;
+      }
+      state.hex.find.query = value;
+      resetRawFindProgress();
+    }
+
+    function rawFindSetKind(value) {
+      if (!state.hex.find) {
+        return;
+      }
+      state.hex.find.kind = value === "hex" ? "hex" : "text";
+      resetRawFindProgress();
+      renderHexViewer();
+    }
+
+    function rawFindKeydown(event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        rawFindNext(false);
+      }
+    }
+
+    function rawFindCancel() {
+      if (!state.hex.find) {
+        return;
+      }
+      state.hex.find.status = "";
+      state.hex.find.continuation = null;
+      renderHexViewer();
+    }
+
+    async function rawFindNext(continuing = false) {
+      if (!state.hex.raw) {
+        setNotice("Open raw image bytes before finding.", true);
+        return;
+      }
+      const find = state.hex.find;
+      const query = String(find.query || "").trim();
+      if (!query) {
+        find.status = "Enter a find query.";
+        renderHexViewer();
+        return;
+      }
+      const start = continuing && find.continuation != null
+        ? Number(find.continuation)
+        : (find.nextStart != null ? Number(find.nextStart) : Number(state.hex.offset || 0));
+      find.active = true;
+      find.status = "Scanning from " + formatRawFindOffset(start) + "...";
+      find.continuation = null;
+      renderHexViewer();
+      try {
+        const data = await apiGet("/api/image/find", {
+          case_path: currentCasePath(),
+          evidence_id: state.hex.raw.evidenceId,
+          start: Math.max(0, Math.floor(start)),
+          q: query,
+          kind: find.kind === "hex" ? "hex" : "text"
+        });
+        find.active = false;
+        if (data.match_offset != null) {
+          const matchOffset = Number(data.match_offset);
+          const matchLength = Math.max(1, Number(data.match_length || 1));
+          find.lastMatch = matchOffset;
+          find.matchLength = matchLength;
+          find.nextStart = matchOffset + 1;
+          find.continuation = null;
+          find.status = "match at " + formatRawFindOffset(matchOffset);
+          state.hex.length = numberValue("hexLength", 512);
+          state.hex.offset = Math.max(0, matchOffset - Math.floor(state.hex.length / 2));
+          $("hexOffset").value = String(state.hex.offset);
+          await fetchEntryBytes();
+          state.hex.selStart = matchOffset;
+          state.hex.selEnd = matchOffset + matchLength - 1;
+          renderHexViewer();
+          setNotice("Raw find match at " + formatRawFindOffset(matchOffset) + ".");
+          return;
+        }
+        const scannedTo = Number(data.scanned_to || start);
+        if (data.eof) {
+          find.status = "No match found through EOF.";
+          find.continuation = null;
+          find.nextStart = null;
+        } else {
+          find.status = "No match in this window; scanned to " + formatRawFindOffset(scannedTo) + ".";
+          find.continuation = Number(data.next_scan_offset == null ? scannedTo : data.next_scan_offset);
+          find.nextStart = find.continuation;
+        }
+        renderHexViewer();
+      } catch (err) {
+        find.active = false;
+        find.status = err.message || String(err);
+        renderHexViewer();
+        setNotice(err.message || String(err), true);
+      }
+    }
+
     async function runSearch() {
       state.searchResults = [];
       state.selectedSearchIndexes = new Set();
@@ -4720,7 +5119,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Search result is no longer loaded.", true);
         return;
       }
-      const entry = state.data && state.data.entries.find((item) => item.id === hit.entry_id);
+      const entry = findLoadedEntry(hit.entry_id);
       if (!entry) {
         setNotice("Search result entry is not loaded in the current case state.", true);
         return;
@@ -4781,9 +5180,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function findLoadedEntry(entryId) {
+      if (!state.data) {
+        return null;
+      }
       const inState = state.data.entries.find((item) => item.id === entryId);
       if (inState) {
         return inState;
+      }
+      const inCategory = (state.cat.entries || []).find((item) => item.id === entryId);
+      if (inCategory) {
+        return inCategory;
       }
       // Entry may have come from the lazy indexed browse cache instead.
       for (const path in state.idx.dirCache) {
@@ -5027,6 +5433,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
       state.expandedTreePaths = new Map();
       state.selectedEntryIds = new Set();
+      state.cat = newCategoryCache();
       state.hex = makeHexState();
       renderHexViewer();
       $("bookmarksTable").innerHTML = empty("No bookmarks.");
@@ -5216,7 +5623,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td class="actions">
             <div class="toolbar">
               <button class="secondary" onclick="selectEvidenceSource(${item.id}, preferredAnalysisPath(${item.id}))">Browse</button>
-              ${item.source_kind === "image" ? `<button class="secondary" onclick="liveBrowseEvidence(${item.id})" title="Read the file system straight from the image - no indexing">Live browse</button>` : ""}
+              ${liveBrowseButtonHtml(item)}
               ${processActionHtml(item)}
               ${item.source_kind === "folder" || item.source_kind === "browser_history" ? "" : `<button class="ghost" onclick="hashEvidence(${item.id})">${item.sha256_hex ? "Re-hash" : "Hash"}</button>`}
               ${item.source_kind === "image" ? `<button class="ghost" onclick="carveEvidence(${item.id})">Carve</button>` : ""}
@@ -5277,6 +5684,37 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<button class="ghost" onclick="processEvidence(${item.id})">Process</button>`;
     }
 
+    function supportsLiveBrowseEvidence(item) {
+      return !!item && (item.source_kind === "image" || item.source_kind === "folder" || item.source_kind === "file");
+    }
+
+    function liveBrowseButtonHtml(item) {
+      if (!supportsLiveBrowseEvidence(item)) {
+        return "";
+      }
+      const title = item.source_kind === "image"
+        ? "Read the file system straight from the image - no indexing"
+        : "Browse the attached source directly - no indexing";
+      return `<button class="secondary" onclick="liveBrowseEvidence(${item.id})" title="${escapeAttr(title)}">Live browse</button>`;
+    }
+
+    function liveBrowseUnavailableMessage(evidence) {
+      if (!evidence) {
+        return "Select an evidence source, then Live browse.";
+      }
+      return "Live browse is available for disk images, folders, and single files; selected source is " + evidence.source_kind + ".";
+    }
+
+    function liveBrowseReadyNotice(evidence) {
+      if (evidence.source_kind === "image") {
+        return "Live browsing " + evidence.display_name + " directly from the image - no indexing.";
+      }
+      if (evidence.source_kind === "folder") {
+        return "Live browsing " + evidence.display_name + " as it is on disk right now - no indexing.";
+      }
+      return "Live browsing " + evidence.display_name + " directly from the file - no indexing.";
+    }
+
     function looksLikeDiskImage(path) {
       return /\.(e01|ex01|l01|raw|dd|img|vdi|vmdk|vhd|vhdx|aff4|iso)$/i.test(path || "");
     }
@@ -5311,6 +5749,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const valid = new Set(state.data.entries.map((entry) => entry.id));
+      for (const path in state.idx.dirCache) {
+        state.idx.dirCache[path].forEach((child) => {
+          if (child.entry_id != null) {
+            valid.add(child.entry_id);
+          }
+        });
+      }
+      (state.cat.entries || []).forEach((entry) => valid.add(entry.id));
       state.selectedEntryIds = new Set(Array.from(state.selectedEntryIds).filter((id) => valid.has(id)));
     }
 
@@ -5318,8 +5764,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return volume + "|" + path;
     }
 
-    // Evidence-row shortcut: jump straight into live browse for one image
-    // source (attach-only evidence needs no indexing to be examined).
+    // Evidence-row shortcut: jump straight into live browse for one source
+    // (attach-only evidence needs no indexing to be examined).
     async function liveBrowseEvidence(id) {
       if (state.live.active) {
         state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
@@ -5336,11 +5782,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Live browse off.");
         return;
       }
-      if (!evidence || evidence.source_kind !== "image") {
-        setNotice("Select a disk-image evidence source, then Live browse.", true);
+      if (!supportsLiveBrowseEvidence(evidence)) {
+        setNotice(liveBrowseUnavailableMessage(evidence), true);
         return;
       }
-      setNotice("Reading volumes from " + evidence.display_name + "...");
+      setNotice(evidence.source_kind === "image"
+        ? "Reading volumes from " + evidence.display_name + "..."
+        : "Opening live view for " + evidence.display_name + "...");
       try {
         const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: evidence.id });
         state.live = { active: true, evidenceId: evidence.id, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
@@ -5351,7 +5799,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           state.live.selKey = liveKey(first.index, "/");
         }
         renderEvidenceBrowserEntries();
-        setNotice("Live browsing " + evidence.display_name + " directly from the image - no indexing.");
+        setNotice(liveBrowseReadyNotice(evidence));
       } catch (err) {
         state.live.active = false;
         setNotice(err.message, true);
@@ -5404,6 +5852,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setInspectorCollapsed(false);
     }
 
+    async function openLiveRawDevice() {
+      const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
+      state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      state.hex.raw = {
+        evidenceId: state.live.evidenceId,
+        name: "Whole device (raw)",
+        logicalPath: "[device] Whole device (raw)",
+        startOffset: 0,
+        volume: null,
+        sizeBytes: evidence && evidence.size_bytes != null ? evidence.size_bytes : null
+      };
+      $("viewerMode").value = "hex";
+      $("hexOffset").value = "0";
+      await fetchEntryBytes();
+      setInspectorCollapsed(false);
+    }
+
+    async function openLiveVolumeRaw(volumeIndex) {
+      const volume = (state.live.volumes || []).find((item) => Number(item.index) === Number(volumeIndex));
+      if (!volume) {
+        setNotice("Volume is no longer loaded.", true);
+        return;
+      }
+      const startOffset = Number(volume.start_offset || 0);
+      state.hex = makeHexState(null, startOffset, numberValue("hexLength", 512));
+      state.hex.raw = {
+        evidenceId: state.live.evidenceId,
+        name: volume.name + " raw bytes",
+        logicalPath: "[vol " + volume.index + "] " + volume.name + " raw bytes",
+        startOffset,
+        volume: volume.index,
+        sizeBytes: volume.size_bytes == null ? null : Number(volume.size_bytes)
+      };
+      $("viewerMode").value = "hex";
+      $("hexOffset").value = String(startOffset);
+      await fetchEntryBytes();
+      setInspectorCollapsed(false);
+    }
+
     async function postLiveBookmark(volume, path, name, isDir) {
       await apiPost("/api/bookmark/quick", {
         case_path: currentCasePath(),
@@ -5443,7 +5930,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         volume: selVolume,
         path: liveChildPath(selPath, entry.name),
         name: entry.name,
-        is_dir: entry.is_dir
+        is_dir: entry.is_dir,
+        symlink: Boolean(entry.symlink)
       }));
     }
 
@@ -5489,7 +5977,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setNotice("Selection cleared.");
     }
 
-    function handleLiveRowClick(event, volume, path, name, isDir) {
+    function handleLiveRowClick(event, volume, path, name, isDir, symlink = false) {
       hideContextMenu();
       const key = liveKey(volume, path);
       if (event.ctrlKey || event.metaKey) {
@@ -5501,6 +5989,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectLiveRange(state.live.lastKey, key, true);
         state.live.lastKey = key;
         renderLiveBrowse();
+        return;
+      }
+      if (symlink) {
+        setNotice("Live browse lists symlinks but does not follow them.", true);
         return;
       }
       if (isDir) {
@@ -5676,7 +6168,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const outputPath = joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
         "live-vol" + volume + "-" + safeFileName(name)
       ]);
-      setNotice("Exporting " + name + " from the image...");
+      const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
+      setNotice("Exporting " + name + (evidence && evidence.source_kind === "image" ? " from the image..." : " from live browse..."));
       try {
         const data = await apiPost("/api/image/export", {
           case_path: currentCasePath(),
@@ -5691,11 +6184,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    // Old-Ecase-preview model: an attached, un-indexed disk image opens straight
+    // Old-Ecase-preview model: attached, un-indexed evidence opens straight
     // into live browsing so the examiner can see, bookmark, and export files
     // without processing. Attempted once per evidence source.
     function maybeAutoLiveBrowse(evidence) {
-      if (!evidence || evidence.source_kind !== "image" || state.live.active) {
+      if (!supportsLiveBrowseEvidence(evidence) || state.live.active) {
+        return false;
+      }
+      if (evidence.indexed_at) {
         return false;
       }
       state.liveAutoTried = state.liveAutoTried || new Set();
@@ -5703,8 +6199,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return false;
       }
       state.liveAutoTried.add(evidence.id);
-      $("filesystemTree").innerHTML = empty("Reading volumes from the image...");
-      $("entryTable").innerHTML = empty("Reading the attached image directly (no indexing)...");
+      $("filesystemTree").innerHTML = empty(evidence.source_kind === "image" ? "Reading volumes from the image..." : "Opening live source...");
+      $("entryTable").innerHTML = empty(evidence.source_kind === "image" ? "Reading the attached image directly (no indexing)..." : "Reading the attached source directly (no indexing)...");
       toggleLiveBrowse();
       return true;
     }
@@ -5729,14 +6225,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function renderLiveBrowse() {
       renderTreeModeControls();
-      $("treeTitle").textContent = "Volumes (live)";
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
+      const localLive = evidence && (evidence.source_kind === "folder" || evidence.source_kind === "file");
+      $("treeTitle").textContent = localLive ? "Live source" : "Volumes (live)";
       $("browserTitle").textContent = (evidence ? evidence.display_name : "Image") + " | live browse";
       const rows = [];
+      if (evidence && evidence.source_kind === "image") {
+        const rawActive = state.hex.raw && state.hex.raw.volume == null ? " active" : "";
+        rows.push(`<button class="tree-row${rawActive}" style="--depth:0" onclick="openLiveRawDevice()" title="Whole decoded device bytes">
+          <span class="tree-toggle"></span>
+          <span class="tree-label">Whole device (raw)</span>
+          <span class="muted tiny">View raw bytes</span>
+        </button>`);
+      }
       state.live.volumes.forEach((volume) => {
         const key = liveKey(volume.index, "/");
         const expanded = state.live.expanded.has(key);
-        const active = state.live.selKey === key ? " active" : "";
+        const active = (state.live.selKey === key || (state.hex.raw && Number(state.hex.raw.volume) === Number(volume.index))) ? " active" : "";
         const toggle = volume.browsable
           ? `<span class="tree-toggle can-toggle" onclick="event.stopPropagation(); liveToggleDir(${volume.index}, '/')">${expanded ? "-" : "+"}</span>`
           : `<span class="tree-toggle"></span>`;
@@ -5744,13 +6249,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         rows.push(`<button class="tree-row${active}" style="--depth:0" ${click} title="${escapeAttr(volume.filesystem + " " + formatBytes(volume.size_bytes))}">
           ${toggle}
           <span class="tree-label">${escapeHtml(volume.name)} <span class="muted tiny">${escapeHtml(volume.filesystem)}</span></span>
-          <span class="muted tiny">${volume.browsable ? "" : "n/a"}</span>
+          <span class="muted tiny" onclick="event.stopPropagation(); openLiveVolumeRaw(${volume.index})">View raw bytes</span>
         </button>`);
         if (volume.browsable && expanded) {
           renderLiveDirRows(volume.index, "/", 1, rows);
         }
       });
-      $("treeCount").textContent = String(state.live.volumes.length);
+      $("treeCount").textContent = String(state.live.volumes.length + (evidence && evidence.source_kind === "image" ? 1 : 0));
       $("filesystemTree").innerHTML = rows.join("") || empty("No browsable volumes.");
 
       const selected = state.live.selKey;
@@ -5770,17 +6275,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const key = liveKey(selVolume, childPath);
         const isChecked = state.live.selected.has(key);
         const rowClasses = "entry-row" + (isChecked ? " multi-selected" : "") + (viewedPath === childPath ? " selected" : "");
-        const rowArgs = `event, ${selVolume}, '${escChild}', '${escName}', ${entry.is_dir}`;
+        const rowArgs = `event, ${selVolume}, '${escChild}', '${escName}', ${entry.is_dir}, ${entry.symlink ? "true" : "false"}`;
         return `<tr class="${rowClasses}" onclick="handleLiveRowClick(${rowArgs})" oncontextmenu="showLiveContextMenu(${rowArgs})">
           <td><input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleLiveSelection(${selVolume}, '${escChild}', '${escName}', ${entry.is_dir}, this.checked, event)"></td>
           <td><span class="entry-name">${escapeHtml(entry.name)}</span></td>
-          <td class="entry-kind">${entry.is_dir ? "Folder" : "File"}</td>
+          <td class="entry-kind">${entry.symlink ? "Symlink" : (entry.is_dir ? "Folder" : "File")}</td>
           <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
           <td class="entry-time">${escapeHtml(entry.modified_utc || entry.created_utc || "")}</td>
         </tr>`;
       }).join("");
       $("selectedCount").textContent = state.live.selected.size + " selected";
-      const hint = `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
+      const caveat = evidence && evidence.source_kind === "folder"
+        ? `<div class="analysis-status">Live view reads the current disk state (not a preserved snapshot).</div>`
+        : "";
+      const hint = caveat + `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
       $("entryTable").innerHTML = contentRows
         ? hint + table(["", "Name", "Type", "Size", "Modified"], contentRows, "live-table")
         : empty("This folder is empty.");
@@ -5935,6 +6443,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         renderHexViewer();
         return;
       }
+      if (state.data && state.browserState.evidenceId) {
+        const evidenceForAuto = state.data.evidence.find((item) => item.id === state.browserState.evidenceId);
+        if (evidenceForAuto && evidenceIndexedEntryCount(evidenceForAuto.id) === 0 && maybeAutoLiveBrowse(evidenceForAuto)) {
+          renderHexViewer();
+          return;
+        }
+      }
       // Big case: browse the indexed tree lazily so we never load everything.
       if (state.data && state.data.entries_truncated && state.browserState.evidenceId
         && state.browserState.treeMode !== "categories") {
@@ -5964,6 +6479,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const evidence = state.data.evidence.find((item) => item.id === state.browserState.evidenceId);
       $("browserTitle").textContent = evidence ? evidence.display_name + " | " + evidence.source_kind : "Select an evidence source";
       const entries = selectedEvidenceEntries();
+      if (state.browserState.treeMode === "categories") {
+        renderCategoryTree(entries);
+        if (serverCategoryBrowseActive()) {
+          renderServerCategoryContents();
+        } else {
+          renderCategoryContents(entries);
+        }
+        renderHexViewer();
+        return;
+      }
       if (entries.length === 0) {
         if (maybeAutoLiveBrowse(evidence)) {
           renderHexViewer();
@@ -5974,12 +6499,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const knownFolders = directoryPathSet(entries);
-      if (state.browserState.treeMode === "categories") {
-        renderCategoryTree(entries);
-        renderCategoryContents(entries);
-        renderHexViewer();
-        return;
-      }
       const syntheticSelection = syntheticContainerSet(knownFolders);
       if (!knownFolders.has(normalizeLogicalPath(state.browserState.selectedPath))
         || syntheticSelection.has(normalizeLogicalPath(state.browserState.selectedPath))) {
@@ -6026,6 +6545,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? `<button class="ghost" onclick="bookmarkEvidence(${evidenceIndex})">Bookmark</button>`
         : "";
       const status = evidenceProcessingStatusHtml(evidence);
+      const liveNotice = (evidence.source_kind === "folder" || evidence.source_kind === "file") && !evidence.indexed_at
+        ? `<div class="analysis-status">Live browse shows this ${evidence.source_kind === "folder" ? "folder" : "file"} as it is on disk right now. Process (Read File System) to index it for search, categories, and reports.</div>`
+        : "";
       const rows = `
         <tr class="entry-row">
           <td><strong>${escapeHtml(evidence.display_name)}</strong><br><span class="muted tiny">${escapeHtml(evidence.source_path)}</span></td>
@@ -6034,13 +6556,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td>${escapeHtml(evidence.attached_at || "")}</td>
           <td class="actions">
             <div class="toolbar">
+              ${liveBrowseButtonHtml(evidence)}
               ${processActionHtml(evidence)}
               ${bookmark}
               <button class="ghost danger" onclick="removeEvidence(${evidence.id})">Remove</button>
             </div>
           </td>
         </tr>`;
-      $("entryTable").innerHTML = table(["Attached Source", "Kind", "Size", "Attached", ""], rows);
+      $("entryTable").innerHTML = liveNotice + table(["Attached Source", "Kind", "Size", "Attached", ""], rows);
       renderSelectionCount();
     }
 
@@ -6085,11 +6608,147 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("filesystemTree").innerHTML = rows.join("") || empty("No folders.");
     }
 
+    function serverCategoryBrowseActive() {
+      return Boolean(state.data && state.data.entries_truncated
+        && state.browserState.treeMode === "categories"
+        && state.browserState.evidenceId);
+    }
+
+    function ensureCategoryCacheForSelection() {
+      const key = state.browserState.selectedCategory || "";
+      const evidenceId = state.browserState.evidenceId || null;
+      if (state.cat.evidenceId !== evidenceId || state.cat.key !== key) {
+        state.cat = newCategoryCache(evidenceId, key);
+      }
+      return state.cat;
+    }
+
+    function normalizeCategoryEntry(entry) {
+      return {
+        ...entry,
+        logical_path: normalizeLogicalPath(entry.logical_path),
+        metadata_json: entry.metadata_json || {}
+      };
+    }
+
+    async function loadServerCategoryEntries(reset = false) {
+      const cache = ensureCategoryCacheForSelection();
+      if (!cache.evidenceId || cache.loading) {
+        return;
+      }
+      if (reset) {
+        cache.entries = [];
+        cache.total = null;
+        cache.error = "";
+      }
+      const selected = splitCategoryKey(cache.key || "");
+      const offset = cache.entries.length;
+      cache.loading = true;
+      cache.error = "";
+      try {
+        const params = {
+          case_path: currentCasePath(),
+          evidence_id: cache.evidenceId,
+          main: selected.main || "",
+          limit: cache.pageSize,
+          offset
+        };
+        if (selected.sub) {
+          params.sub = selected.sub;
+        }
+        const data = await apiGet("/api/entries/category", params);
+        if (state.cat !== cache
+          || state.browserState.treeMode !== "categories"
+          || state.browserState.evidenceId !== cache.evidenceId
+          || (state.browserState.selectedCategory || "") !== cache.key) {
+          cache.loading = false;
+          return;
+        }
+        const seen = new Set(cache.entries.map((entry) => entry.id));
+        (data.entries || []).map(normalizeCategoryEntry).forEach((entry) => {
+          if (!seen.has(entry.id)) {
+            cache.entries.push(entry);
+            seen.add(entry.id);
+          }
+        });
+        cache.total = Number(data.total_in_category || 0);
+        cache.loading = false;
+        renderEvidenceBrowserEntries();
+        renderHexViewer();
+      } catch (err) {
+        if (state.cat === cache) {
+          cache.error = err.message || String(err);
+          cache.loading = false;
+          renderEvidenceBrowserEntries();
+        }
+        setNotice(err.message || String(err), true);
+      }
+    }
+
+    function loadMoreCategoryEntries() {
+      loadServerCategoryEntries(false);
+    }
+
+    function categoryServerStatusHtml(rows, cache) {
+      if (cache.total == null && cache.loading) {
+        return `<div class="analysis-status">Loading category entries...</div>`;
+      }
+      const loaded = cache.entries.length;
+      const total = Number(cache.total || 0);
+      const showing = dateFilterActive() ? rows.length : loaded;
+      const dateNote = dateFilterActive()
+        ? ` <span class="muted tiny">(date filtered within loaded page; ${loaded.toLocaleString()} loaded)</span>`
+        : "";
+      const loading = cache.loading ? ` <span class="muted tiny">Loading...</span>` : "";
+      const more = loaded < total
+        ? ` <button class="ghost" onclick="loadMoreCategoryEntries()"${cache.loading ? " disabled" : ""}>Load more</button>`
+        : "";
+      return `<div class="analysis-status">Showing ${showing.toLocaleString()} of ${total.toLocaleString()} in this category${dateNote}.${loading}${more}</div>`;
+    }
+
+    function renderServerCategoryContents() {
+      const cache = ensureCategoryCacheForSelection();
+      const selectedLabel = categoryLabel(cache.key) || "All Categories";
+      if (cache.total == null && !cache.loading && !cache.error) {
+        $("folderTitle").textContent = selectedLabel + " | loading";
+        $("entryTable").innerHTML = empty("Loading category entries...");
+        loadServerCategoryEntries(true);
+        renderSelectionCount();
+        return;
+      }
+      const rows = applyDateFilter(cache.entries || []);
+      const total = cache.total == null ? 0 : Number(cache.total);
+      $("folderTitle").textContent = selectedLabel + " | " + total.toLocaleString() + " total";
+      if (cache.error) {
+        $("entryTable").innerHTML = categoryServerStatusHtml(rows, cache) + empty(cache.error);
+        renderSelectionCount();
+        return;
+      }
+      const status = categoryServerStatusHtml(rows, cache);
+      if (rows.length === 0) {
+        const message = total === 0
+          ? "No entries in this category."
+          : (dateFilterActive() ? "No loaded entries in this category match the date filter." : "No entries loaded yet.");
+        $("entryTable").innerHTML = status + empty(message);
+        renderSelectionCount();
+        return;
+      }
+      if (shouldRenderEmailCategory(rows)) {
+        renderEmailCategoryContents(rows, status);
+        return;
+      }
+      if (shouldRenderThumbnailCategory(rows)) {
+        renderThumbnailCategoryContents(rows, status);
+        return;
+      }
+      renderCategoryRows(rows, status);
+    }
+
     function renderCategoryTree(entries) {
       // Category counts follow the active date filter, like the contents pane.
       // On truncated (large) cases the exact SQL counts are used instead, but
-      // only without a date filter - the server counts cannot be date-filtered.
-      const useServerCounts = serverCategoryCountsAvailable() && !dateFilterActive();
+      // the contents pane notes that date filters apply only within loaded pages.
+      const useServerCounts = serverCategoryCountsAvailable();
       const categoryEntries = categorizedVisibleEntries(applyDateFilter(entries));
       const mains = new Map();
       let totalCount = 0;
@@ -6163,19 +6822,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const selectedLabel = categoryLabel(selected) || "All Categories";
       const filterNote = dateFilterActive() ? " (date filtered)" : "";
       $("folderTitle").textContent = selectedLabel + " | " + rows.length + " result" + (rows.length === 1 ? "" : "s") + filterNote;
+      const status = truncatedEntriesNoticeHtml();
       if (rows.length === 0) {
-        $("entryTable").innerHTML = truncatedEntriesNoticeHtml() + empty("No entries in this category.");
+        $("entryTable").innerHTML = status + empty("No entries in this category.");
         renderSelectionCount();
         return;
       }
       if (shouldRenderEmailCategory(rows)) {
-        renderEmailCategoryContents(rows);
+        renderEmailCategoryContents(rows, status);
         return;
       }
       if (shouldRenderThumbnailCategory(rows)) {
-        renderThumbnailCategoryContents(rows);
+        renderThumbnailCategoryContents(rows, status);
         return;
       }
+      renderCategoryRows(rows, status);
+    }
+
+    function renderCategoryRows(rows, prefixHtml = "") {
       const entryRows = rows.map((entry) => {
         const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
         const isChecked = state.selectedEntryIds.has(entry.id);
@@ -6211,7 +6875,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const gridToggle = rows.every((entry) => isImageEntry(entry))
         ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Thumbnail view</button></div>`
         : "";
-      $("entryTable").innerHTML = truncatedEntriesNoticeHtml() + gridToggle + table(["", "Name", "Category", "Type", "Size", "Flags", "Offset", "Time", ""], entryRows.join(""), "category-table");
+      $("entryTable").innerHTML = prefixHtml + gridToggle + table(["", "Name", "Category", "Type", "Size", "Flags", "Offset", "Time", ""], entryRows.join(""), "category-table");
       renderSelectionCount();
     }
 
@@ -6273,7 +6937,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return "/api/entry/raw?case_path=" + encodeURIComponent(currentCasePath()) + "&entry_id=" + entry.id;
     }
 
-    function renderThumbnailCategoryContents(rows) {
+    function renderThumbnailCategoryContents(rows, prefixHtml = "") {
       const cards = rows.map((entry) => {
         const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
         const isChecked = state.selectedEntryIds.has(entry.id);
@@ -6285,11 +6949,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <div class="thumb-meta muted tiny">${entry.size_bytes == null ? "" : escapeHtml(formatBytes(entry.size_bytes))}</div>
           </div>`;
       });
-      $("entryTable").innerHTML = `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('list')">List view</button></div><div class="thumb-grid">${cards.join("")}</div>`;
+      $("entryTable").innerHTML = prefixHtml + `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('list')">List view</button></div><div class="thumb-grid">${cards.join("")}</div>`;
       renderSelectionCount();
     }
 
-    function renderEmailCategoryContents(rows) {
+    function renderEmailCategoryContents(rows, prefixHtml = "") {
       const entryRows = rows.map((entry) => {
         const metadata = entry.metadata_json || {};
         const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
@@ -6312,7 +6976,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
           </tr>`;
       });
-      $("entryTable").innerHTML = table(["", "To", "From", "Date/Time", "Subject", "Body", "Size"], entryRows.join(""), "email-table");
+      $("entryTable").innerHTML = prefixHtml + table(["", "To", "From", "Date/Time", "Subject", "Body", "Size"], entryRows.join(""), "email-table");
       renderSelectionCount();
     }
 
@@ -6635,7 +7299,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function visibleFolderEntries() {
       if (state.browserState.treeMode === "categories") {
-        return categoryEntriesForSelection(selectedEvidenceEntries(), state.browserState.selectedCategory || "");
+        if (serverCategoryBrowseActive()) {
+          return applyDateFilter(state.cat.entries || []);
+        }
+        return applyDateFilter(categoryEntriesForSelection(selectedEvidenceEntries(), state.browserState.selectedCategory || ""));
       }
       if (idxBrowseActive()) {
         return (state.idx.dirCache[state.idx.selPath || "/"] || [])
@@ -6786,7 +7453,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function entryCategoryLabel(entry) {
       const category = entryCategory(entry);
-      return category.main + " / " + category.sub;
+      return category.sub ? category.main + " / " + category.sub : category.main;
     }
 
     function entryCategoryDetail(entry) {
@@ -6796,10 +7463,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function entryCategory(entry) {
       const metadata = entry.metadata_json || {};
-      if (metadata.category_main && metadata.category_sub) {
-        return { main: String(metadata.category_main), sub: String(metadata.category_sub) };
+      if (metadata.category_main !== undefined && metadata.category_main !== null && String(metadata.category_main).trim()) {
+        return {
+          main: String(metadata.category_main),
+          sub: metadata.category_sub === undefined || metadata.category_sub === null ? "" : String(metadata.category_sub)
+        };
       }
-      return inferEntryCategory(entry);
+      return { main: "Uncategorized", sub: "" };
     }
 
     function inferEntryCategory(entry) {
@@ -7280,7 +7950,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function searchResultItemRef(hit) {
-      const entry = state.data && state.data.entries.find((item) => item.id === hit.entry_id);
+      const entry = findLoadedEntry(hit.entry_id);
       const metadata = entry ? (entry.metadata_json || {}) : {};
       return {
         kind: "search_result",
@@ -7388,6 +8058,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function currentHexEntry() {
+      if (state.hex.raw) {
+        return {
+          id: null,
+          entry_kind: "file",
+          evidence_id: state.hex.raw.evidenceId,
+          name: state.hex.raw.name,
+          logical_path: state.hex.raw.logicalPath,
+          size_bytes: state.hex.raw.sizeBytes,
+          is_deleted: false,
+          metadata_json: {
+            source: "raw_image",
+            start_offset: state.hex.raw.startOffset,
+            volume: state.hex.raw.volume == null ? null : state.hex.raw.volume
+          }
+        };
+      }
       // Live-browse files have no indexed entry row; synthesize one so the
       // viewer renders instead of falling back to "No item selected".
       if (state.hex.live) {
@@ -7424,7 +8110,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if ($("viewerMode").value === "metadata") {
           $("viewerMode").value = "hex";
         }
-        if (!state.hex.data && state.hex.entryId && !state.hex.fetching) {
+        if (!state.hex.data && (state.hex.entryId || state.hex.live || state.hex.raw) && !state.hex.fetching) {
           fetchEntryBytes();
         } else {
           renderHexViewer();
@@ -7558,10 +8244,40 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function hexInspector(data) {
       const decode = currentHexDecode(data);
       return [
+        rawFindBar(),
+        containerByteNotice(),
         hexCurrentBar(decode),
         `<div class="hex-grid">${hexRows(data.bytes, data.offset)}</div>`,
         hexDecodePanel(decode)
-      ].join("");
+      ].filter(Boolean).join("");
+    }
+
+    function containerByteNotice() {
+      const entry = currentHexEntry();
+      const evidence = evidenceSourceForEntry(entry);
+      if (entry && isPromotableDiskImageEntry(entry, evidence)) {
+        return `<div class="hex-info">Raw container bytes - use Analyze image to browse decoded contents.</div>`;
+      }
+      return "";
+    }
+
+    function rawFindBar() {
+      if (!state.hex.raw) {
+        return "";
+      }
+      const find = state.hex.find || {};
+      const status = find.status ? `<span class="raw-find-status">${escapeHtml(find.status)}</span>` : "";
+      const continueButton = find.continuation != null && !find.active
+        ? `<button class="ghost" onclick="rawFindNext(true)">Continue</button><button class="ghost" onclick="rawFindCancel()">Cancel</button>`
+        : "";
+      return `
+        <div class="raw-find">
+          <label>Find<input id="rawFindQuery" spellcheck="false" value="${escapeAttr(find.query || "")}" oninput="rawFindSetQuery(this.value)" onkeydown="rawFindKeydown(event)"></label>
+          <label>Kind<select id="rawFindKind" onchange="rawFindSetKind(this.value)"><option value="text"${find.kind !== "hex" ? " selected" : ""}>text</option><option value="hex"${find.kind === "hex" ? " selected" : ""}>hex</option></select></label>
+          <button class="secondary" onclick="rawFindNext(false)"${find.active ? " disabled" : ""}>Find next</button>
+          ${continueButton}
+          ${status}
+        </div>`;
     }
 
     function hexCurrentBar(decode) {
@@ -7773,6 +8489,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function formatOffsetPair(value) {
       const offset = Number(value) || 0;
       return `${offset} (0x${offset.toString(16).toUpperCase().padStart(8, "0")})`;
+    }
+
+    function formatRawFindOffset(value) {
+      const offset = Number(value) || 0;
+      return "0x" + offset.toString(16).toUpperCase().padStart(8, "0") + " / dec " + offset;
     }
 
     function bindHexSelection() {
@@ -8122,8 +8843,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function inspectorSummary(entry) {
       const raw = entry.metadata_json || {};
       const evidence = evidenceSourceForEntry(entry);
+      const synthetic = entry.id == null;
       const canAnalyze = entry.entry_kind === "file" && isPromotableDiskImageEntry(entry, evidence);
-      const canViewBytes = entry.entry_kind === "file" && !canAnalyze;
+      const canViewBytes = entry.entry_kind === "file" && !synthetic;
       const badges = [
         inspectorBadge(entry.entry_kind),
         entry.size_bytes == null ? "" : inspectorBadge(formatBytes(entry.size_bytes)),
@@ -8136,8 +8858,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const actions = [
         canViewBytes ? `<button class="secondary" onclick="openEntry(${entry.id})">View bytes</button>` : "",
         canAnalyze ? `<button class="secondary" onclick="analyzeDiskImageEntry(${entry.id})">Analyze image</button>` : "",
-        entry.entry_kind === "file" ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
-        `<button class="ghost" onclick="bookmarkEntry(${entry.id})">Bookmark</button>`
+        entry.entry_kind === "file" && !synthetic ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
+        !synthetic ? `<button class="ghost" onclick="bookmarkEntry(${entry.id})">Bookmark</button>` : ""
       ].filter(Boolean).join("");
       return `
         <section class="inspector-summary">
@@ -8301,9 +9023,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function renderSearchResults() {
       $("searchCount").textContent = state.searchResults.length;
+      if (state.searchResults.length === 0 && state.data && Number(state.data.entry_count || 0) === 0) {
+        $("searchResults").innerHTML = `<div class="analysis-status">This case has no indexed entries; Deep Search only searches processed evidence. Process evidence first, or use the raw find in Live browse.</div>`;
+        renderSearchSelectionCount();
+        return;
+      }
       const rows = state.searchResults.map((hit, index) => {
         const checked = state.selectedSearchIndexes.has(index) ? " checked" : "";
-        const entry = state.data && state.data.entries.find((item) => item.id === hit.entry_id);
+        const entry = findLoadedEntry(hit.entry_id);
         const deleted = entry && entry.is_deleted ? ' <span class="pill bad">deleted</span>' : "";
         const offset = entry ? entryPrimaryOffset(entry) : "";
         return `
@@ -8428,6 +9155,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function handleGlobalKeydown(event) {
       if (event.key === "Escape" && state.viewerFullscreen) {
         setViewerFullscreen(false);
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f" && state.hex.raw) {
+        event.preventDefault();
+        const input = $("rawFindQuery");
+        if (input) {
+          input.focus();
+          input.select();
+        }
         return;
       }
       if (!event.altKey || event.ctrlKey || event.metaKey || isFormInputTarget(event.target)) {
@@ -8595,7 +9331,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     });
     $("viewerMode").addEventListener("change", () => {
-      if (state.hex.entryId && $("viewerMode").value !== "metadata" && !state.hex.data && !state.hex.fetching) {
+      if ((state.hex.entryId || state.hex.live || state.hex.raw) && $("viewerMode").value !== "metadata" && !state.hex.data && !state.hex.fetching) {
         fetchEntryBytes();
       } else {
         renderHexViewer();

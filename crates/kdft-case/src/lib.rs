@@ -243,6 +243,31 @@ pub struct EntryBytes {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawFindKind {
+    Text,
+    Hex,
+}
+
+impl RawFindKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(Self::Text),
+            "hex" => Ok(Self::Hex),
+            other => Err(anyhow!("unsupported raw find kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageRawFindResult {
+    pub match_offset: Option<u64>,
+    pub match_length: Option<usize>,
+    pub scanned_to: u64,
+    pub next_scan_offset: u64,
+    pub eof: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecoverEntryResult {
     pub entry_id: i64,
@@ -2184,12 +2209,6 @@ pub fn read_filesystem_entry_bytes(
     if let Some(bytes) = read_image_ntfs_entry_bytes(&entry, options.offset, length)? {
         return Ok(bytes);
     };
-    if is_disk_image_container_byte_entry(&entry) {
-        bail!(
-            "disk image file entries must be attached and analyzed as image evidence before byte viewing: {}",
-            entry.logical_path
-        );
-    }
     let Some(path) = actual_file_path(&entry.source_kind, &entry.source_path, &entry.logical_path)
     else {
         bail!(
@@ -3054,6 +3073,16 @@ pub struct CategoryCount {
     pub count: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CategoryEntryPage {
+    pub entries: Vec<FilesystemEntry>,
+    pub total_in_category: i64,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+const CATEGORY_ENTRY_PAGE_LIMIT: usize = 1_000;
+
 /// Exact per-category entry counts computed in SQLite from the stored
 /// `category_main` / `category_sub` metadata stamped at process time. Entries
 /// processed before category stamping existed land in the "Uncategorized"
@@ -3079,6 +3108,95 @@ pub fn category_entry_counts(case_path: &Path) -> Result<Vec<CategoryCount>> {
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("counting entries per category")
+}
+
+/// Lists one bounded page of entries in a category directly from the case
+/// database. This uses the same stored category semantics as
+/// `category_entry_counts`: directory rows are excluded, missing main category
+/// values are grouped as "Uncategorized", and missing subcategories are "".
+pub fn list_entries_by_category(
+    case_path: &Path,
+    evidence_id: Option<i64>,
+    category_main: &str,
+    category_sub: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<CategoryEntryPage> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    if let Some(evidence_id) = evidence_id {
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+    }
+    let category_main = category_main.trim();
+    let category_sub = category_sub.map(str::trim);
+    let limit = limit.min(CATEGORY_ENTRY_PAGE_LIMIT);
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
+
+    let total_in_category = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM filesystem_entries
+             WHERE case_id = ?1
+               AND (?2 IS NULL OR evidence_id = ?2)
+               AND entry_kind != 'directory'
+               AND (?3 = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = ?3)
+               AND (?4 IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = ?4)",
+            params![case_id, evidence_id, category_main, category_sub],
+            |row| row.get(0),
+        )
+        .context("counting entries in category")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, discovered_by_job_id
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind != 'directory'
+           AND (?3 = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = ?3)
+           AND (?4 IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = ?4)
+         ORDER BY logical_path, id
+         LIMIT ?5 OFFSET ?6",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            case_id,
+            evidence_id,
+            category_main,
+            category_sub,
+            limit_i64,
+            offset_i64
+        ],
+        |row| {
+            Ok(RawFilesystemEntry {
+                id: row.get(0)?,
+                case_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                logical_path: row.get(4)?,
+                name: row.get(5)?,
+                entry_kind: row.get(6)?,
+                size_bytes: row.get(7)?,
+                is_deleted: row.get::<_, i64>(8)? != 0,
+                metadata_json: row.get(9)?,
+                discovered_by_job_id: row.get(10)?,
+            })
+        },
+    )?;
+    let entries = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing entries by category")?
+        .into_iter()
+        .map(filesystem_entry_from_raw)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(CategoryEntryPage {
+        entries,
+        total_in_category,
+        limit,
+        offset,
+    })
 }
 
 struct RawBookmark {
@@ -7054,6 +7172,12 @@ pub struct LiveEntry {
     pub created_utc: Option<String>,
     pub modified_utc: Option<String>,
     pub accessed_utc: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub symlink: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Lists the browsable volumes of a disk image (partitions or whole-image),
@@ -7187,6 +7311,7 @@ fn list_ntfs_directory(
             accessed_utc: child.standard_access_time_utc.or(child.access_time_utc),
             name: child.name,
             is_dir: child.is_directory,
+            symlink: false,
         })
         .collect())
 }
@@ -7226,6 +7351,7 @@ fn list_fat_directory(
             modified_utc: fat_datetime_iso(entry.modified()),
             accessed_utc: fat_date_iso(entry.accessed()),
             name,
+            symlink: false,
         });
     }
     Ok(entries)
@@ -7295,9 +7421,273 @@ fn list_ext_directory(
             created_utc: None,
             modified_utc: None,
             accessed_utc: None,
+            symlink: false,
         });
     }
     Ok(entries)
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalDirectoryListing {
+    pub entries: Vec<LiveEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug)]
+struct LocalLiveEvidence {
+    source_kind: String,
+    source_path: PathBuf,
+    display_name: String,
+}
+
+const LIVE_DIR_LIST_MAX_ENTRIES: usize = 5_000;
+const LIVE_BYTES_MAX_LEN: usize = 8 * 1024 * 1024;
+const RAW_FIND_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const RAW_FIND_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+
+fn image_evidence_path(case_path: &Path, evidence_id: i64) -> Result<PathBuf> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let (source_kind, source_path): (String, String) = conn
+        .query_row(
+            "SELECT source_kind, source_path
+             FROM evidence_sources
+             WHERE case_id = ?1 AND id = ?2",
+            params![case_id, evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("evidence {evidence_id} not found"))?;
+    if source_kind != "image" {
+        bail!("raw image bytes are only available for image evidence, not {source_kind}");
+    }
+    Ok(PathBuf::from(source_path))
+}
+
+fn read_local_live_evidence(case_path: &Path, evidence_id: i64) -> Result<LocalLiveEvidence> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let source = conn
+        .query_row(
+            "SELECT source_kind, source_path, display_name
+             FROM evidence_sources
+             WHERE case_id = ?1 AND id = ?2",
+            params![case_id, evidence_id],
+            |row| {
+                Ok(LocalLiveEvidence {
+                    source_kind: row.get(0)?,
+                    source_path: PathBuf::from(row.get::<_, String>(1)?),
+                    display_name: row.get(2)?,
+                })
+            },
+        )
+        .optional()?
+        .with_context(|| format!("evidence {evidence_id} not found"))?;
+    if source.source_kind != "folder" && source.source_kind != "file" {
+        bail!(
+            "local live browsing supports folder/file evidence, not {}",
+            source.source_kind
+        );
+    }
+    Ok(source)
+}
+
+fn split_live_relative_path(relative_path: &str) -> Result<Vec<String>> {
+    if Path::new(relative_path)
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        bail!("relative path must stay inside the evidence root");
+    }
+    let normalized = relative_path.replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    let mut parts = Vec::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            bail!("relative path escapes evidence root: '..' is not allowed");
+        }
+        parts.push(part.to_string());
+    }
+    Ok(parts)
+}
+
+fn ensure_under_evidence_root(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("resolving evidence path {}", candidate.display()))?;
+    if !canonical.starts_with(root) {
+        bail!("relative path escapes evidence root");
+    }
+    Ok(canonical)
+}
+
+fn resolve_local_folder_path(
+    source_path: &Path,
+    relative_path: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let root = source_path
+        .canonicalize()
+        .with_context(|| format!("resolving evidence root {}", source_path.display()))?;
+    if !root.is_dir() {
+        bail!(
+            "folder evidence path is no longer a directory: {}",
+            root.display()
+        );
+    }
+
+    let mut candidate = root.clone();
+    for part in split_live_relative_path(relative_path)? {
+        candidate.push(&part);
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("reading evidence path {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            if candidate
+                .canonicalize()
+                .map(|canonical| !canonical.starts_with(&root))
+                .unwrap_or(true)
+            {
+                bail!("relative path escapes evidence root through a symlink");
+            }
+            bail!(
+                "live browse does not follow symlinks: {}",
+                candidate.display()
+            );
+        }
+    }
+    let canonical = ensure_under_evidence_root(&root, &candidate)?;
+    Ok((root, canonical))
+}
+
+fn resolve_single_file_path(source: &LocalLiveEvidence, relative_path: &str) -> Result<PathBuf> {
+    let file = source
+        .source_path
+        .canonicalize()
+        .with_context(|| format!("resolving evidence file {}", source.source_path.display()))?;
+    if !file.is_file() {
+        bail!("file evidence path is no longer a file: {}", file.display());
+    }
+    let parts = split_live_relative_path(relative_path)?;
+    if parts.is_empty() {
+        return Ok(file);
+    }
+    let file_name = file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if parts.len() == 1 && (parts[0] == file_name || parts[0] == source.display_name) {
+        return Ok(file);
+    }
+    bail!("single-file evidence exposes only the attached file");
+}
+
+fn resolve_local_live_file_path(
+    source: &LocalLiveEvidence,
+    relative_path: &str,
+) -> Result<PathBuf> {
+    match source.source_kind.as_str() {
+        "folder" => {
+            let (_root, path) = resolve_local_folder_path(&source.source_path, relative_path)?;
+            Ok(path)
+        }
+        "file" => resolve_single_file_path(source, relative_path),
+        other => bail!("local live byte reading is not supported for {other} evidence"),
+    }
+}
+
+fn system_time_rfc3339(value: Option<std::time::SystemTime>) -> Option<String> {
+    value.map(|time| DateTime::<Utc>::from(time).to_rfc3339())
+}
+
+fn local_live_entry(name: String, metadata: fs::Metadata) -> Result<LiveEntry> {
+    let file_type = metadata.file_type();
+    let symlink = file_type.is_symlink();
+    let is_dir = !symlink && file_type.is_dir();
+    let size_bytes = if is_dir {
+        None
+    } else {
+        Some(i64::try_from(metadata.len()).context("local live entry size exceeds i64")?)
+    };
+    Ok(LiveEntry {
+        name,
+        is_dir,
+        size_bytes,
+        created_utc: system_time_rfc3339(metadata.created().ok()),
+        modified_utc: system_time_rfc3339(metadata.modified().ok()),
+        accessed_utc: system_time_rfc3339(metadata.accessed().ok()),
+        symlink,
+    })
+}
+
+fn local_entry_sort(left: &LiveEntry, right: &LiveEntry) -> std::cmp::Ordering {
+    (right.is_dir as u8)
+        .cmp(&(left.is_dir as u8))
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+pub fn list_local_directory(
+    case_path: &Path,
+    evidence_id: i64,
+    relative_path: &str,
+) -> Result<LocalDirectoryListing> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    if source.source_kind == "file" {
+        let file = resolve_single_file_path(&source, relative_path)?;
+        let metadata = fs::symlink_metadata(&file)
+            .with_context(|| format!("reading evidence file metadata {}", file.display()))?;
+        let name = file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&source.display_name)
+            .to_string();
+        return Ok(LocalDirectoryListing {
+            entries: vec![local_live_entry(name, metadata)?],
+            truncated: false,
+        });
+    }
+
+    let (_root, dir_path) = resolve_local_folder_path(&source.source_path, relative_path)?;
+    let metadata = fs::symlink_metadata(&dir_path)
+        .with_context(|| format!("reading evidence directory metadata {}", dir_path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "live browse does not follow symlinks: {}",
+            dir_path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("local live path is not a directory: {}", dir_path.display());
+    }
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let read_dir = fs::read_dir(&dir_path)
+        .with_context(|| format!("reading evidence directory {}", dir_path.display()))?;
+    for child in read_dir {
+        let child = child.with_context(|| format!("reading entry in {}", dir_path.display()))?;
+        if entries.len() >= LIVE_DIR_LIST_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let child_path = child.path();
+        let metadata = fs::symlink_metadata(&child_path)
+            .with_context(|| format!("reading evidence entry metadata {}", child_path.display()))?;
+        let name = child
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| child.file_name().to_string_lossy().into_owned());
+        entries.push(local_live_entry(name, metadata)?);
+    }
+    entries.sort_by(local_entry_sort);
+    Ok(LocalDirectoryListing { entries, truncated })
 }
 
 /// Reads a file's bytes live from a volume by path (for the byte viewer during
@@ -7311,7 +7701,7 @@ pub fn read_image_directory_bytes(
     offset: u64,
     length: usize,
 ) -> Result<(Vec<u8>, u64)> {
-    let length = length.min(8 * 1024 * 1024);
+    let length = length.min(LIVE_BYTES_MAX_LEN);
     let volumes = list_image_volumes(image_path)?;
     let volume = volumes
         .get(volume_index)
@@ -7401,6 +7791,255 @@ pub fn read_image_directory_bytes(
     }
 }
 
+/// Reads a bounded decoded-device byte window from image evidence. The offset
+/// is absolute in the decoded disk stream, so EWF, VHD/VDI, and split raw
+/// sources are presented as the examiner-visible device bytes.
+pub fn read_image_raw_bytes(
+    case_path: &Path,
+    evidence_id: i64,
+    offset: u64,
+    length: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let image_path = image_evidence_path(case_path, evidence_id)?;
+    let mut opened = open_disk_image(&image_path)?;
+    let total_size = opened.decoded_size;
+    let read_offset = offset.min(total_size);
+    opened
+        .reader
+        .seek(SeekFrom::Start(read_offset))
+        .with_context(|| format!("seeking decoded image bytes at offset {read_offset}"))?;
+    let mut buffer = Vec::new();
+    opened
+        .reader
+        .take(length.min(LIVE_BYTES_MAX_LEN) as u64)
+        .read_to_end(&mut buffer)
+        .with_context(|| format!("reading decoded image bytes at offset {read_offset}"))?;
+    Ok((buffer, total_size))
+}
+
+pub fn find_in_image_raw(
+    case_path: &Path,
+    evidence_id: i64,
+    start_offset: u64,
+    query: &str,
+    kind: RawFindKind,
+) -> Result<ImageRawFindResult> {
+    find_in_image_raw_with_limits(
+        case_path,
+        evidence_id,
+        start_offset,
+        query,
+        kind,
+        RAW_FIND_CHUNK_BYTES,
+        RAW_FIND_MAX_SCAN_BYTES,
+    )
+}
+
+fn find_in_image_raw_with_limits(
+    case_path: &Path,
+    evidence_id: i64,
+    start_offset: u64,
+    query: &str,
+    kind: RawFindKind,
+    chunk_size: usize,
+    scan_cap: u64,
+) -> Result<ImageRawFindResult> {
+    let patterns = raw_find_patterns(query, kind)?;
+    let max_pattern_len = patterns
+        .iter()
+        .map(RawFindPattern::byte_len)
+        .max()
+        .unwrap_or(0);
+    if max_pattern_len == 0 {
+        bail!("raw find query cannot be empty");
+    }
+    if max_pattern_len as u64 > scan_cap {
+        bail!("raw find query is larger than the per-call scan cap");
+    }
+    let chunk_size = chunk_size.max(1);
+    let image_path = image_evidence_path(case_path, evidence_id)?;
+    let mut opened = open_disk_image(&image_path)?;
+    let total_size = opened.decoded_size;
+    let mut read_offset = start_offset.min(total_size);
+    if read_offset >= total_size {
+        return Ok(ImageRawFindResult {
+            match_offset: None,
+            match_length: None,
+            scanned_to: total_size,
+            next_scan_offset: total_size,
+            eof: true,
+        });
+    }
+
+    let scan_end = read_offset.saturating_add(scan_cap).min(total_size);
+    let overlap_len = max_pattern_len.saturating_sub(1);
+    let mut tail = Vec::new();
+    let mut min_match_start = read_offset;
+
+    while read_offset < scan_end {
+        let read_len = usize::try_from(scan_end.saturating_sub(read_offset))
+            .unwrap_or(usize::MAX)
+            .min(chunk_size);
+        opened
+            .reader
+            .seek(SeekFrom::Start(read_offset))
+            .with_context(|| format!("seeking decoded image bytes at offset {read_offset}"))?;
+        let mut chunk = Vec::new();
+        opened
+            .reader
+            .by_ref()
+            .take(read_len as u64)
+            .read_to_end(&mut chunk)
+            .with_context(|| format!("reading decoded image bytes at offset {read_offset}"))?;
+        if chunk.is_empty() {
+            break;
+        }
+
+        let buffer_start = read_offset.saturating_sub(tail.len() as u64);
+        let mut buffer = Vec::with_capacity(tail.len() + chunk.len());
+        buffer.extend_from_slice(&tail);
+        buffer.extend_from_slice(&chunk);
+        let read_end = read_offset.saturating_add(chunk.len() as u64);
+        let min_index = usize::try_from(min_match_start.saturating_sub(buffer_start))
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+
+        if let Some((match_index, match_length)) =
+            find_raw_patterns_in_buffer(&buffer, min_index, &patterns)
+        {
+            let match_offset = buffer_start.saturating_add(match_index as u64);
+            return Ok(ImageRawFindResult {
+                match_offset: Some(match_offset),
+                match_length: Some(match_length),
+                scanned_to: read_end,
+                next_scan_offset: match_offset.saturating_add(1),
+                eof: read_end >= total_size,
+            });
+        }
+
+        read_offset = read_end;
+        min_match_start = min_match_start.max(read_end.saturating_sub(overlap_len as u64));
+        if overlap_len == 0 {
+            tail.clear();
+        } else if buffer.len() > overlap_len {
+            tail = buffer[buffer.len() - overlap_len..].to_vec();
+        } else {
+            tail = buffer;
+        }
+    }
+
+    let eof = read_offset >= total_size;
+    let next_scan_offset = if eof {
+        total_size
+    } else {
+        read_offset.saturating_sub(overlap_len as u64)
+    };
+    Ok(ImageRawFindResult {
+        match_offset: None,
+        match_length: None,
+        scanned_to: read_offset,
+        next_scan_offset,
+        eof,
+    })
+}
+
+enum RawFindPattern {
+    Exact(Vec<u8>),
+    AsciiCaseInsensitive(Vec<u8>),
+    Utf16LeCaseInsensitive(Vec<u16>),
+}
+
+impl RawFindPattern {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Exact(bytes) | Self::AsciiCaseInsensitive(bytes) => bytes.len(),
+            Self::Utf16LeCaseInsensitive(units) => units.len().saturating_mul(2),
+        }
+    }
+
+    fn find_in(&self, haystack: &[u8]) -> Option<usize> {
+        match self {
+            Self::Exact(bytes) => find_exact_bytes(haystack, bytes),
+            Self::AsciiCaseInsensitive(bytes) => find_ascii_case_insensitive_bytes(haystack, bytes),
+            Self::Utf16LeCaseInsensitive(units) => {
+                find_utf16_ascii_case_insensitive_bytes(haystack, units, true)
+            }
+        }
+    }
+}
+
+fn raw_find_patterns(query: &str, kind: RawFindKind) -> Result<Vec<RawFindPattern>> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("raw find query cannot be empty");
+    }
+    match kind {
+        RawFindKind::Hex => {
+            let raw = strip_hex_query_prefix(query).unwrap_or(query);
+            Ok(vec![RawFindPattern::Exact(parse_hex_pattern(raw)?)])
+        }
+        RawFindKind::Text => Ok(vec![
+            RawFindPattern::AsciiCaseInsensitive(query.as_bytes().to_vec()),
+            RawFindPattern::Utf16LeCaseInsensitive(query.encode_utf16().collect()),
+        ]),
+    }
+}
+
+fn find_raw_patterns_in_buffer(
+    buffer: &[u8],
+    min_index: usize,
+    patterns: &[RawFindPattern],
+) -> Option<(usize, usize)> {
+    let search = buffer.get(min_index..)?;
+    let mut best: Option<(usize, usize)> = None;
+    for pattern in patterns {
+        let Some(relative) = pattern.find_in(search) else {
+            continue;
+        };
+        let absolute = min_index.saturating_add(relative);
+        let length = pattern.byte_len();
+        if best
+            .as_ref()
+            .map_or(true, |(best_offset, _)| absolute < *best_offset)
+        {
+            best = Some((absolute, length));
+        }
+    }
+    best
+}
+
+pub fn read_local_evidence_bytes(
+    case_path: &Path,
+    evidence_id: i64,
+    relative_path: &str,
+    offset: u64,
+    length: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    let path = resolve_local_live_file_path(&source, relative_path)?;
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("reading evidence file metadata {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "live byte reading does not follow symlinks: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!("local live path is not a file: {}", path.display());
+    }
+    let total = metadata.len();
+    let mut file = fs::File::open(&path)
+        .with_context(|| format!("opening evidence file {}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking evidence file {}", path.display()))?;
+    let mut buffer = Vec::new();
+    file.take(length.min(LIVE_BYTES_MAX_LEN) as u64)
+        .read_to_end(&mut buffer)
+        .with_context(|| format!("reading evidence file {}", path.display()))?;
+    Ok((buffer, total))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveExportResult {
     pub output_path: String,
@@ -7412,6 +8051,70 @@ pub struct LiveExportResult {
 /// Safety ceiling for live (un-indexed) file export. A partial copy would look
 /// complete on disk, so oversized files fail loudly instead of truncating.
 const LIVE_EXPORT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+pub fn export_local_file(
+    case_path: &Path,
+    evidence_id: i64,
+    relative_path: &str,
+    output_path: &Path,
+) -> Result<LiveExportResult> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    let path = resolve_local_live_file_path(&source, relative_path)?;
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("reading evidence file metadata {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("live export does not follow symlinks: {}", path.display());
+    }
+    if !metadata.is_file() {
+        bail!("local live path is not a file: {}", path.display());
+    }
+    let total_size = metadata.len();
+    if total_size > LIVE_EXPORT_MAX_BYTES {
+        bail!(
+            "file is {total_size} bytes; live export is capped at {LIVE_EXPORT_MAX_BYTES} bytes - process the evidence to export it"
+        );
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating export folder {}", parent.display()))?;
+    }
+
+    let mut source_file = fs::File::open(&path)
+        .with_context(|| format!("opening evidence file {}", path.display()))?;
+    let mut output = fs::File::create(output_path)
+        .with_context(|| format!("creating exported file {}", output_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut bytes_written = 0_u64;
+    loop {
+        let read = source_file
+            .read(&mut buffer)
+            .with_context(|| format!("reading evidence file {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if bytes_written.saturating_add(read as u64) > LIVE_EXPORT_MAX_BYTES {
+            drop(output);
+            let _ = fs::remove_file(output_path);
+            bail!(
+                "file is larger than live export cap ({LIVE_EXPORT_MAX_BYTES} bytes): {}",
+                path.display()
+            );
+        }
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing exported file {}", output_path.display()))?;
+        hasher.update(&buffer[..read]);
+        bytes_written += read as u64;
+    }
+
+    Ok(LiveExportResult {
+        output_path: output_path.display().to_string(),
+        bytes_written,
+        total_size,
+        sha256_hex: format!("{:x}", hasher.finalize()),
+    })
+}
 
 /// Old-Ecase-preview-style export: copy one file out of an attached disk image
 /// directly (no indexing), hashing the written bytes. The caller records the
@@ -7557,9 +8260,13 @@ struct TreeExportSink {
 
 impl TreeExportSink {
     fn new(output_root: &Path, max_files: usize) -> Self {
+        Self::new_with_size_header(output_root, max_files, "size_bytes")
+    }
+
+    fn new_with_size_header(output_root: &Path, max_files: usize, size_header: &str) -> Self {
         Self {
             output_root: output_root.to_path_buf(),
-            manifest: "relative_path,size_bytes,sha256\r\n".to_string(),
+            manifest: format!("relative_path,{size_header},sha256\r\n"),
             files: 0,
             bytes: 0,
             dirs: 0,
@@ -7582,7 +8289,7 @@ impl TreeExportSink {
         }
     }
 
-    fn write_file(&mut self, rel_parts: &[String], bytes: &[u8]) -> Result<()> {
+    fn unique_output_path(&mut self, rel_parts: &[String]) -> Result<PathBuf> {
         let mut target = self.output_root.clone();
         for part in rel_parts {
             target.push(sanitize_logical_segment(part));
@@ -7604,24 +8311,83 @@ impl TreeExportSink {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating export folder {}", parent.display()))?;
         }
-        fs::write(&unique, bytes)
-            .with_context(|| format!("writing exported file {}", unique.display()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let sha = format!("{:x}", hasher.finalize());
-        let rel = unique
+        Ok(unique)
+    }
+
+    fn append_manifest_row(&mut self, output_path: &Path, size: u64, sha256_hex: &str) {
+        let rel = output_path
             .strip_prefix(&self.output_root)
-            .unwrap_or(&unique)
+            .unwrap_or(output_path)
             .display()
             .to_string();
         self.manifest.push_str(&format!(
             "\"{}\",{},{}\r\n",
             rel.replace('"', "\"\""),
-            bytes.len(),
-            sha
+            size,
+            sha256_hex
         ));
+    }
+
+    fn write_file(&mut self, rel_parts: &[String], bytes: &[u8]) -> Result<()> {
+        let unique = self.unique_output_path(rel_parts)?;
+        fs::write(&unique, bytes)
+            .with_context(|| format!("writing exported file {}", unique.display()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let sha = format!("{:x}", hasher.finalize());
+        self.append_manifest_row(&unique, bytes.len() as u64, &sha);
         self.files += 1;
         self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn write_file_from_path(
+        &mut self,
+        rel_parts: &[String],
+        source_path: &Path,
+        expected_size: u64,
+    ) -> Result<()> {
+        let unique = self.unique_output_path(rel_parts)?;
+        let mut source = fs::File::open(source_path)
+            .with_context(|| format!("opening evidence file {}", source_path.display()))?;
+        let mut output = fs::File::create(&unique)
+            .with_context(|| format!("creating exported file {}", unique.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut written = 0_u64;
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .with_context(|| format!("reading evidence file {}", source_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            if written.saturating_add(read as u64) > LIVE_EXPORT_MAX_BYTES {
+                drop(output);
+                let _ = fs::remove_file(&unique);
+                bail!(
+                    "file is larger than live export cap ({LIVE_EXPORT_MAX_BYTES} bytes): {}",
+                    source_path.display()
+                );
+            }
+            output
+                .write_all(&buffer[..read])
+                .with_context(|| format!("writing exported file {}", unique.display()))?;
+            hasher.update(&buffer[..read]);
+            written += read as u64;
+        }
+        let sha = format!("{:x}", hasher.finalize());
+        self.append_manifest_row(&unique, written, &sha);
+        self.files += 1;
+        self.bytes += written;
+        if written != expected_size {
+            self.skip(format!(
+                "{}: size changed during export (expected {}, wrote {})",
+                source_path.display(),
+                expected_size,
+                written
+            ));
+        }
         Ok(())
     }
 
@@ -7867,6 +8633,150 @@ pub fn export_image_tree(
     sink.finish()
 }
 
+fn local_tree_note_path(parts: &[String]) -> String {
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+pub fn export_local_tree(
+    case_path: &Path,
+    evidence_id: i64,
+    dir_path: &str,
+    output_root: &Path,
+    max_files: Option<usize>,
+) -> Result<LiveTreeExportResult> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    if source.source_kind != "folder" {
+        bail!("recursive live export is only available for folder evidence");
+    }
+    let (root, start) = resolve_local_folder_path(&source.source_path, dir_path)?;
+    let metadata = fs::symlink_metadata(&start)
+        .with_context(|| format!("reading evidence directory metadata {}", start.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("live export does not follow symlinks: {}", start.display());
+    }
+    if !metadata.is_dir() {
+        bail!("local live path is not a directory: {}", start.display());
+    }
+
+    let max_files = max_files
+        .unwrap_or(LIVE_TREE_EXPORT_MAX_FILES)
+        .min(LIVE_TREE_EXPORT_MAX_FILES);
+    let mut sink = TreeExportSink::new_with_size_header(output_root, max_files, "size");
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(start, Vec::new())];
+    while let Some((dir, rel_parts)) = stack.pop() {
+        if sink.dirs as usize >= LIVE_TREE_EXPORT_MAX_DIRS || !sink.file_budget_left() {
+            sink.truncated = true;
+            break;
+        }
+        if let Err(err) = ensure_under_evidence_root(&root, &dir) {
+            sink.skip(format!("{}: {err:#}", local_tree_note_path(&rel_parts)));
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                sink.skip(format!("{}: {err}", local_tree_note_path(&rel_parts)));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            sink.skip(format!(
+                "{}: symlink skipped",
+                local_tree_note_path(&rel_parts)
+            ));
+            continue;
+        }
+        if !metadata.is_dir() {
+            sink.skip(format!(
+                "{}: not a directory",
+                local_tree_note_path(&rel_parts)
+            ));
+            continue;
+        }
+        sink.dirs += 1;
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) => {
+                sink.skip(format!("{}: {err}", local_tree_note_path(&rel_parts)));
+                continue;
+            }
+        };
+        for child in read_dir {
+            if !sink.file_budget_left() {
+                sink.truncated = true;
+                break;
+            }
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    sink.skip(format!("{}: {err}", local_tree_note_path(&rel_parts)));
+                    continue;
+                }
+            };
+            let child_path = child.path();
+            let name = child
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| child.file_name().to_string_lossy().into_owned());
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(name);
+            let child_note = local_tree_note_path(&child_rel);
+            let metadata = match fs::symlink_metadata(&child_path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    sink.skip(format!("{child_note}: {err}"));
+                    continue;
+                }
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                sink.skip(format!("{child_note}: symlink skipped"));
+                continue;
+            }
+            if file_type.is_dir() {
+                if sink.dirs as usize + stack.len() >= LIVE_TREE_EXPORT_MAX_DIRS {
+                    sink.truncated = true;
+                    break;
+                }
+                match ensure_under_evidence_root(&root, &child_path) {
+                    Ok(canonical) => stack.push((canonical, child_rel)),
+                    Err(err) => sink.skip(format!("{child_note}: {err:#}")),
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                sink.skip(format!("{child_note}: unsupported file type"));
+                continue;
+            }
+            let size = metadata.len();
+            if size > LIVE_EXPORT_MAX_BYTES {
+                sink.skip(format!("{child_note}: {size} bytes exceeds export cap"));
+                continue;
+            }
+            let canonical = match ensure_under_evidence_root(&root, &child_path) {
+                Ok(canonical) => canonical,
+                Err(err) => {
+                    sink.skip(format!("{child_note}: {err:#}"));
+                    continue;
+                }
+            };
+            if let Err(err) = sink.write_file_from_path(&child_rel, &canonical, size) {
+                sink.skip(format!("{child_note}: {err:#}"));
+            }
+        }
+        if sink.truncated {
+            break;
+        }
+    }
+
+    sink.finish()
+}
+
 /// Audit trail for a recursive live folder export.
 pub fn record_live_tree_export(
     case_path: &Path,
@@ -7924,6 +8834,77 @@ pub fn record_live_export(
             case_id,
             actor,
             evidence_id,
+            volume_index as i64,
+            file_path,
+            result.output_path,
+            result.bytes_written as i64,
+            result.sha256_hex
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn record_live_tree_export_with_source_kind(
+    case_path: &Path,
+    evidence_id: i64,
+    source_kind: &str,
+    volume_index: usize,
+    dir_path: &str,
+    result: &LiveTreeExportResult,
+) -> Result<()> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'live.export_tree', ?2, 'evidence', ?3,
+                 json_object('source_kind', ?4, 'volume', ?5, 'dir_path', ?6,
+                             'output_dir', ?7, 'files_exported', ?8,
+                             'bytes_written', ?9, 'skipped', ?10,
+                             'truncated', ?11, 'manifest_path', ?12))",
+        params![
+            case_id,
+            actor,
+            evidence_id,
+            source_kind,
+            volume_index as i64,
+            dir_path,
+            result.output_dir,
+            result.files_exported as i64,
+            result.bytes_written as i64,
+            result.skipped_count as i64,
+            result.truncated,
+            result.manifest_path
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn record_live_export_with_source_kind(
+    case_path: &Path,
+    evidence_id: i64,
+    source_kind: &str,
+    volume_index: usize,
+    file_path: &str,
+    result: &LiveExportResult,
+) -> Result<()> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'live.export', ?2, 'evidence', ?3,
+                 json_object('source_kind', ?4, 'volume', ?5, 'file_path', ?6,
+                             'output_path', ?7, 'bytes_written', ?8, 'sha256', ?9))",
+        params![
+            case_id,
+            actor,
+            evidence_id,
+            source_kind,
             volume_index as i64,
             file_path,
             result.output_path,
@@ -10699,18 +11680,6 @@ fn read_ntfs_unallocated_stream_bytes<T: Read + Seek>(
         Ok(())
     })?;
     Ok((bytes, total_size))
-}
-
-fn is_disk_image_container_byte_entry(entry: &EntryForBytes) -> bool {
-    if entry.metadata_json["filesystem_parser"].as_str().is_some() {
-        return false;
-    }
-    let path = if entry.source_kind == "file" {
-        &entry.source_path
-    } else {
-        &entry.logical_path
-    };
-    looks_like_image(Path::new(path))
 }
 
 fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
@@ -14936,6 +15905,141 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn image_raw_read_serves_decoded_device_offsets() -> Result<()> {
+        let case_path = unique_case_path("image-raw-read");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-raw-read-source");
+        let image_path = evidence_dir.join("test.dd");
+        let image = test_fat_mbr_image_bytes()?;
+        fs::write(&image_path, &image)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let (mbr, total_size) = read_image_raw_bytes(&case_path, evidence_id, 0, 512)?;
+        assert_eq!(total_size, image.len() as u64);
+        assert_eq!(mbr, image[..512]);
+
+        let volumes = list_image_volumes(&image_path)?;
+        let start = volumes
+            .first()
+            .expect("FAT fixture should expose a volume")
+            .start_offset;
+        let (volume_head, total_size_again) =
+            read_image_raw_bytes(&case_path, evidence_id, start, 64)?;
+        assert_eq!(total_size_again, image.len() as u64);
+        assert_eq!(
+            volume_head,
+            image[start as usize..start as usize + 64].to_vec()
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn image_raw_find_is_bounded_and_matches_text_utf16le_and_hex() -> Result<()> {
+        let case_path = unique_case_path("image-raw-find");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-raw-find-source");
+        let image_path = evidence_dir.join("find.dd");
+        let mut image = vec![0_u8; 160];
+        image[13..19].copy_from_slice(b"Needle");
+        let utf16_offset = 53;
+        for (index, unit) in "UnicodeNeedle".encode_utf16().enumerate() {
+            image[utf16_offset + (index * 2)..utf16_offset + (index * 2) + 2]
+                .copy_from_slice(&unit.to_le_bytes());
+        }
+        image[31..35].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        image[120..129].copy_from_slice(b"late-text");
+        fs::write(&image_path, &image)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let text_hit = find_in_image_raw_with_limits(
+            &case_path,
+            evidence_id,
+            0,
+            "needle",
+            RawFindKind::Text,
+            16,
+            80,
+        )?;
+        assert_eq!(text_hit.match_offset, Some(13));
+        assert_eq!(text_hit.match_length, Some(6));
+
+        let utf16_hit = find_in_image_raw_with_limits(
+            &case_path,
+            evidence_id,
+            20,
+            "unicodeneedle",
+            RawFindKind::Text,
+            16,
+            80,
+        )?;
+        assert_eq!(utf16_hit.match_offset, Some(utf16_offset as u64));
+        assert_eq!(utf16_hit.match_length, Some("UnicodeNeedle".len() * 2));
+
+        let hex_hit = find_in_image_raw_with_limits(
+            &case_path,
+            evidence_id,
+            0,
+            "DE AD BE EF",
+            RawFindKind::Hex,
+            32,
+            80,
+        )?;
+        assert_eq!(hex_hit.match_offset, Some(31));
+        assert_eq!(hex_hit.match_length, Some(4));
+
+        let first_window = find_in_image_raw_with_limits(
+            &case_path,
+            evidence_id,
+            0,
+            "late-text",
+            RawFindKind::Text,
+            16,
+            64,
+        )?;
+        assert_eq!(first_window.match_offset, None);
+        assert_eq!(first_window.scanned_to, 64);
+        assert!(!first_window.eof);
+        assert!(first_window.next_scan_offset < first_window.scanned_to);
+        assert!(first_window.next_scan_offset > 0);
+
+        let continued = find_in_image_raw_with_limits(
+            &case_path,
+            evidence_id,
+            first_window.next_scan_offset,
+            "late-text",
+            RawFindKind::Text,
+            16,
+            128,
+        )?;
+        assert_eq!(continued.match_offset, Some(120));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
     /// Builds a minimal, spec-correct ext2 image (block size 1024, one block
     /// group) containing /hello.txt, for exercising the ext parser without an
     /// external fixture or mke2fs.
@@ -15072,6 +16176,249 @@ mod tests {
 
         // No case database is touched by live browsing.
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_lists_directory_bounded_sorted_and_truncated() -> Result<()> {
+        let case_path = unique_case_path("local-live-list");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-list-source");
+        let sorted_dir = evidence_dir.join("sorted");
+        fs::create_dir_all(sorted_dir.join("zeta"))?;
+        fs::create_dir_all(sorted_dir.join("alpha"))?;
+        fs::write(sorted_dir.join("b.txt"), b"b")?;
+        fs::write(sorted_dir.join("A.txt"), b"a")?;
+        let many_dir = evidence_dir.join("many");
+        fs::create_dir_all(&many_dir)?;
+        for index in 0..=LIVE_DIR_LIST_MAX_ENTRIES {
+            fs::write(many_dir.join(format!("file-{index:05}.txt")), b"x")?;
+        }
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let sorted = list_local_directory(&case_path, evidence_id, "/sorted")?;
+        assert!(!sorted.truncated);
+        let names = sorted
+            .entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_dir))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("alpha", true),
+                ("zeta", true),
+                ("A.txt", false),
+                ("b.txt", false)
+            ]
+        );
+
+        let many = list_local_directory(&case_path, evidence_id, "/many")?;
+        assert_eq!(many.entries.len(), LIVE_DIR_LIST_MAX_ENTRIES);
+        assert!(many.truncated);
+        assert!(many.entries.windows(2).all(|pair| {
+            let left = &pair[0];
+            let right = &pair[1];
+            local_entry_sort(left, right) != std::cmp::Ordering::Greater
+        }));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_reads_byte_window() -> Result<()> {
+        let case_path = unique_case_path("local-live-bytes");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-bytes-source");
+        fs::write(evidence_dir.join("bytes.bin"), b"0123456789abcdef")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let (bytes, total) =
+            read_local_evidence_bytes(&case_path, evidence_id, "/bytes.bin", 4, 6)?;
+        assert_eq!(bytes, b"456789");
+        assert_eq!(total, 16);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_single_file_lists_and_reads_attached_file() -> Result<()> {
+        let case_path = unique_case_path("local-live-single-file");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-single-file-source");
+        let file_path = evidence_dir.join("one.txt");
+        fs::write(&file_path, b"single-file evidence")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: file_path.clone(),
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let listing = list_local_directory(&case_path, evidence_id, "/")?;
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "one.txt");
+        assert!(!listing.entries[0].is_dir);
+        let (bytes, total) = read_local_evidence_bytes(&case_path, evidence_id, "/one.txt", 7, 4)?;
+        assert_eq!(bytes, b"file");
+        assert_eq!(total, b"single-file evidence".len() as u64);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_exports_file_byte_exact_with_sha256() -> Result<()> {
+        let case_path = unique_case_path("local-live-export");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-export-source");
+        let payload = b"export me exactly";
+        fs::write(evidence_dir.join("payload.bin"), payload)?;
+        let output_dir = unique_temp_dir("local-live-export-output");
+        let output_path = output_dir.join("payload.bin");
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let result = export_local_file(&case_path, evidence_id, "/payload.bin", &output_path)?;
+        assert_eq!(fs::read(&output_path)?, payload);
+        assert_eq!(result.bytes_written, payload.len() as u64);
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        assert_eq!(result.sha256_hex, format!("{:x}", hasher.finalize()));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        let _ = fs::remove_dir_all(output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_exports_tree_with_manifest() -> Result<()> {
+        let case_path = unique_case_path("local-live-tree");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-tree-source");
+        fs::create_dir_all(evidence_dir.join("dir"))?;
+        fs::write(evidence_dir.join("root.txt"), b"root")?;
+        fs::write(evidence_dir.join("dir").join("nested.txt"), b"nested")?;
+        let output_dir = unique_temp_dir("local-live-tree-output");
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let result = export_local_tree(&case_path, evidence_id, "/", &output_dir, None)?;
+        assert_eq!(result.files_exported, 2);
+        assert_eq!(result.directories_visited, 2);
+        assert_eq!(fs::read(output_dir.join("root.txt"))?, b"root");
+        assert_eq!(
+            fs::read(output_dir.join("dir").join("nested.txt"))?,
+            b"nested"
+        );
+        let manifest = fs::read_to_string(output_dir.join("kdft-manifest.csv"))?;
+        assert!(manifest.starts_with("relative_path,size,sha256\r\n"));
+        assert!(manifest.contains("\"root.txt\",4,"));
+        assert!(
+            manifest.contains("\"dir\\nested.txt\",6,")
+                || manifest.contains("\"dir/nested.txt\",6,")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        let _ = fs::remove_dir_all(output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_live_rejects_parent_directory_traversal() -> Result<()> {
+        let case_path = unique_case_path("local-live-traversal");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-traversal-source");
+        fs::write(evidence_dir.join("inside.txt"), b"inside")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let err = list_local_directory(&case_path, evidence_id, "../")
+            .expect_err("parent traversal should be rejected")
+            .to_string();
+        assert!(err.contains("..") || err.contains("escapes evidence root"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_live_rejects_symlink_escape() -> Result<()> {
+        let case_path = unique_case_path("local-live-symlink-escape");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("local-live-symlink-escape-source");
+        let outside_dir = unique_temp_dir("local-live-symlink-outside");
+        let outside_file = outside_dir.join("outside.txt");
+        fs::write(&outside_file, b"outside")?;
+        std::os::unix::fs::symlink(&outside_file, evidence_dir.join("escape.txt"))?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let err = read_local_evidence_bytes(&case_path, evidence_id, "/escape.txt", 0, 16)
+            .expect_err("symlink escape should be rejected")
+            .to_string();
+        assert!(err.contains("symlink") || err.contains("escapes evidence root"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        let _ = fs::remove_dir_all(outside_dir);
         Ok(())
     }
 
@@ -15974,6 +17321,232 @@ mod tests {
     }
 
     #[test]
+    fn list_entries_by_category_pages_files_only_and_counts_total() -> Result<()> {
+        let case_path = unique_case_path("category-page");
+        create_test_case(&case_path)?;
+        let first_source = unique_temp_dir("category-page-source-a");
+        let second_source = unique_temp_dir("category-page-source-b");
+        fs::write(first_source.join("placeholder-a.bin"), b"a")?;
+        fs::write(second_source.join("placeholder-b.bin"), b"b")?;
+        let first_evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: first_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let second_evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: second_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let insert_entry = |evidence_id: i64,
+                            logical_path: &str,
+                            name: &str,
+                            entry_kind: &str,
+                            metadata: serde_json::Value|
+         -> Result<()> {
+            conn.execute(
+                "INSERT INTO filesystem_entries(
+                     case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    case_id,
+                    evidence_id,
+                    logical_path,
+                    name,
+                    entry_kind,
+                    metadata.to_string()
+                ],
+            )?;
+            Ok(())
+        };
+        let docs = serde_json::json!({
+            "category_main": "Documents and Office",
+            "category_sub": "Word processing"
+        });
+        insert_entry(
+            first_evidence_id,
+            "/docs",
+            "docs",
+            "directory",
+            docs.clone(),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/docs/a.docx",
+            "a.docx",
+            "file",
+            docs.clone(),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/docs/b.docx",
+            "b.docx",
+            "file",
+            docs.clone(),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/docs/c.docx",
+            "c.docx",
+            "file",
+            docs.clone(),
+        )?;
+        insert_entry(
+            second_evidence_id,
+            "/docs/d.docx",
+            "d.docx",
+            "file",
+            docs.clone(),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/bin/tool.exe",
+            "tool.exe",
+            "file",
+            serde_json::json!({
+                "category_main": "Program Execution",
+                "category_sub": "Executables and binaries"
+            }),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/cloud/sync.txt",
+            "sync.txt",
+            "file",
+            serde_json::json!({
+                "category_main": "Cloud and Web",
+                "category_sub": "Cloud sync"
+            }),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/unknown.bin",
+            "unknown.bin",
+            "file",
+            serde_json::json!({}),
+        )?;
+        insert_entry(
+            first_evidence_id,
+            "/null.bin",
+            "null.bin",
+            "file",
+            serde_json::json!({
+                "category_main": null,
+                "category_sub": null
+            }),
+        )?;
+        drop(conn);
+
+        let first_page = list_entries_by_category(
+            &case_path,
+            Some(first_evidence_id),
+            "Documents and Office",
+            Some("Word processing"),
+            2,
+            0,
+        )?;
+        assert_eq!(first_page.total_in_category, 3);
+        assert_eq!(first_page.entries.len(), 2);
+        assert_eq!(
+            first_page
+                .entries
+                .iter()
+                .map(|entry| entry.logical_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs/a.docx", "/docs/b.docx"]
+        );
+        assert!(first_page
+            .entries
+            .iter()
+            .all(|entry| entry.entry_kind != "directory"));
+
+        let second_page = list_entries_by_category(
+            &case_path,
+            Some(first_evidence_id),
+            "Documents and Office",
+            Some("Word processing"),
+            2,
+            2,
+        )?;
+        assert_eq!(second_page.total_in_category, 3);
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.entries[0].logical_path, "/docs/c.docx");
+
+        let all_evidence_docs = list_entries_by_category(
+            &case_path,
+            None,
+            "Documents and Office",
+            Some("Word processing"),
+            10,
+            0,
+        )?;
+        assert_eq!(all_evidence_docs.total_in_category, 4);
+
+        let uncategorized = list_entries_by_category(
+            &case_path,
+            Some(first_evidence_id),
+            "Uncategorized",
+            Some(""),
+            10,
+            0,
+        )?;
+        assert_eq!(uncategorized.total_in_category, 2);
+        assert_eq!(
+            uncategorized
+                .entries
+                .iter()
+                .map(|entry| entry.logical_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/null.bin", "/unknown.bin"]
+        );
+
+        let all_categories =
+            list_entries_by_category(&case_path, Some(first_evidence_id), "", None, 100, 0)?;
+        assert_eq!(all_categories.total_in_category, 7);
+        assert_eq!(all_categories.entries.len(), 7);
+        assert_eq!(
+            list_entries_by_category(
+                &case_path,
+                Some(first_evidence_id),
+                "Program Execution",
+                None,
+                10,
+                0,
+            )?
+            .total_in_category,
+            1
+        );
+        assert_eq!(
+            list_entries_by_category(
+                &case_path,
+                Some(first_evidence_id),
+                "Cloud and Web",
+                None,
+                10,
+                0,
+            )?
+            .total_in_category,
+            1
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(first_source);
+        let _ = fs::remove_dir_all(second_source);
+        Ok(())
+    }
+
+    #[test]
     fn evidence_process_indexes_folder_and_deep_searches_content() -> Result<()> {
         let case_path = unique_case_path("process-search");
         create_test_case(&case_path)?;
@@ -16383,11 +17956,11 @@ mod tests {
     }
 
     #[test]
-    fn disk_image_file_entries_are_not_opened_as_raw_bytes() -> Result<()> {
-        let case_path = unique_case_path("folder-vm-image");
+    fn disk_image_file_entries_return_raw_container_bytes() -> Result<()> {
+        let case_path = unique_case_path("folder-dd-image");
         create_test_case(&case_path)?;
-        let evidence_dir = unique_temp_dir("folder-vm-image-source");
-        fs::write(evidence_dir.join("guest.vhd"), b"not a real vhd")?;
+        let evidence_dir = unique_temp_dir("folder-dd-image-source");
+        fs::write(evidence_dir.join("guest.dd"), b"raw container bytes")?;
 
         let evidence_id = add_evidence(
             &case_path,
@@ -16408,19 +17981,19 @@ mod tests {
         let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
         let entry = entries
             .iter()
-            .find(|entry| entry.logical_path == "/guest.vhd")
-            .expect("folder VHD entry should be indexed");
-        let err = read_filesystem_entry_bytes(
+            .find(|entry| entry.logical_path == "/guest.dd")
+            .expect("folder .dd entry should be indexed");
+        let bytes = read_filesystem_entry_bytes(
             &case_path,
             ReadEntryBytesOptions {
                 entry_id: entry.id,
-                offset: 0,
-                length: 64,
+                offset: 4,
+                length: 9,
             },
-        )
-        .expect_err("disk image entries should not raw-open as ordinary file bytes")
-        .to_string();
-        assert!(err.contains("attached and analyzed as image evidence"));
+        )?;
+        assert_eq!(bytes.bytes, b"container");
+        assert_eq!(bytes.total_size, b"raw container bytes".len() as u64);
+        assert!(!bytes.eof);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
