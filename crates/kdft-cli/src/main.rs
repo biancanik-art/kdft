@@ -4,10 +4,11 @@ use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, case_info, create_bookmark,
     create_bookmark_folder, create_case, deep_search, filesystem_entry_count, global_options,
     import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
-    list_evidence, list_installed_resources, process_evidence, render_report_html, report_data,
-    update_global_options, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
-    CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions,
-    EvidenceKind, GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
+    list_evidence, list_installed_resources, process_evidence, remove_bookmark,
+    remove_bookmark_item, render_report_html, report_data, update_global_options,
+    AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType, CreateBookmarkItemOptions,
+    CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions, EvidenceKind,
+    GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
     UpdateGlobalOptions,
 };
 use std::fs;
@@ -153,6 +154,8 @@ enum BookmarkCommand {
     List(CasePathArgs),
     ItemAdd(AddBookmarkItemArgs),
     ItemList(ListBookmarkItemsArgs),
+    Remove(RemoveBookmarkArgs),
+    ItemRemove(RemoveBookmarkItemArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -234,7 +237,8 @@ struct ImportHistoryArgs {
     case: PathBuf,
     #[arg(long)]
     path: PathBuf,
-    #[arg(long, default_value_t = 5000)]
+    /// Maximum visit rows to import; 0 imports all available rows.
+    #[arg(long, default_value_t = 0)]
     max_visits: usize,
     #[arg(long)]
     name: Option<String>,
@@ -326,6 +330,26 @@ struct ListBookmarkItemsArgs {
     case: PathBuf,
     #[arg(long)]
     bookmark_id: Option<i64>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveBookmarkArgs {
+    #[arg(long)]
+    case: PathBuf,
+    #[arg(long)]
+    bookmark_id: i64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveBookmarkItemArgs {
+    #[arg(long)]
+    case: PathBuf,
+    #[arg(long)]
+    item_id: i64,
     #[arg(long)]
     json: bool,
 }
@@ -488,6 +512,14 @@ fn main() -> Result<()> {
             BookmarkCommand::ItemList(args) => {
                 let items = list_bookmark_items(&args.case, args.bookmark_id)?;
                 print_json_or_debug(args.json, &items)?;
+            }
+            BookmarkCommand::Remove(args) => {
+                let result = remove_bookmark(&args.case, args.bookmark_id)?;
+                print_json_or_debug(args.json, &result)?;
+            }
+            BookmarkCommand::ItemRemove(args) => {
+                let result = remove_bookmark_item(&args.case, args.item_id)?;
+                print_json_or_debug(args.json, &result)?;
             }
         },
         Command::Options { command } => match command {

@@ -129,6 +129,25 @@ pub struct RemoveEvidenceResult {
     pub removed_jobs: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RemoveBookmarkResult {
+    pub bookmark_id: i64,
+    pub removed_items: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkBookmarkItemsResult {
+    pub bookmark_id: i64,
+    pub items_added: i64,
+    pub skipped_entry_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoveBookmarkItemResult {
+    pub item_id: i64,
+    pub bookmark_id: i64,
+}
+
 #[derive(Debug, Serialize, Default)]
 pub struct ClearStaleFindingsResult {
     pub removed_folders: i64,
@@ -1280,6 +1299,76 @@ pub fn clear_all_findings(case_path: &Path) -> Result<ClearStaleFindingsResult> 
     Ok(result)
 }
 
+pub fn remove_bookmark(case_path: &Path, bookmark_id: i64) -> Result<RemoveBookmarkResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    ensure_bookmark(&tx, case_id, bookmark_id)?;
+    let removed_items: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM bookmark_items bi
+         JOIN bookmarks b ON b.id = bi.bookmark_id
+         WHERE b.case_id = ?1 AND bi.bookmark_id = ?2",
+        params![case_id, bookmark_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.delete', ?2, 'bookmark', ?3,
+                 json_object('removed_items', ?4))",
+        params![case_id, actor, bookmark_id, removed_items],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM bookmarks WHERE case_id = ?1 AND id = ?2",
+        params![case_id, bookmark_id],
+    )?;
+    if deleted == 0 {
+        bail!("bookmark does not exist in active case: {bookmark_id}");
+    }
+    tx.commit()?;
+    Ok(RemoveBookmarkResult {
+        bookmark_id,
+        removed_items,
+    })
+}
+
+pub fn remove_bookmark_item(case_path: &Path, item_id: i64) -> Result<RemoveBookmarkItemResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let bookmark_id: i64 = tx
+        .query_row(
+            "SELECT bi.bookmark_id
+             FROM bookmark_items bi
+             JOIN bookmarks b ON b.id = bi.bookmark_id
+             WHERE b.case_id = ?1 AND bi.id = ?2",
+            params![case_id, item_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .with_context(|| format!("bookmark item does not exist in active case: {item_id}"))?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.item.delete', ?2, 'bookmark_item', ?3,
+                 json_object('bookmark_id', ?4))",
+        params![case_id, actor, item_id, bookmark_id],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM bookmark_items WHERE id = ?1 AND bookmark_id = ?2",
+        params![item_id, bookmark_id],
+    )?;
+    if deleted == 0 {
+        bail!("bookmark item does not exist in active case: {item_id}");
+    }
+    tx.commit()?;
+    Ok(RemoveBookmarkItemResult {
+        item_id,
+        bookmark_id,
+    })
+}
+
 /// Maps a 0 entry limit to "unlimited". A single Windows disk can hold far more
 /// than the old 100k cap, so processing indexes the whole volume by default.
 fn unlimited_if_zero(max_entries: usize) -> usize {
@@ -1560,10 +1649,7 @@ pub fn import_browser_history(
     case_path: &Path,
     options: ImportBrowserHistoryOptions,
 ) -> Result<BrowserHistoryImportResult> {
-    if options.max_visits == 0 {
-        bail!("max_visits must be greater than zero");
-    }
-    let max_visits = options.max_visits.min(100_000);
+    let max_visits = unlimited_if_zero(options.max_visits);
     let family = detect_browser_family(&options.history_path)?;
     let import_data = match family {
         BrowserFamily::Chromium => {
@@ -2508,11 +2594,13 @@ pub fn add_bookmark_item(
     if let Some(evidence_id) = evidence_id {
         ensure_evidence_source(&tx, case_id, evidence_id)?;
     }
+    let mut referenced_entry: Option<FilesystemEntry> = None;
     if let Some(entry_id) = options.entry_id {
         let entry_evidence_id = ensure_filesystem_entry(&tx, case_id, entry_id, evidence_id)?;
         if evidence_id.is_none() {
             evidence_id = Some(entry_evidence_id);
         }
+        referenced_entry = Some(load_filesystem_entry_by_id(&tx, case_id, entry_id)?);
     }
 
     let item_order = match options.item_order {
@@ -2526,10 +2614,35 @@ pub fn add_bookmark_item(
         )?,
     };
     ensure_bookmark_item_order_available(&tx, options.bookmark_id, item_order)?;
-    let display_name = trim_optional_string(options.display_name);
-    let logical_path = trim_optional_string(options.logical_path);
-    let data_preview = trim_optional_string(options.data_preview);
-    let item_ref_json = options.item_ref_json.to_string();
+    let mut display_name = trim_optional_string(options.display_name);
+    let mut logical_path = trim_optional_string(options.logical_path);
+    let mut data_preview = trim_optional_string(options.data_preview);
+    let mut item_ref_value = options.item_ref_json;
+    if let Some(entry) = referenced_entry.as_ref() {
+        // Bookmarks created with only --entry-id (the CLI's only bookmarking path, with no
+        // client-side entry cache to draw from) used to reach report export with null
+        // display_name/logical_path and an empty item_ref_json, which rendered as a
+        // completely blank row. Backfill the same shape report_entry_item_ref_json() already
+        // builds for category-bookmark expansion, so every bookmarking surface produces a
+        // usable report.
+        if display_name.is_none() {
+            display_name = Some(report_entry_display_name(entry));
+        }
+        if logical_path.is_none() {
+            logical_path = Some(entry.logical_path.clone());
+        }
+        let ref_is_empty = item_ref_value
+            .as_object()
+            .map(serde_json::Map::is_empty)
+            .unwrap_or(false);
+        if ref_is_empty {
+            item_ref_value = report_entry_item_ref_json(entry);
+            if data_preview.is_none() {
+                data_preview = report_entry_preview(&item_ref_value);
+            }
+        }
+    }
+    let item_ref_json = item_ref_value.to_string();
 
     tx.execute(
         "INSERT INTO bookmark_items(
@@ -2566,6 +2679,81 @@ pub fn add_bookmark_item(
     let item = read_bookmark_item(&tx, case_id, item_id)?;
     tx.commit()?;
     Ok(item)
+}
+
+/// Adds many entries to one bookmark in a single transaction. Exists because the
+/// UI's "bookmark selected" bulk action used to call add_bookmark_item once per entry over
+/// HTTP - each call opening its own case connection and transaction - which measured ~17ms/item
+/// and therefore took nearly 7 minutes with zero progress feedback on a real ~23k-entry
+/// selection (the reported "browser crashed" incident). Doing every insert inside one
+/// transaction removes the per-item connection/transaction/HTTP overhead entirely.
+pub fn bulk_add_bookmark_items(
+    case_path: &Path,
+    bookmark_id: i64,
+    entry_ids: &[i64],
+) -> Result<BulkBookmarkItemsResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    ensure_bookmark(&tx, case_id, bookmark_id)?;
+
+    let mut next_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
+        params![bookmark_id],
+        |row| row.get(0),
+    )?;
+    let mut items_added: i64 = 0;
+    let mut skipped_entry_ids: Vec<i64> = Vec::new();
+    for &entry_id in entry_ids {
+        let entry = match load_filesystem_entry_by_id(&tx, case_id, entry_id) {
+            Ok(entry) => entry,
+            Err(_) => {
+                skipped_entry_ids.push(entry_id);
+                continue;
+            }
+        };
+        next_order = next_order.saturating_add(10);
+        let display_name = report_entry_display_name(&entry);
+        let item_ref_value = report_entry_item_ref_json(&entry);
+        let data_preview = report_entry_preview(&item_ref_value);
+        let item_ref_json = item_ref_value.to_string();
+        tx.execute(
+            "INSERT INTO bookmark_items(
+                 bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
+                 selection_offset, selection_length, data_preview, item_ref_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8)",
+            params![
+                bookmark_id,
+                entry.evidence_id,
+                entry_id,
+                next_order,
+                display_name,
+                entry.logical_path,
+                data_preview,
+                item_ref_json,
+            ],
+        )?;
+        items_added += 1;
+    }
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.item.bulk_add', ?2, 'bookmark', ?3,
+                 json_object('items_added', ?4, 'skipped', ?5))",
+        params![
+            case_id,
+            actor,
+            bookmark_id,
+            items_added,
+            skipped_entry_ids.len() as i64
+        ],
+    )?;
+    tx.commit()?;
+    Ok(BulkBookmarkItemsResult {
+        bookmark_id,
+        items_added,
+        skipped_entry_ids,
+    })
 }
 
 pub fn list_bookmark_items(
@@ -2636,7 +2824,7 @@ pub fn report_data(case_path: &Path) -> Result<ReportData> {
         .context("listing report folders")?;
 
     for folder in &mut folders {
-        folder.bookmarks = report_bookmarks_for_folder(&conn, folder.id)?;
+        folder.bookmarks = report_bookmarks_for_folder(&conn, case_id, folder.id)?;
     }
 
     let evidence = report_evidence_rows(&conn, case_id)?;
@@ -3420,16 +3608,27 @@ impl SafariHistoryRow {
 
 struct TempFileGuard {
     path: PathBuf,
+    sidecar_paths: Vec<PathBuf>,
 }
 
 impl TempFileGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            sidecar_paths: Vec::new(),
+        }
+    }
+
+    fn add_sidecar(&mut self, path: PathBuf) {
+        self.sidecar_paths.push(path);
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
+        for path in &self.sidecar_paths {
+            let _ = fs::remove_file(path);
+        }
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -3572,15 +3771,7 @@ fn read_chromium_history_rows(
     history_path: &Path,
     max_visits: usize,
 ) -> Result<ChromiumHistoryRows> {
-    let copy_path = temp_history_copy_path(history_path);
-    fs::copy(history_path, &copy_path).with_context(|| {
-        format!(
-            "copying history database {} to {}",
-            history_path.display(),
-            copy_path.display()
-        )
-    })?;
-    let copy_guard = TempFileGuard::new(copy_path);
+    let copy_guard = copy_sqlite_database_to_temp(history_path)?;
     let conn = Connection::open_with_flags(&copy_guard.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| {
             format!(
@@ -3603,7 +3794,7 @@ fn read_chromium_history_rows(
          ORDER BY v.visit_time DESC, v.id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_visits as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_visits)], |row| {
         Ok(ChromiumHistoryRow {
             visit_id: row.get(0)?,
             url_id: row.get(1)?,
@@ -3642,13 +3833,84 @@ fn browser_history_visit_records(
 }
 
 fn open_sqlite_copy_read_only(path: &Path) -> Result<(Connection, TempFileGuard)> {
-    let copy_path = temp_history_copy_path(path);
-    fs::copy(path, &copy_path)
-        .with_context(|| format!("copying browser database {}", path.display()))?;
-    let guard = TempFileGuard::new(copy_path);
+    let guard = copy_sqlite_database_to_temp(path)?;
     let conn = Connection::open_with_flags(&guard.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening browser database copy {}", guard.path.display()))?;
     Ok((conn, guard))
+}
+
+fn copy_sqlite_database_to_temp(path: &Path) -> Result<TempFileGuard> {
+    let copy_path = temp_history_copy_path(path);
+    fs::copy(path, &copy_path).with_context(|| {
+        format!(
+            "copying browser database {} to {}",
+            path.display(),
+            copy_path.display()
+        )
+    })?;
+    let mut guard = TempFileGuard::new(copy_path);
+    let dest_db = guard.path.clone();
+    copy_sqlite_sidecar_if_present(path, &dest_db, "-wal", &mut guard)?;
+    copy_sqlite_sidecar_if_present(path, &dest_db, "-shm", &mut guard)?;
+    Ok(guard)
+}
+
+fn copy_sqlite_sidecar_if_present(
+    source_db: &Path,
+    dest_db: &Path,
+    suffix: &str,
+    guard: &mut TempFileGuard,
+) -> Result<()> {
+    let source_sidecar = sqlite_sidecar_path(source_db, suffix);
+    let metadata = match fs::metadata(&source_sidecar) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading SQLite sidecar {}", source_sidecar.display()))
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+
+    let dest_sidecar = sqlite_sidecar_path(dest_db, suffix);
+    match fs::copy(&source_sidecar, &dest_sidecar) {
+        Ok(_) => {
+            guard.add_sidecar(dest_sidecar);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "copying SQLite sidecar {} to {}",
+                source_sidecar.display(),
+                dest_sidecar.display()
+            )
+        }),
+    }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn history_limit_json(max_rows: usize) -> serde_json::Value {
+    if max_rows == usize::MAX {
+        serde_json::Value::String("unlimited".to_string())
+    } else {
+        serde_json::json!(max_rows)
+    }
+}
+
+fn sqlite_limit_param(max_rows: usize) -> i64 {
+    if max_rows == usize::MAX {
+        -1
+    } else {
+        i64::try_from(max_rows).unwrap_or(i64::MAX)
+    }
 }
 
 fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
@@ -3704,7 +3966,7 @@ fn collect_chromium_history_import(
         "history_db": profile_paths.history_path.to_string_lossy(),
         "bookmarks_file": profile_paths.bookmarks_path.to_string_lossy(),
         "preferences_file": profile_paths.preferences_path.to_string_lossy(),
-        "max_visits": max_visits
+        "max_visits": history_limit_json(max_visits)
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -3753,7 +4015,7 @@ fn collect_firefox_history_import(
         "formhistory_file": profile_paths.formhistory_path.to_string_lossy(),
         "cookies_file": profile_paths.cookies_path.to_string_lossy(),
         "logins_file": profile_paths.logins_path.to_string_lossy(),
-        "max_visits": max_visits
+        "max_visits": history_limit_json(max_visits)
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -3794,7 +4056,7 @@ fn collect_safari_history_import(
         "profile_dir": profile_paths.profile_dir.to_string_lossy(),
         "history_db": profile_paths.history_path.to_string_lossy(),
         "unsupported_artifacts": ["bookmarks_plist", "downloads_plist"],
-        "max_visits": max_visits
+        "max_visits": history_limit_json(max_visits)
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -3834,7 +4096,7 @@ fn read_chromium_url_records_inner(
         "SELECT id, url, title, visit_count, typed_count, last_visit_time, hidden
          FROM urls ORDER BY last_visit_time DESC, id DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         let id: i64 = row.get(0)?;
         let url: String = row.get(1)?;
         let title: Option<String> = row.get(2)?;
@@ -3913,7 +4175,7 @@ fn read_chromium_search_records_inner(
          JOIN urls u ON u.id = k.url_id
          ORDER BY u.last_visit_time DESC, k.url_id DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         let url_id: i64 = row.get(0)?;
         let term: String = row.get(1)?;
         let url: String = row.get(2)?;
@@ -3969,7 +4231,7 @@ fn read_chromium_download_records_inner(
                 total_bytes, state, danger_type, interrupt_reason, referrer, tab_url, mime_type
          FROM downloads ORDER BY start_time DESC, id DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         let id: i64 = row.get(0)?;
         let current_path: Option<String> = row.get(1)?;
         let target_path: Option<String> = row.get(2)?;
@@ -4085,7 +4347,7 @@ fn read_chromium_login_records_inner(
         "SELECT origin_url, action_url, username_value, date_created, date_last_used, times_used
          FROM logins ORDER BY date_created DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         let origin_url: Option<String> = row.get(0)?;
         let action_url: Option<String> = row.get(1)?;
         let username: Option<String> = row.get(2)?;
@@ -4170,7 +4432,7 @@ fn read_chromium_cookie_records_inner(
                 is_secure, is_httponly
          FROM cookies ORDER BY creation_utc DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         let host_key: String = row.get(0)?;
         let name: String = row.get(1)?;
         let path: Option<String> = row.get(2)?;
@@ -4567,7 +4829,7 @@ fn read_firefox_history_rows(places_path: &Path, max_visits: usize) -> Result<Fi
          ORDER BY v.visit_date DESC, v.id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_visits as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_visits)], |row| {
         Ok(FirefoxHistoryRow {
             visit_id: row.get(0)?,
             place_id: row.get(1)?,
@@ -4645,7 +4907,7 @@ fn read_firefox_url_records_inner(
          ORDER BY COALESCE(last_visit_date, 0) DESC, id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -4723,7 +4985,7 @@ fn read_firefox_bookmark_records_inner(
          ORDER BY b.dateAdded DESC, b.id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
@@ -4820,7 +5082,7 @@ fn read_firefox_search_records_inner(
          ORDER BY COALESCE(lastUsed, 0) DESC, id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -4894,7 +5156,7 @@ fn read_firefox_download_records_inner(
          ORDER BY a.dateAdded DESC, a.id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
@@ -5056,7 +5318,7 @@ fn read_firefox_cookie_records_inner(
          ORDER BY COALESCE(creationTime, 0) DESC, id DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -5136,7 +5398,7 @@ fn read_safari_history_rows(history_path: &Path, max_visits: usize) -> Result<Sa
          LIMIT ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![max_visits as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_visits)], |row| {
         Ok(SafariHistoryRow {
             visit_id: row.get(0)?,
             history_item_id: row.get(1)?,
@@ -5212,7 +5474,7 @@ fn read_safari_url_records_inner(
          LIMIT ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![max_rows as i64], |row| {
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -7172,6 +7434,18 @@ pub struct LiveEntry {
     pub created_utc: Option<String>,
     pub modified_utc: Option<String>,
     pub accessed_utc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntfs_file_record_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mft_record_logical_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mft_record_physical_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data_logical_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data_physical_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntfs_mft_record_modification_time_utc: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub symlink: bool,
 }
@@ -7299,6 +7573,23 @@ fn list_ntfs_directory(
     Ok(children
         .into_iter()
         .map(|child| LiveEntry {
+            ntfs_file_record_number: Some(child.file_record_number),
+            mft_record_logical_offset: ntfs_mft_record_logical_offset(
+                &ntfs,
+                child.file_record_number,
+            ),
+            mft_record_physical_offset: ntfs_mft_record_logical_offset(
+                &ntfs,
+                child.file_record_number,
+            )
+            .map(|offset| start_offset.saturating_add(offset)),
+            file_data_logical_offset: child.file_data_logical_offset,
+            file_data_physical_offset: child
+                .file_data_logical_offset
+                .map(|offset| start_offset.saturating_add(offset)),
+            ntfs_mft_record_modification_time_utc: child
+                .standard_mft_record_modification_time_utc
+                .or(child.mft_record_modification_time_utc),
             size_bytes: if child.is_directory {
                 None
             } else {
@@ -7350,6 +7641,12 @@ fn list_fat_directory(
             created_utc: fat_datetime_iso(entry.created()),
             modified_utc: fat_datetime_iso(entry.modified()),
             accessed_utc: fat_date_iso(entry.accessed()),
+            ntfs_file_record_number: None,
+            mft_record_logical_offset: None,
+            mft_record_physical_offset: None,
+            file_data_logical_offset: None,
+            file_data_physical_offset: None,
+            ntfs_mft_record_modification_time_utc: None,
             name,
             symlink: false,
         });
@@ -7421,6 +7718,12 @@ fn list_ext_directory(
             created_utc: None,
             modified_utc: None,
             accessed_utc: None,
+            ntfs_file_record_number: None,
+            mft_record_logical_offset: None,
+            mft_record_physical_offset: None,
+            file_data_logical_offset: None,
+            file_data_physical_offset: None,
+            ntfs_mft_record_modification_time_utc: None,
             symlink: false,
         });
     }
@@ -7617,6 +7920,12 @@ fn local_live_entry(name: String, metadata: fs::Metadata) -> Result<LiveEntry> {
         created_utc: system_time_rfc3339(metadata.created().ok()),
         modified_utc: system_time_rfc3339(metadata.modified().ok()),
         accessed_utc: system_time_rfc3339(metadata.accessed().ok()),
+        ntfs_file_record_number: None,
+        mft_record_logical_offset: None,
+        mft_record_physical_offset: None,
+        file_data_logical_offset: None,
+        file_data_physical_offset: None,
+        ntfs_mft_record_modification_time_utc: None,
         symlink,
     })
 }
@@ -8775,6 +9084,551 @@ pub fn export_local_tree(
     }
 
     sink.finish()
+}
+
+/// Shared cap for "Bookmark folder (recursive)" (indexed Analyze and live browse):
+/// how many descendant files one recursive folder bookmark can insert.
+pub const RECURSIVE_FOLDER_BOOKMARK_LIMIT: usize = 5000;
+
+pub struct LiveTreeFileRef {
+    pub relative_path: String,
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+pub struct LiveTreeListResult {
+    pub files: Vec<LiveTreeFileRef>,
+    pub directories_visited: u64,
+    pub truncated: bool,
+}
+
+struct TreeListSink {
+    files: Vec<LiveTreeFileRef>,
+    dirs: u64,
+    max_files: usize,
+    truncated: bool,
+}
+
+impl TreeListSink {
+    fn new(max_files: usize) -> Self {
+        Self {
+            files: Vec::new(),
+            dirs: 0,
+            max_files,
+            truncated: false,
+        }
+    }
+
+    fn file_budget_left(&self) -> bool {
+        self.files.len() < self.max_files
+    }
+
+    fn push(&mut self, rel_parts: &[String], size_bytes: u64) {
+        let relative_path = rel_parts.join("/");
+        let name = rel_parts.last().cloned().unwrap_or_default();
+        self.files.push(LiveTreeFileRef {
+            relative_path,
+            name,
+            size_bytes,
+        });
+    }
+
+    fn finish(self) -> LiveTreeListResult {
+        LiveTreeListResult {
+            files: self.files,
+            directories_visited: self.dirs,
+            truncated: self.truncated,
+        }
+    }
+}
+
+/// Recursively lists files under `dir_path` in one volume of a disk image, read
+/// live (no indexing). Mirrors `export_image_tree`'s per-filesystem walk but
+/// never reads file content - used to bulk-create bookmark items for
+/// "Bookmark folder (recursive)" in live browse without the cost/side-effect of
+/// a real export.
+pub fn list_image_tree_files(
+    image_path: &Path,
+    volume_index: usize,
+    dir_path: &str,
+    max_files: usize,
+) -> Result<LiveTreeListResult> {
+    let volumes = list_image_volumes(image_path)?;
+    let volume = volumes
+        .get(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    let relative = dir_path.trim_matches('/').to_string();
+    let mut sink = TreeListSink::new(max_files.max(1));
+
+    match volume.filesystem.as_str() {
+        "EXT" => {
+            let opened = open_disk_image(image_path)?;
+            let reader = Ext4ImageReader {
+                reader: opened.reader,
+                partition_start: volume.start_offset,
+            };
+            let fs = ext4_view::Ext4::load(Box::new(reader))
+                .map_err(|err| anyhow!("opening ext volume: {err}"))?;
+            let start = if relative.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{relative}")
+            };
+            let mut stack: Vec<(String, Vec<String>)> = vec![(start, Vec::new())];
+            while let Some((ext_path, rel_parts)) = stack.pop() {
+                if sink.dirs as usize >= LIVE_TREE_EXPORT_MAX_DIRS || !sink.file_budget_left() {
+                    sink.truncated = true;
+                    break;
+                }
+                sink.dirs += 1;
+                let read_dir = match fs.read_dir(ext_path.as_str()) {
+                    Ok(read_dir) => read_dir,
+                    Err(_) => continue,
+                };
+                for entry in read_dir {
+                    if !sink.file_budget_left() {
+                        sink.truncated = true;
+                        break;
+                    }
+                    let Ok(entry) = entry else { continue };
+                    let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let child_path = if ext_path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{ext_path}/{name}")
+                    };
+                    let mut child_rel = rel_parts.clone();
+                    child_rel.push(name.clone());
+                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    if is_dir {
+                        stack.push((child_path, child_rel));
+                        continue;
+                    }
+                    let size = entry.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
+                    sink.push(&child_rel, size);
+                }
+            }
+        }
+        "FAT" => {
+            let mut opened = open_disk_image(image_path)?;
+            let slice =
+                PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+            let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
+                .context("opening FAT volume")?;
+            let root = fs.root_dir();
+            let mut stack: Vec<(String, Vec<String>)> = vec![(relative.clone(), Vec::new())];
+            while let Some((fat_path, rel_parts)) = stack.pop() {
+                if sink.dirs as usize >= LIVE_TREE_EXPORT_MAX_DIRS || !sink.file_budget_left() {
+                    sink.truncated = true;
+                    break;
+                }
+                sink.dirs += 1;
+                let dir = if fat_path.is_empty() {
+                    root.clone()
+                } else {
+                    match root.open_dir(&fat_path) {
+                        Ok(dir) => dir,
+                        Err(_) => continue,
+                    }
+                };
+                for entry in dir.iter() {
+                    if !sink.file_budget_left() {
+                        sink.truncated = true;
+                        break;
+                    }
+                    let Ok(entry) = entry else { continue };
+                    let name = entry.file_name();
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let child_path = if fat_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{fat_path}/{name}")
+                    };
+                    let mut child_rel = rel_parts.clone();
+                    child_rel.push(name.clone());
+                    if entry.is_dir() {
+                        stack.push((child_path, child_rel));
+                        continue;
+                    }
+                    sink.push(&child_rel, entry.len());
+                }
+            }
+        }
+        "NTFS" => {
+            let mut opened = open_disk_image(image_path)?;
+            let mut slice =
+                PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+            let ntfs = ntfs::Ntfs::new(&mut slice).context("opening NTFS volume")?;
+            let mut record = ntfs
+                .root_directory(&mut slice)
+                .context("opening NTFS root directory")?
+                .file_record_number();
+            for component in relative.split('/').filter(|v| !v.is_empty()) {
+                let children = collect_ntfs_dir_children(&ntfs, &mut slice, record)?;
+                let child = children
+                    .iter()
+                    .find(|child| child.is_directory && child.name.eq_ignore_ascii_case(component))
+                    .with_context(|| format!("directory not found: {component}"))?;
+                record = child.file_record_number;
+            }
+            let mut stack: Vec<(u64, Vec<String>)> = vec![(record, Vec::new())];
+            let mut seen_records: HashSet<u64> = HashSet::new();
+            while let Some((dir_record, rel_parts)) = stack.pop() {
+                if sink.dirs as usize >= LIVE_TREE_EXPORT_MAX_DIRS || !sink.file_budget_left() {
+                    sink.truncated = true;
+                    break;
+                }
+                if !seen_records.insert(dir_record) {
+                    continue;
+                }
+                sink.dirs += 1;
+                let children = match collect_ntfs_dir_children(&ntfs, &mut slice, dir_record) {
+                    Ok(children) => children,
+                    Err(_) => continue,
+                };
+                for child in children {
+                    if !sink.file_budget_left() {
+                        sink.truncated = true;
+                        break;
+                    }
+                    let mut child_rel = rel_parts.clone();
+                    child_rel.push(child.name.clone());
+                    if child.is_directory {
+                        stack.push((child.file_record_number, child_rel));
+                        continue;
+                    }
+                    sink.push(&child_rel, child.size_bytes);
+                }
+            }
+        }
+        other => bail!("live browsing is not supported for {other} volumes"),
+    }
+
+    Ok(sink.finish())
+}
+
+/// Recursively lists files under `dir_path` for local-folder live evidence.
+/// Mirrors `export_local_tree`'s walk but never reads file content.
+pub fn list_local_tree_files(
+    case_path: &Path,
+    evidence_id: i64,
+    dir_path: &str,
+    max_files: usize,
+) -> Result<LiveTreeListResult> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    if source.source_kind != "folder" {
+        bail!("recursive live listing is only available for folder evidence");
+    }
+    let (root, start) = resolve_local_folder_path(&source.source_path, dir_path)?;
+    let metadata = fs::symlink_metadata(&start)
+        .with_context(|| format!("reading evidence directory metadata {}", start.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("live listing does not follow symlinks: {}", start.display());
+    }
+    if !metadata.is_dir() {
+        bail!("local live path is not a directory: {}", start.display());
+    }
+
+    let mut sink = TreeListSink::new(max_files.max(1));
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(start, Vec::new())];
+    while let Some((dir, rel_parts)) = stack.pop() {
+        if sink.dirs as usize >= LIVE_TREE_EXPORT_MAX_DIRS || !sink.file_budget_left() {
+            sink.truncated = true;
+            break;
+        }
+        if ensure_under_evidence_root(&root, &dir).is_err() {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        sink.dirs += 1;
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(_) => continue,
+        };
+        for child in read_dir {
+            if !sink.file_budget_left() {
+                sink.truncated = true;
+                break;
+            }
+            let Ok(child) = child else { continue };
+            let child_path = child.path();
+            let name = child
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| child.file_name().to_string_lossy().into_owned());
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(name);
+            let metadata = match fs::symlink_metadata(&child_path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if sink.dirs as usize + stack.len() >= LIVE_TREE_EXPORT_MAX_DIRS {
+                    sink.truncated = true;
+                    break;
+                }
+                if let Ok(canonical) = ensure_under_evidence_root(&root, &child_path) {
+                    stack.push((canonical, child_rel));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            sink.push(&child_rel, metadata.len());
+        }
+        if sink.truncated {
+            break;
+        }
+    }
+
+    Ok(sink.finish())
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecursiveBookmarkResult {
+    pub bookmark_id: i64,
+    pub items_added: i64,
+    pub total_candidates: i64,
+    pub truncated: bool,
+    pub skipped_entry_ids: Vec<i64>,
+}
+
+/// Descendant (non-directory) entry ids under a folder's logical-path prefix,
+/// bounded by `max_entries`. Backs "Bookmark folder (recursive)" in the
+/// indexed Analyze view.
+fn indexed_folder_descendant_entry_ids(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    folder_logical_path: &str,
+    max_entries: usize,
+) -> Result<(Vec<i64>, i64)> {
+    let trimmed = folder_logical_path.trim().trim_end_matches('/');
+    if !trimmed.is_empty() {
+        let normalized = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{trimmed}")
+        };
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM filesystem_entries
+                 WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'directory'
+                   AND logical_path = ?3",
+                params![case_id, evidence_id, normalized],
+                |row| row.get(0),
+            )
+            .context("checking recursive bookmark folder exists")?;
+        if exists == 0 {
+            bail!("directory not found: {folder_logical_path}");
+        }
+    }
+    let prefix = if folder_logical_path.ends_with('/') {
+        folder_logical_path.to_string()
+    } else {
+        format!("{folder_logical_path}/")
+    };
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind != 'directory'
+               AND substr(logical_path, 1, length(?3)) = ?3",
+            params![case_id, evidence_id, prefix],
+            |row| row.get(0),
+        )
+        .context("counting descendant entries for recursive folder bookmark")?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind != 'directory'
+           AND substr(logical_path, 1, length(?3)) = ?3
+         ORDER BY logical_path, id
+         LIMIT ?4",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![case_id, evidence_id, prefix, max_entries as i64],
+            |row| row.get::<_, i64>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing descendant entries for recursive folder bookmark")?;
+    Ok((ids, total))
+}
+
+/// "Bookmark folder (recursive)" for the indexed Analyze view: bulk-adds every
+/// descendant file under `folder_logical_path` to `bookmark_id` in one
+/// transaction (reuses `bulk_add_bookmark_items`, so this has the same ~ms/item
+/// cost as the existing bulk-bookmark-selected fix, not the old N-HTTP-request
+/// shape).
+pub fn bookmark_indexed_folder_recursive(
+    case_path: &Path,
+    bookmark_id: i64,
+    evidence_id: i64,
+    folder_logical_path: &str,
+    max_entries: usize,
+) -> Result<RecursiveBookmarkResult> {
+    let max_entries = max_entries.clamp(1, RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    let (entry_ids, total_candidates) = {
+        let conn = open_existing_case(case_path)?;
+        let case_id = active_case_id(&conn)?;
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+        indexed_folder_descendant_entry_ids(
+            &conn,
+            case_id,
+            evidence_id,
+            folder_logical_path,
+            max_entries,
+        )?
+    };
+    let truncated = total_candidates > entry_ids.len() as i64;
+    let bulk = bulk_add_bookmark_items(case_path, bookmark_id, &entry_ids)?;
+    Ok(RecursiveBookmarkResult {
+        bookmark_id: bulk.bookmark_id,
+        items_added: bulk.items_added,
+        total_candidates,
+        truncated,
+        skipped_entry_ids: bulk.skipped_entry_ids,
+    })
+}
+
+/// Bulk-inserts one bookmark item per file from a recursive live-tree listing,
+/// in a single transaction (same rationale as `bulk_add_bookmark_items` - avoid
+/// N per-item DB round trips). Each item's `item_ref_json` includes `metadata`
+/// and `size_bytes` up front so report rendering's `enrich_live_bookmark_item`
+/// does not need to re-open the live source once per item.
+#[allow(clippy::too_many_arguments)]
+pub fn bulk_add_live_bookmark_items(
+    case_path: &Path,
+    bookmark_id: i64,
+    evidence_id: i64,
+    source_kind: &str,
+    source_path: &str,
+    volume: usize,
+    volume_name: &str,
+    filesystem: &str,
+    files: &[LiveTreeFileRef],
+) -> Result<BulkBookmarkItemsResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    ensure_bookmark(&tx, case_id, bookmark_id)?;
+    ensure_evidence_source(&tx, case_id, evidence_id)?;
+
+    let mut next_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
+        params![bookmark_id],
+        |row| row.get(0),
+    )?;
+    let mut items_added: i64 = 0;
+    for file in files {
+        next_order = next_order.saturating_add(10);
+        let logical_path = format!("[vol {volume}] {}", file.relative_path);
+        let file_extension = file_extension_of(&file.name).unwrap_or_default();
+        let item_ref_value = serde_json::json!({
+            "kind": "live_file",
+            "entry_kind": "file",
+            "evidence_id": evidence_id,
+            "logical_path": logical_path,
+            "relative_path": file.relative_path,
+            "display_name": file.name,
+            "volume": volume,
+            "path": file.relative_path,
+            "volume_name": volume_name,
+            "filesystem": filesystem,
+            "size_bytes": file.size_bytes,
+            "is_deleted": false,
+            "symlink": false,
+            "file_extension": file_extension,
+            "metadata": {
+                "source_kind": source_kind,
+                "source_path": source_path,
+                "volume_index": volume,
+            }
+        });
+        let data_preview = format!("Live file, {} bytes", file.size_bytes);
+        let item_ref_json = item_ref_value.to_string();
+        tx.execute(
+            "INSERT INTO bookmark_items(
+                 bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
+                 selection_offset, selection_length, data_preview, item_ref_json
+             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
+            params![
+                bookmark_id,
+                evidence_id,
+                next_order,
+                file.name,
+                logical_path,
+                data_preview,
+                item_ref_json,
+            ],
+        )?;
+        items_added += 1;
+    }
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.item.bulk_add_live', ?2, 'bookmark', ?3,
+                 json_object('items_added', ?4))",
+        params![case_id, actor, bookmark_id, items_added],
+    )?;
+    tx.commit()?;
+    Ok(BulkBookmarkItemsResult {
+        bookmark_id,
+        items_added,
+        skipped_entry_ids: Vec::new(),
+    })
+}
+
+/// "Bookmark folder (recursive)" for live browse: walks the live tree (bounded,
+/// no byte reads) then bulk-inserts one bookmark item per file found.
+#[allow(clippy::too_many_arguments)]
+pub fn bookmark_live_folder_recursive(
+    case_path: &Path,
+    bookmark_id: i64,
+    evidence_id: i64,
+    source_kind: &str,
+    source_path: &str,
+    volume: usize,
+    volume_name: &str,
+    filesystem: &str,
+    listing: LiveTreeListResult,
+) -> Result<RecursiveBookmarkResult> {
+    let total_candidates = listing.files.len() as i64;
+    let truncated = listing.truncated;
+    let bulk = bulk_add_live_bookmark_items(
+        case_path,
+        bookmark_id,
+        evidence_id,
+        source_kind,
+        source_path,
+        volume,
+        volume_name,
+        filesystem,
+        &listing.files,
+    )?;
+    Ok(RecursiveBookmarkResult {
+        bookmark_id: bulk.bookmark_id,
+        items_added: bulk.items_added,
+        total_candidates,
+        truncated,
+        skipped_entry_ids: bulk.skipped_entry_ids,
+    })
 }
 
 /// Audit trail for a recursive live folder export.
@@ -12754,7 +13608,11 @@ fn evaluate_signature(name: &str, header: &[u8]) -> SignatureFinding {
     }
 }
 
-fn report_bookmarks_for_folder(conn: &Connection, folder_id: i64) -> Result<Vec<ReportBookmark>> {
+fn report_bookmarks_for_folder(
+    conn: &Connection,
+    case_id: i64,
+    folder_id: i64,
+) -> Result<Vec<ReportBookmark>> {
     let mut stmt = conn.prepare(
         "SELECT id, folder_id, bookmark_type, data_type, title, examiner_comment,
                 source_ref_json, content_ref_json, created_at
@@ -12786,7 +13644,7 @@ fn report_bookmarks_for_folder(conn: &Connection, folder_id: i64) -> Result<Vec<
                 parse_stored_json(&raw.source_ref_json, "source_ref_json", raw.id)?;
             let content_ref_json =
                 parse_stored_json(&raw.content_ref_json, "content_ref_json", raw.id)?;
-            Ok(ReportBookmark {
+            let mut bookmark = ReportBookmark {
                 id: raw.id,
                 folder_id: raw.folder_id,
                 bookmark_type: raw.bookmark_type,
@@ -12796,8 +13654,10 @@ fn report_bookmarks_for_folder(conn: &Connection, folder_id: i64) -> Result<Vec<
                 source_ref_json,
                 content_ref_json,
                 created_at: raw.created_at,
-                items: report_items_for_bookmark(conn, raw.id)?,
-            })
+                items: report_items_for_bookmark(conn, case_id, raw.id)?,
+            };
+            expand_category_bookmark_items(conn, case_id, &mut bookmark)?;
+            Ok(bookmark)
         })
         .collect()
 }
@@ -12814,7 +13674,11 @@ struct RawReportBookmark {
     created_at: String,
 }
 
-fn report_items_for_bookmark(conn: &Connection, bookmark_id: i64) -> Result<Vec<BookmarkItem>> {
+fn report_items_for_bookmark(
+    conn: &Connection,
+    case_id: i64,
+    bookmark_id: i64,
+) -> Result<Vec<BookmarkItem>> {
     let mut stmt = conn.prepare(
         "SELECT id, bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
                 selection_offset, selection_length, data_preview, item_ref_json, created_at
@@ -12841,7 +13705,558 @@ fn report_items_for_bookmark(conn: &Connection, bookmark_id: i64) -> Result<Vec<
     let raw_items = rows
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("listing report bookmark items")?;
-    raw_items.into_iter().map(bookmark_item_from_raw).collect()
+    raw_items
+        .into_iter()
+        .map(|raw| {
+            let mut item = bookmark_item_from_raw(raw)?;
+            enrich_live_bookmark_item(conn, case_id, &mut item);
+            Ok(item)
+        })
+        .collect()
+}
+
+const REPORT_CATEGORY_EXPANSION_LIMIT: usize = 1000;
+
+fn enrich_live_bookmark_item(conn: &Connection, case_id: i64, item: &mut BookmarkItem) {
+    if item.item_ref_json.get("metadata").is_some()
+        && item.item_ref_json.get("size_bytes").is_some()
+    {
+        return;
+    }
+    let kind = item
+        .item_ref_json
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    if !matches!(kind.as_deref(), Some("live_file") | Some("live_dir")) {
+        return;
+    }
+    let Some(evidence_id) = item.evidence_id.or_else(|| {
+        item.item_ref_json
+            .get("evidence_id")
+            .and_then(|value| value.as_i64())
+    }) else {
+        return;
+    };
+    let Some(path) = item
+        .item_ref_json
+        .get("path")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            item.item_ref_json
+                .get("relative_path")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let volume = item
+        .item_ref_json
+        .get("volume")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+
+    let source = conn
+        .query_row(
+            "SELECT source_kind, source_path, display_name
+             FROM evidence_sources
+             WHERE id = ?1 AND case_id = ?2",
+            params![evidence_id, case_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((source_kind, source_path, source_display_name)) = source else {
+        return;
+    };
+    let mut volume_json = serde_json::Map::new();
+    let live_entry = if source_kind == "image" {
+        if let Ok(volumes) = list_image_volumes(Path::new(&source_path)) {
+            if let Some(volume_info) = volumes.get(volume) {
+                volume_json.insert(
+                    "volume_name".to_string(),
+                    serde_json::json!(volume_info.name),
+                );
+                volume_json.insert(
+                    "volume_filesystem".to_string(),
+                    serde_json::json!(volume_info.filesystem),
+                );
+                volume_json.insert(
+                    "volume_start_offset".to_string(),
+                    serde_json::json!(volume_info.start_offset),
+                );
+                volume_json.insert(
+                    "volume_size_bytes".to_string(),
+                    serde_json::json!(volume_info.size_bytes),
+                );
+            }
+        }
+        live_entry_for_image_path(Path::new(&source_path), volume, &path).ok()
+    } else {
+        None
+    };
+
+    let Some(object) = item.item_ref_json.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("evidence_id".to_string())
+        .or_insert_with(|| serde_json::json!(evidence_id));
+    object.entry("entry_kind".to_string()).or_insert_with(|| {
+        serde_json::json!(if kind.as_deref() == Some("live_dir") {
+            "directory"
+        } else {
+            "file"
+        })
+    });
+    if let Some(logical_path) = item.logical_path.as_deref() {
+        object
+            .entry("logical_path".to_string())
+            .or_insert_with(|| serde_json::json!(logical_path));
+    }
+    object
+        .entry("relative_path".to_string())
+        .or_insert_with(|| serde_json::json!(path));
+    if let Some(display_name) = item.display_name.as_deref() {
+        object
+            .entry("display_name".to_string())
+            .or_insert_with(|| serde_json::json!(display_name));
+    }
+    object
+        .entry("is_deleted".to_string())
+        .or_insert_with(|| serde_json::json!(false));
+    if kind.as_deref() == Some("live_file") {
+        object
+            .entry("file_extension".to_string())
+            .or_insert_with(|| {
+                serde_json::json!(file_extension_of(
+                    item.display_name.as_deref().unwrap_or(&path)
+                ))
+            });
+    }
+    for (key, value) in &volume_json {
+        object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if let Some(entry) = live_entry {
+        object
+            .entry("size_bytes".to_string())
+            .or_insert_with(|| serde_json::json!(entry.size_bytes));
+        object
+            .entry("created_utc".to_string())
+            .or_insert_with(|| serde_json::json!(entry.created_utc));
+        object
+            .entry("modified_utc".to_string())
+            .or_insert_with(|| serde_json::json!(entry.modified_utc));
+        object
+            .entry("accessed_utc".to_string())
+            .or_insert_with(|| serde_json::json!(entry.accessed_utc));
+        object
+            .entry("symlink".to_string())
+            .or_insert_with(|| serde_json::json!(entry.symlink));
+        object
+            .entry("ntfs_file_record_number".to_string())
+            .or_insert_with(|| serde_json::json!(entry.ntfs_file_record_number));
+        object
+            .entry("mft_record_logical_offset".to_string())
+            .or_insert_with(|| serde_json::json!(entry.mft_record_logical_offset));
+        object
+            .entry("mft_record_physical_offset".to_string())
+            .or_insert_with(|| serde_json::json!(entry.mft_record_physical_offset));
+        object
+            .entry("file_data_logical_offset".to_string())
+            .or_insert_with(|| serde_json::json!(entry.file_data_logical_offset));
+        object
+            .entry("file_data_physical_offset".to_string())
+            .or_insert_with(|| serde_json::json!(entry.file_data_physical_offset));
+        object
+            .entry("ntfs_mft_record_modification_time_utc".to_string())
+            .or_insert_with(|| serde_json::json!(entry.ntfs_mft_record_modification_time_utc));
+        if item
+            .data_preview
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            item.data_preview = Some(live_entry_preview(kind.as_deref(), &entry));
+        }
+    }
+    let metadata = object
+        .entry("metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert("source_kind".to_string(), serde_json::json!(source_kind));
+        metadata.insert("source_path".to_string(), serde_json::json!(source_path));
+        metadata.insert(
+            "source_display_name".to_string(),
+            serde_json::json!(source_display_name),
+        );
+        metadata.insert("volume_index".to_string(), serde_json::json!(volume));
+        for (key, value) in volume_json {
+            metadata.entry(key).or_insert(value);
+        }
+    }
+}
+
+fn live_entry_for_image_path(source_path: &Path, volume: usize, path: &str) -> Result<LiveEntry> {
+    let normalized = normalize_live_bookmark_path(path);
+    let (parent, name) = split_live_parent_name(&normalized);
+    let entries = list_image_directory(source_path, volume, &parent)?;
+    entries
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .with_context(|| format!("live entry not found: {path}"))
+}
+
+fn normalize_live_bookmark_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn split_live_parent_name(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches('/');
+    let Some(index) = trimmed.rfind('/') else {
+        return ("/".to_string(), trimmed.to_string());
+    };
+    let parent = if index == 0 { "/" } else { &trimmed[..index] };
+    let name = &trimmed[index + 1..];
+    (parent.to_string(), name.to_string())
+}
+
+fn live_entry_preview(kind: Option<&str>, entry: &LiveEntry) -> String {
+    let mut parts = Vec::new();
+    parts.push(if kind == Some("live_dir") {
+        "Live folder".to_string()
+    } else {
+        "Live file".to_string()
+    });
+    if let Some(size) = entry.size_bytes {
+        parts.push(format_size_bytes(size));
+    }
+    if let Some(value) = entry.modified_utc.as_deref() {
+        parts.push(format!("modified {value}"));
+    }
+    if let Some(value) = entry.created_utc.as_deref() {
+        parts.push(format!("created {value}"));
+    }
+    if let Some(value) = entry.accessed_utc.as_deref() {
+        parts.push(format!("accessed {value}"));
+    }
+    parts.join(" | ")
+}
+
+fn expand_category_bookmark_items(
+    conn: &Connection,
+    case_id: i64,
+    bookmark: &mut ReportBookmark,
+) -> Result<()> {
+    let original_items = std::mem::take(&mut bookmark.items);
+    let mut expanded_items = Vec::with_capacity(original_items.len());
+    for mut item in original_items {
+        let expansion = category_bookmark_expansion(conn, case_id, bookmark.id, &item)?;
+        if let Some((summary, entries)) = expansion {
+            item.data_preview = Some(summary);
+            expanded_items.push(item);
+            expanded_items.extend(entries);
+        } else {
+            expanded_items.push(item);
+        }
+    }
+    bookmark.items = expanded_items;
+    Ok(())
+}
+
+fn category_bookmark_expansion(
+    conn: &Connection,
+    case_id: i64,
+    bookmark_id: i64,
+    item: &BookmarkItem,
+) -> Result<Option<(String, Vec<BookmarkItem>)>> {
+    if item
+        .item_ref_json
+        .get("kind")
+        .and_then(|value| value.as_str())
+        != Some("category")
+    {
+        return Ok(None);
+    }
+    let key = item
+        .item_ref_json
+        .get("category_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let label = item
+        .item_ref_json
+        .get("category_label")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if key.is_empty() {
+                "All Categories"
+            } else {
+                key
+            }
+        });
+    let evidence_id = item
+        .item_ref_json
+        .get("evidence_id")
+        .and_then(|value| value.as_i64())
+        .or(item.evidence_id);
+    let expansion = report_entries_for_category(conn, case_id, evidence_id, key)?;
+    let total = expansion.total;
+    let shown = expansion.entries.len();
+    let omitted = total.saturating_sub(shown);
+    let created_at = item.created_at.clone();
+    let base_order = item.item_order;
+    let synthetic_items = expansion
+        .entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            report_category_entry_item(bookmark_id, base_order, index, &created_at, entry)
+        })
+        .collect::<Vec<_>>();
+    let noun = if total == 1 { "entry" } else { "entries" };
+    let summary = if omitted == 0 {
+        format!("Indexed category: {label}. Expanded to {total} non-directory {noun}.")
+    } else {
+        format!(
+            "Indexed category: {label}. Expanded to first {shown} of {total} non-directory {noun}; {omitted} omitted to keep the HTML report responsive."
+        )
+    };
+    Ok(Some((summary, synthetic_items)))
+}
+
+struct ReportCategoryEntries {
+    total: usize,
+    entries: Vec<FilesystemEntry>,
+}
+
+fn report_entries_for_category(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    key: &str,
+) -> Result<ReportCategoryEntries> {
+    let (category_main, category_sub) = split_report_category_key(key);
+    if let Some(evidence_id) = evidence_id {
+        ensure_evidence_source(conn, case_id, evidence_id)?;
+    }
+    let total = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM filesystem_entries
+             WHERE case_id = ?1
+               AND (?2 IS NULL OR evidence_id = ?2)
+               AND entry_kind != 'directory'
+               AND (?3 = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = ?3)
+               AND (?4 IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = ?4)",
+            params![case_id, evidence_id, category_main, category_sub.as_deref()],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("counting entries for report category expansion")?;
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT id, case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, discovered_by_job_id
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind != 'directory'
+           AND (?3 = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = ?3)
+           AND (?4 IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = ?4)
+         ORDER BY COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized'),
+                  COALESCE(json_extract(metadata_json, '$.category_sub'), ''),
+                  logical_path, id
+         LIMIT ?5",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            case_id,
+            evidence_id,
+            category_main,
+            category_sub.as_deref(),
+            i64::try_from(REPORT_CATEGORY_EXPANSION_LIMIT).unwrap_or(i64::MAX)
+        ],
+        |row| {
+            Ok(RawFilesystemEntry {
+                id: row.get(0)?,
+                case_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                logical_path: row.get(4)?,
+                name: row.get(5)?,
+                entry_kind: row.get(6)?,
+                size_bytes: row.get(7)?,
+                is_deleted: row.get::<_, i64>(8)? != 0,
+                metadata_json: row.get(9)?,
+                discovered_by_job_id: row.get(10)?,
+            })
+        },
+    )?;
+    let entries = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing entries for report category expansion")?
+        .into_iter()
+        .map(filesystem_entry_from_raw)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ReportCategoryEntries { total, entries })
+}
+
+fn split_report_category_key(key: &str) -> (String, Option<String>) {
+    let mut parts = key.splitn(2, "|||");
+    let main = parts.next().unwrap_or("").trim().to_string();
+    let sub = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    (main, sub)
+}
+
+fn report_category_entry_item(
+    bookmark_id: i64,
+    base_order: i64,
+    index: usize,
+    created_at: &str,
+    entry: FilesystemEntry,
+) -> BookmarkItem {
+    let item_ref_json = report_entry_item_ref_json(&entry);
+    let display_name = report_entry_display_name(&entry);
+    let item_order = base_order.saturating_add(i64::try_from(index + 1).unwrap_or(i64::MAX));
+    BookmarkItem {
+        id: -item_order,
+        bookmark_id,
+        evidence_id: Some(entry.evidence_id),
+        entry_id: Some(entry.id),
+        item_order,
+        display_name: Some(display_name),
+        logical_path: Some(entry.logical_path),
+        selection_offset: None,
+        selection_length: None,
+        data_preview: report_entry_preview(&item_ref_json),
+        item_ref_json,
+        created_at: created_at.to_string(),
+    }
+}
+
+fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
+    let mut object = entry
+        .metadata_json
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    // search_text is a synthetic, often-large Deep Search index blob (concatenated
+    // URL/title/host, or a full metadata dump for preferences) - internal plumbing, not
+    // examiner-facing content, so it must not leak into the report.
+    object.remove("search_text");
+    let artifact_kind = object
+        .get("artifact_kind")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    object.insert(
+        "evidence_id".to_string(),
+        serde_json::json!(entry.evidence_id),
+    );
+    object.insert("entry_id".to_string(), serde_json::json!(entry.id));
+    object.insert(
+        "entry_kind".to_string(),
+        serde_json::json!(entry.entry_kind),
+    );
+    object.insert(
+        "logical_path".to_string(),
+        serde_json::json!(entry.logical_path),
+    );
+    object.insert(
+        "display_name".to_string(),
+        serde_json::json!(report_entry_display_name(entry)),
+    );
+    object.insert(
+        "size_bytes".to_string(),
+        serde_json::json!(entry.size_bytes),
+    );
+    object.insert(
+        "is_deleted".to_string(),
+        serde_json::json!(entry.is_deleted),
+    );
+    let mut metadata_for_report = entry.metadata_json.clone();
+    if let Some(metadata_object) = metadata_for_report.as_object_mut() {
+        metadata_object.remove("search_text");
+    }
+    object.insert("metadata".to_string(), metadata_for_report);
+    if let Some(kind) = artifact_kind.filter(|kind| is_browser_activity_artifact_kind(kind)) {
+        object.insert("kind".to_string(), serde_json::json!("browser_activity"));
+        object.insert("activity_kind".to_string(), serde_json::json!(kind));
+    } else {
+        object.insert("kind".to_string(), serde_json::json!("category_entry"));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn is_browser_activity_artifact_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "browser_history_visit"
+            | "browser_url"
+            | "browser_search_term"
+            | "browser_download"
+            | "browser_bookmark"
+            | "browser_login"
+            | "browser_cookie"
+            | "browser_preference"
+    )
+}
+
+fn report_entry_display_name(entry: &FilesystemEntry) -> String {
+    entry
+        .name
+        .trim()
+        .is_empty()
+        .then(|| {
+            entry
+                .logical_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_else(|| entry.name.clone())
+}
+
+fn report_entry_preview(item_ref: &serde_json::Value) -> Option<String> {
+    let preview_fields = [
+        "visit_time_utc",
+        "last_visit_time_utc",
+        "last_used_utc",
+        "date_added_utc",
+        "start_time_utc",
+        "url",
+        "search_term",
+        "target_path",
+        "current_path",
+        "username",
+        "cookie_name",
+        "category_detail",
+        "category_sub",
+    ];
+    let parts = preview_fields
+        .iter()
+        .filter_map(|key| activity_value_string(item_ref, &[*key]))
+        .take(4)
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {
@@ -12882,16 +14297,33 @@ fn ensure_installed_resources_config_column(conn: &Connection) -> Result<()> {
         .context("renaming installed_resources.config_file_name column")?;
     }
     // Refresh the tool-seeded resource rows (not examiner data) that older
-    // cases created with the legacy vendor wording.
-    conn.execute(
-        "UPDATE installed_resources
-         SET version = replace(version, ?1, 'ecase-6.11-baseline'),
-             notes = replace(notes, ?2, 'modeled from the old Ecase 6.11 flavor, Chapter 3.')
-         WHERE version LIKE '%' || ?1 || '%'
-            OR notes LIKE '%' || ?2 || '%'",
-        params![legacy_version, legacy_notes],
-    )
-    .context("refreshing seeded installed_resources wording")?;
+    // cases created with the legacy vendor wording. Avoid an unconditional
+    // UPDATE here: open_existing_case runs for read-only UI refreshes too, and
+    // taking a write lock on every refresh can collide with concurrent tabs.
+    let has_legacy_wording = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM installed_resources
+                WHERE version LIKE '%' || ?1 || '%'
+                   OR notes LIKE '%' || ?2 || '%'
+                LIMIT 1
+            )",
+            params![legacy_version, legacy_notes],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("checking seeded installed_resources wording")?
+        != 0;
+    if has_legacy_wording {
+        conn.execute(
+            "UPDATE installed_resources
+             SET version = replace(version, ?1, 'ecase-6.11-baseline'),
+                 notes = replace(notes, ?2, 'modeled from the old Ecase 6.11 flavor, Chapter 3.')
+             WHERE version LIKE '%' || ?1 || '%'
+                OR notes LIKE '%' || ?2 || '%'",
+            params![legacy_version, legacy_notes],
+        )
+        .context("refreshing seeded installed_resources wording")?;
+    }
     Ok(())
 }
 
@@ -12904,17 +14336,48 @@ fn ensure_filesystem_entries_indexes(conn: &Connection) -> Result<()> {
     // entries table once per deleted row (parent_id ON DELETE SET NULL) -
     // O(N^2), which on a 359k-entry case never finishes and holds the write
     // lock ("database is locked" for every other action).
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS ix_filesystem_entries_case_evidence
-         ON filesystem_entries(case_id, evidence_id);
-         CREATE INDEX IF NOT EXISTS ix_filesystem_entries_parent
-         ON filesystem_entries(parent_id);
-         CREATE INDEX IF NOT EXISTS ix_filesystem_entries_job
-         ON filesystem_entries(discovered_by_job_id);
-         CREATE INDEX IF NOT EXISTS ix_bookmark_items_entry
-         ON bookmark_items(entry_id);",
+    for (name, sql) in [
+        (
+            "ix_filesystem_entries_case_evidence",
+            "CREATE INDEX ix_filesystem_entries_case_evidence
+             ON filesystem_entries(case_id, evidence_id)",
+        ),
+        (
+            "ix_filesystem_entries_parent",
+            "CREATE INDEX ix_filesystem_entries_parent
+             ON filesystem_entries(parent_id)",
+        ),
+        (
+            "ix_filesystem_entries_job",
+            "CREATE INDEX ix_filesystem_entries_job
+             ON filesystem_entries(discovered_by_job_id)",
+        ),
+        (
+            "ix_bookmark_items_entry",
+            "CREATE INDEX ix_bookmark_items_entry
+             ON bookmark_items(entry_id)",
+        ),
+    ] {
+        if !sqlite_index_exists(conn, name)? {
+            conn.execute(sql, [])
+                .with_context(|| format!("creating SQLite index {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_index_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index' AND name = ?1
+            LIMIT 1
+        )",
+        params![name],
+        |row| row.get::<_, i64>(0),
     )
-    .context("creating filesystem_entries/bookmark_items foreign-key indexes")
+    .map(|value| value != 0)
+    .with_context(|| format!("checking SQLite index {name}"))
 }
 
 fn ensure_evidence_hash_columns(conn: &Connection) -> Result<()> {
@@ -13371,6 +14834,36 @@ fn ensure_filesystem_entry(
     Ok(evidence_id)
 }
 
+fn load_filesystem_entry_by_id(
+    conn: &Connection,
+    case_id: i64,
+    entry_id: i64,
+) -> Result<FilesystemEntry> {
+    let raw = conn.query_row(
+        "SELECT id, case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, discovered_by_job_id
+         FROM filesystem_entries
+         WHERE id = ?1 AND case_id = ?2",
+        params![entry_id, case_id],
+        |row| {
+            Ok(RawFilesystemEntry {
+                id: row.get(0)?,
+                case_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                logical_path: row.get(4)?,
+                name: row.get(5)?,
+                entry_kind: row.get(6)?,
+                size_bytes: row.get(7)?,
+                is_deleted: row.get::<_, i64>(8)? != 0,
+                metadata_json: row.get(9)?,
+                discovered_by_job_id: row.get(10)?,
+            })
+        },
+    )?;
+    filesystem_entry_from_raw(raw)
+}
+
 fn validate_json_object(value: &serde_json::Value, field: &str) -> Result<()> {
     if value.is_object() {
         Ok(())
@@ -13573,16 +15066,32 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
 
 fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) -> bool {
     let item_ref = &item.item_ref_json;
-    let has_context = item_ref.get("kind").and_then(|value| value.as_str())
-        == Some("search_result")
-        || item_ref.get("mft_record_physical_offset").is_some()
+    let kind = item_ref.get("kind").and_then(|value| value.as_str());
+    let has_context = matches!(
+        kind,
+        Some("search_result")
+            | Some("filesystem_entry")
+            | Some("filesystem_folder")
+            | Some("live_file")
+            | Some("live_dir")
+    ) || item_ref.get("mft_record_physical_offset").is_some()
         || item_ref.get("file_data_physical_offset").is_some()
         || item_ref.get("is_deleted").is_some()
-        || item_ref.get("file_extension").is_some();
+        || item_ref.get("file_extension").is_some()
+        || item_ref.get("size_bytes").is_some();
     if !has_context {
         return false;
     }
-    html.push_str("<dl class=\"activity-details\"><dt>Artifact</dt><dd>Forensic Finding</dd>");
+    html.push_str("<dl class=\"activity-details\"><dt>Artifact</dt><dd>");
+    html.push_str(match kind {
+        Some("live_file") => "Live Browse File",
+        Some("live_dir") => "Live Browse Folder",
+        Some("filesystem_folder") => "Filesystem Folder",
+        Some("filesystem_entry") => "Filesystem Entry",
+        Some("search_result") => "Forensic Finding",
+        _ => "Forensic Finding",
+    });
+    html.push_str("</dd>");
     if let Some(path) = item_ref
         .get("logical_path")
         .and_then(|value| value.as_str())
@@ -13591,17 +15100,35 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
                 .get("relative_path")
                 .and_then(|value| value.as_str())
         })
+        .or_else(|| item_ref.get("path").and_then(|value| value.as_str()))
     {
         html.push_str("<dt>Path</dt><dd>");
         html.push_str(&escape_html(&display_entry_path(path)));
         html.push_str("</dd>");
     }
+    push_activity_detail(html, item_ref, "Display Name", &["display_name"]);
+    push_activity_detail(html, item_ref, "Entry Kind", &["entry_kind"]);
+    push_activity_detail(html, item_ref, "Filesystem", &["filesystem"]);
+    push_activity_detail(html, item_ref, "Volume", &["volume", "volume_name"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Volume Start Offset",
+        &["volume_start_offset"],
+    );
+    push_activity_detail(html, item_ref, "Volume Size", &["volume_size_bytes"]);
     push_activity_detail(html, item_ref, "Extension", &["file_extension"]);
     push_activity_detail(html, item_ref, "Detected Type", &["detected_signature"]);
     push_activity_detail(html, item_ref, "Signature Status", &["signature_status"]);
     push_activity_detail(html, item_ref, "Size", &["size_bytes"]);
     push_activity_detail(html, item_ref, "Deleted", &["is_deleted"]);
     push_activity_detail(html, item_ref, "Match", &["match_kind"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "NTFS File Record",
+        &["ntfs_file_record_number"],
+    );
     push_activity_detail(
         html,
         item_ref,
@@ -13636,27 +15163,58 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
     );
     push_activity_detail(html, item_ref, "In File Slack", &["is_file_slack"]);
     push_activity_detail(html, item_ref, "In Unallocated Space", &["is_unallocated"]);
+    push_activity_detail(html, item_ref, "Created", &["created_utc"]);
+    push_activity_detail(html, item_ref, "Modified", &["modified_utc"]);
+    push_activity_detail(html, item_ref, "Accessed", &["accessed_utc"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "MFT Modified",
+        &["ntfs_mft_record_modification_time_utc"],
+    );
+    push_activity_detail(html, item_ref, "Symlink", &["symlink"]);
     if let Some(metadata) = item_ref.get("metadata") {
         push_activity_detail(
             html,
             metadata,
             "Created",
-            &["ntfs_creation_time_utc", "ntfs_standard_creation_time_utc"],
+            &[
+                "created_utc",
+                "ntfs_creation_time_utc",
+                "ntfs_standard_creation_time_utc",
+                "file_name_created_utc",
+                "standard_information_created_utc",
+                "fat_created",
+                "source_file_created_utc",
+            ],
         );
         push_activity_detail(
             html,
             metadata,
             "Modified",
             &[
+                "modified_utc",
                 "ntfs_modification_time_utc",
                 "ntfs_standard_modification_time_utc",
+                "file_name_modified_utc",
+                "standard_information_modified_utc",
+                "fat_modified",
+                "source_file_modified_utc",
             ],
         );
         push_activity_detail(
             html,
             metadata,
             "Accessed",
-            &["ntfs_access_time_utc", "ntfs_standard_access_time_utc"],
+            &[
+                "accessed_utc",
+                "ntfs_access_time_utc",
+                "ntfs_standard_access_time_utc",
+                "file_name_accessed_utc",
+                "standard_information_accessed_utc",
+                "fat_accessed",
+                "source_file_accessed_utc",
+            ],
         );
         push_activity_detail(
             html,
@@ -13665,8 +15223,13 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
             &[
                 "ntfs_mft_record_modification_time_utc",
                 "ntfs_standard_mft_record_modification_time_utc",
+                "mft_modified_utc",
+                "file_name_mft_modified_utc",
+                "standard_information_mft_modified_utc",
             ],
         );
+        push_activity_detail(html, metadata, "Source Path", &["source_path"]);
+        push_activity_detail(html, metadata, "Source Kind", &["source_kind"]);
         push_activity_detail(html, metadata, "Recovery Source", &["recovery_source"]);
         push_activity_detail(html, metadata, "Recovery Status", &["recovery_status"]);
     }
@@ -13752,6 +15315,9 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Typed Count", &["typed_count"]);
             push_activity_detail(html, item_ref, "Visit ID", &["visit_id"]);
             push_activity_detail(html, item_ref, "URL ID", &["url_id"]);
+            push_activity_detail(html, item_ref, "Place ID", &["place_id"]);
+            push_activity_detail(html, item_ref, "History Item ID", &["history_item_id"]);
+            push_activity_detail(html, item_ref, "Visit Type", &["visit_type_label"]);
             push_activity_detail(html, item_ref, "Chrome Visit Time", &["visit_time_chrome"]);
             push_activity_detail(
                 html,
@@ -13759,6 +15325,8 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Chrome Last URL Visit",
                 &["last_visit_time_chrome"],
             );
+            push_activity_detail(html, item_ref, "Firefox PRTime", &["visit_time_prtime"]);
+            push_activity_detail(html, item_ref, "Safari Time", &["visit_time_safari"]);
             push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
             push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
             push_activity_detail(
@@ -13779,6 +15347,74 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Source Accessed",
                 &["source_file_accessed_utc"],
             );
+        }
+        "browser_url" => {
+            push_activity_detail(html, item_ref, "URL", &["url"]);
+            push_activity_detail(html, item_ref, "Title", &["title", "display_name"]);
+            push_activity_detail(html, item_ref, "Host", &["host"]);
+            push_activity_detail(html, item_ref, "Last Visit", &["last_visit_time_utc"]);
+            push_activity_detail(html, item_ref, "Visit Count", &["visit_count"]);
+            push_activity_detail(html, item_ref, "Typed Count", &["typed_count"]);
+            push_activity_detail(html, item_ref, "Typed", &["typed"]);
+            push_activity_detail(html, item_ref, "Hidden", &["hidden"]);
+            push_activity_detail(html, item_ref, "URL ID", &["url_id"]);
+            push_activity_detail(html, item_ref, "Place ID", &["place_id"]);
+            push_activity_detail(html, item_ref, "History Item ID", &["history_item_id"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Chrome Last Visit",
+                &["last_visit_time_chrome"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Firefox PRTime",
+                &["last_visit_time_prtime"],
+            );
+            push_browser_source_details(html, item_ref);
+        }
+        "browser_search_term" => {
+            push_activity_detail(html, item_ref, "Search Term", &["search_term"]);
+            push_activity_detail(html, item_ref, "URL", &["url"]);
+            push_activity_detail(html, item_ref, "Host", &["host"]);
+            push_activity_detail(html, item_ref, "Last Visit", &["last_visit_time_utc"]);
+            push_activity_detail(html, item_ref, "First Used", &["first_used_utc"]);
+            push_activity_detail(html, item_ref, "Last Used", &["last_used_utc"]);
+            push_activity_detail(html, item_ref, "Times Used", &["times_used"]);
+            push_activity_detail(html, item_ref, "URL ID", &["url_id"]);
+            push_activity_detail(html, item_ref, "Form History ID", &["formhistory_id"]);
+            push_browser_source_details(html, item_ref);
+        }
+        "browser_download" => {
+            push_activity_detail(html, item_ref, "File Name", &["file_name", "display_name"]);
+            push_activity_detail(html, item_ref, "Target Path", &["target_path"]);
+            push_activity_detail(html, item_ref, "Current Path", &["current_path"]);
+            push_activity_detail(html, item_ref, "Source URL", &["source_url", "tab_url"]);
+            push_activity_detail(html, item_ref, "Referrer", &["referrer"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Started",
+                &["start_time_utc", "date_added_utc"],
+            );
+            push_activity_detail(html, item_ref, "Ended", &["end_time_utc"]);
+            push_activity_detail(html, item_ref, "Received Bytes", &["received_bytes"]);
+            push_activity_detail(html, item_ref, "Total Bytes", &["total_bytes"]);
+            push_activity_detail(html, item_ref, "State", &["state"]);
+            push_activity_detail(html, item_ref, "Danger Type", &["danger_type"]);
+            push_activity_detail(html, item_ref, "Interrupt Reason", &["interrupt_reason"]);
+            push_activity_detail(html, item_ref, "MIME Type", &["mime_type"]);
+            push_activity_detail(html, item_ref, "Download ID", &["download_id"]);
+            push_activity_detail(html, item_ref, "Annotation ID", &["annotation_id"]);
+            push_activity_detail(html, item_ref, "Annotation Name", &["annotation_name"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Annotation Content",
+                &["annotation_content"],
+            );
+            push_browser_source_details(html, item_ref);
         }
         "browser_bookmark" => {
             push_activity_detail(html, item_ref, "Name", &["name", "display_name"]);
@@ -13814,6 +15450,52 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Source Accessed",
                 &["source_file_accessed_utc"],
             );
+        }
+        "browser_login" => {
+            push_activity_detail(html, item_ref, "Host", &["host"]);
+            push_activity_detail(html, item_ref, "Origin URL", &["origin_url"]);
+            push_activity_detail(html, item_ref, "Action URL", &["action_url"]);
+            push_activity_detail(html, item_ref, "Hostname", &["hostname"]);
+            push_activity_detail(html, item_ref, "Realm", &["http_realm"]);
+            push_activity_detail(html, item_ref, "Username", &["username"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Created",
+                &["date_created_utc", "time_created_utc"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Last Used",
+                &["date_last_used_utc", "time_last_used_utc"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Password Changed",
+                &["time_password_changed_utc"],
+            );
+            push_activity_detail(html, item_ref, "Times Used", &["times_used"]);
+            push_activity_detail(html, item_ref, "Password Note", &["password_note"]);
+            push_browser_source_details(html, item_ref);
+        }
+        "browser_cookie" => {
+            push_activity_detail(html, item_ref, "Host", &["host"]);
+            push_activity_detail(html, item_ref, "Cookie Name", &["cookie_name"]);
+            push_activity_detail(html, item_ref, "Cookie Path", &["cookie_path"]);
+            push_activity_detail(html, item_ref, "Created", &["creation_utc"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Last Access",
+                &["last_access_utc", "last_accessed_utc"],
+            );
+            push_activity_detail(html, item_ref, "Expires", &["expires_utc", "expiry_utc"]);
+            push_activity_detail(html, item_ref, "Secure", &["is_secure"]);
+            push_activity_detail(html, item_ref, "HttpOnly", &["is_httponly"]);
+            push_activity_detail(html, item_ref, "Value Note", &["value_note"]);
+            push_browser_source_details(html, item_ref);
         }
         "browser_preference" => {
             push_activity_detail(html, item_ref, "Category", &["category"]);
@@ -13862,6 +15544,30 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
     }
     html.push_str("</dl>");
     true
+}
+
+fn push_browser_source_details(html: &mut String, item_ref: &serde_json::Value) {
+    push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
+    push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Source Created",
+        &["source_file_created_utc"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Source Modified",
+        &["source_file_modified_utc"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Source Accessed",
+        &["source_file_accessed_utc"],
+    );
+    push_activity_detail(html, item_ref, "Source Size", &["source_file_size_bytes"]);
 }
 
 fn browser_activity_kind(item_ref: &serde_json::Value) -> Option<&str> {
@@ -18012,7 +19718,7 @@ mod tests {
             &case_path,
             ImportBrowserHistoryOptions {
                 history_path: history_path.clone(),
-                max_visits: 10,
+                max_visits: 0,
                 evidence_name: Some("Chrome Default History".to_string()),
             },
         )?;
@@ -18154,6 +19860,42 @@ mod tests {
             12
         );
 
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(history_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_history_import_reads_pending_wal_rows() -> Result<()> {
+        let case_path = unique_case_path("history-import-wal");
+        create_test_case(&case_path)?;
+        let history_dir = unique_temp_dir("history-import-wal-source");
+        fs::create_dir_all(&history_dir)?;
+        let history_path = history_dir.join("History");
+        let writer = create_test_chromium_history_with_pending_wal(&history_path)?;
+        assert!(
+            sqlite_sidecar_path(&history_path, "-wal").is_file(),
+            "test setup should leave the committed row in a WAL sidecar"
+        );
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: history_path.clone(),
+                max_visits: 10,
+                evidence_name: Some("Chrome WAL History".to_string()),
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 1);
+        assert_eq!(imported.entries_indexed, 2);
+
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert!(entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("browser_history_visit")
+                && entry.metadata_json["url"].as_str() == Some("https://wal.example/recent")
+        }));
+
+        drop(writer);
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(history_dir);
         Ok(())
@@ -18596,6 +20338,60 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_delete_removes_items_and_records_audit() -> Result<()> {
+        let case_path = unique_case_path("bookmark-delete");
+        create_test_case(&case_path)?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        add_bookmark_item(&case_path, test_bookmark_item_options(bookmark_id))?;
+        add_bookmark_item(&case_path, test_bookmark_item_options(bookmark_id))?;
+
+        let removed = remove_bookmark(&case_path, bookmark_id)?;
+        assert_eq!(removed.bookmark_id, bookmark_id);
+        assert_eq!(removed.removed_items, 2);
+        assert!(list_bookmarks(&case_path)?.is_empty());
+        assert!(list_bookmark_items(&case_path, None)?.is_empty());
+
+        let conn = open_existing_case(&case_path)?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM audit_events WHERE object_type = 'bookmark' AND object_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![bookmark_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(event_type, "bookmark.delete");
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_item_delete_removes_only_selected_item() -> Result<()> {
+        let case_path = unique_case_path("bookmark-item-delete");
+        create_test_case(&case_path)?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let first = add_bookmark_item(&case_path, test_bookmark_item_options(bookmark_id))?;
+        let second = add_bookmark_item(&case_path, test_bookmark_item_options(bookmark_id))?;
+
+        let removed = remove_bookmark_item(&case_path, first.id)?;
+        assert_eq!(removed.item_id, first.id);
+        assert_eq!(removed.bookmark_id, bookmark_id);
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, second.id);
+        assert_eq!(list_bookmarks(&case_path)?.len(), 1);
+
+        let conn = open_existing_case(&case_path)?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM audit_events WHERE object_type = 'bookmark_item' AND object_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![first.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(event_type, "bookmark.item.delete");
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
     fn bookmark_item_add_rejects_duplicate_explicit_order() -> Result<()> {
         let case_path = unique_case_path("bookmark-item-duplicate-order");
         create_test_case(&case_path)?;
@@ -18709,6 +20505,359 @@ mod tests {
         let item = add_bookmark_item(&case_path, options)?;
         assert_eq!(item.evidence_id, Some(evidence_id));
         assert_eq!(item.entry_id, Some(entry_id));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_item_add_backfills_display_and_reference_from_entry_for_report() -> Result<()> {
+        let case_path = unique_case_path("bookmark-item-report-backfill");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-report-backfill");
+        fs::create_dir_all(&evidence_source)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let metadata = serde_json::json!({
+            "artifact_kind": "browser_login",
+            "browser_family": "chromium",
+            "host": "ebank.example.com",
+            "username": "jdoe",
+            "search_text": "must not leak into the report reference"
+        });
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+             ) VALUES (?1, ?2, '/Browser Activities/Logins/ebank.example.com/jdoe.record',
+                       'jdoe @ ebank.example.com', 'record', ?3)",
+            rusqlite::params![case_id, evidence_id, metadata.to_string()],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        drop(conn);
+
+        // Only entry_id supplied - the CLI's only bookmarking path, with no client-side
+        // entry cache to draw display_name/logical_path/item_ref_json from.
+        let mut options = test_bookmark_item_options(bookmark_id);
+        options.entry_id = Some(entry_id);
+        let item = add_bookmark_item(&case_path, options)?;
+        assert_eq!(
+            item.display_name.as_deref(),
+            Some("jdoe @ ebank.example.com")
+        );
+        assert_eq!(
+            item.logical_path.as_deref(),
+            Some("/Browser Activities/Logins/ebank.example.com/jdoe.record")
+        );
+        assert_eq!(
+            item.item_ref_json["kind"],
+            serde_json::json!("browser_activity")
+        );
+        assert_eq!(
+            item.item_ref_json["activity_kind"],
+            serde_json::json!("browser_login")
+        );
+        assert_eq!(
+            item.item_ref_json["host"],
+            serde_json::json!("ebank.example.com")
+        );
+        assert!(item.item_ref_json.get("search_text").is_none());
+
+        let report = report_data(&case_path)?;
+        let html = render_report_html(&report);
+        assert!(html.contains("jdoe @ ebank.example.com"));
+        assert!(html.contains("ebank.example.com"));
+        assert!(!html.contains("must not leak"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_add_bookmark_items_inserts_all_in_one_transaction_and_skips_missing_entries(
+    ) -> Result<()> {
+        let case_path = unique_case_path("bookmark-bulk-add");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-bulk-add");
+        fs::create_dir_all(&evidence_source)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let mut entry_ids = Vec::new();
+        for index in 0..25 {
+            conn.execute(
+                "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+                 VALUES (?1, ?2, ?3, ?4, 'file')",
+                rusqlite::params![
+                    case_id,
+                    evidence_id,
+                    format!("/bulk-{index}.txt"),
+                    format!("bulk-{index}.txt")
+                ],
+            )?;
+            entry_ids.push(conn.last_insert_rowid());
+        }
+        let missing_entry_id = entry_ids.iter().max().copied().unwrap_or(0) + 1000;
+        drop(conn);
+
+        let mut request_ids = entry_ids.clone();
+        request_ids.push(missing_entry_id);
+        let result = bulk_add_bookmark_items(&case_path, bookmark_id, &request_ids)?;
+        assert_eq!(result.items_added, 25);
+        assert_eq!(result.skipped_entry_ids, vec![missing_entry_id]);
+
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 25);
+        assert_eq!(items[0].item_order, 10);
+        assert_eq!(items[24].item_order, 250);
+        assert_eq!(items[0].display_name.as_deref(), Some("bulk-0.txt"));
+        assert_eq!(items[0].logical_path.as_deref(), Some("/bulk-0.txt"));
+        assert_eq!(
+            items[0].item_ref_json["kind"],
+            serde_json::json!("category_entry")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_indexed_folder_recursive_bulk_adds_descendant_files_only() -> Result<()> {
+        let case_path = unique_case_path("bookmark-folder-recursive-indexed");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-folder-recursive-indexed");
+        fs::create_dir_all(&evidence_source)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Target', 'Target', 'directory')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        for index in 0..3 {
+            conn.execute(
+                "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+                 VALUES (?1, ?2, ?3, ?4, 'file')",
+                rusqlite::params![
+                    case_id,
+                    evidence_id,
+                    format!("/Target/file-{index}.txt"),
+                    format!("file-{index}.txt")
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Target/Sub', 'Sub', 'directory')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Target/Sub/nested.txt', 'nested.txt', 'file')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        // A file outside /Target that must NOT be swept up, and one whose path
+        // merely starts with the same prefix text (not an actual descendant).
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/outside.txt', 'outside.txt', 'file')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Target2/decoy.txt', 'decoy.txt', 'file')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        drop(conn);
+
+        let result = bookmark_indexed_folder_recursive(
+            &case_path,
+            bookmark_id,
+            evidence_id,
+            "/Target",
+            RECURSIVE_FOLDER_BOOKMARK_LIMIT,
+        )?;
+        assert_eq!(result.items_added, 4);
+        assert_eq!(result.total_candidates, 4);
+        assert!(!result.truncated);
+
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 4);
+        let paths: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.logical_path.clone())
+            .collect();
+        assert!(paths.contains(&"/Target/file-0.txt".to_string()));
+        assert!(paths.contains(&"/Target/Sub/nested.txt".to_string()));
+        assert!(!paths.iter().any(|path| path == "/outside.txt"));
+        assert!(!paths.iter().any(|path| path == "/Target2/decoy.txt"));
+        assert!(!paths.iter().any(|path| path == "/Target"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_indexed_folder_recursive_rejects_nonexistent_path_but_allows_root() -> Result<()> {
+        let case_path = unique_case_path("bookmark-folder-recursive-indexed-missing");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-folder-recursive-indexed-missing");
+        fs::create_dir_all(&evidence_source)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Real', 'Real', 'directory')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(case_id, evidence_id, logical_path, name, entry_kind)
+             VALUES (?1, ?2, '/Real/file.txt', 'file.txt', 'file')",
+            rusqlite::params![case_id, evidence_id],
+        )?;
+        drop(conn);
+
+        // A folder path that was never indexed must error instead of silently
+        // producing an empty bookmark (previously returned items_added: 0 with
+        // no signal that the path was bogus rather than genuinely empty).
+        let missing = bookmark_indexed_folder_recursive(
+            &case_path,
+            bookmark_id,
+            evidence_id,
+            "/Real/does-not-exist",
+            RECURSIVE_FOLDER_BOOKMARK_LIMIT,
+        );
+        assert!(missing.is_err());
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("directory not found"));
+
+        // The whole-evidence root ("/") has no directory row of its own and
+        // must remain valid even when it is genuinely empty of un-nested files.
+        let root = bookmark_indexed_folder_recursive(
+            &case_path,
+            bookmark_id,
+            evidence_id,
+            "/",
+            RECURSIVE_FOLDER_BOOKMARK_LIMIT,
+        )?;
+        assert_eq!(root.items_added, 1);
+        assert_eq!(root.total_candidates, 1);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_live_folder_recursive_walks_local_folder_tree_without_indexing() -> Result<()> {
+        let case_path = unique_case_path("bookmark-folder-recursive-live");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-folder-recursive-live");
+        fs::create_dir_all(evidence_source.join("Sub"))?;
+        fs::write(evidence_source.join("a.txt"), b"hello")?;
+        fs::write(evidence_source.join("b.txt"), b"world!!")?;
+        fs::write(evidence_source.join("Sub").join("c.txt"), b"nested")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+
+        let listing = list_local_tree_files(
+            &case_path,
+            evidence_id,
+            "/",
+            RECURSIVE_FOLDER_BOOKMARK_LIMIT,
+        )?;
+        assert_eq!(listing.files.len(), 3);
+        assert!(!listing.truncated);
+
+        let result = bookmark_live_folder_recursive(
+            &case_path,
+            bookmark_id,
+            evidence_id,
+            "folder",
+            &evidence_source.to_string_lossy(),
+            0,
+            "",
+            "",
+            listing,
+        )?;
+        assert_eq!(result.items_added, 3);
+        assert!(!result.truncated);
+
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 3);
+        let names: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.display_name.clone())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"c.txt".to_string()));
+        let nested = items
+            .iter()
+            .find(|item| item.display_name.as_deref() == Some("c.txt"))
+            .expect("nested file bookmarked");
+        assert_eq!(nested.item_ref_json["kind"], serde_json::json!("live_file"));
+        assert_eq!(
+            nested.item_ref_json["relative_path"],
+            serde_json::json!("Sub/c.txt")
+        );
+        assert_eq!(nested.item_ref_json["size_bytes"], serde_json::json!(6));
+        assert!(nested.item_ref_json["metadata"].is_object());
+
+        // filesystem_entries must stay untouched by a live/recursive bookmark - this
+        // is explicitly a no-indexing action, same guarantee as a single live bookmark.
+        assert_eq!(filesystem_entry_count(&case_path)?, 0);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_source);
@@ -19072,6 +21221,95 @@ mod tests {
     }
 
     #[test]
+    fn render_report_html_formats_live_bookmark_metadata() -> Result<()> {
+        let case_path = unique_case_path("report-live-bookmark-context");
+        create_test_case(&case_path)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Live Browse", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::NotableFile,
+                data_type: Some("Live file".to_string()),
+                title: Some("TCMS - Demo Corp - Findings Report - Example 2.docx".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: None,
+                entry_id: None,
+                item_order: None,
+                display_name: Some("TCMS - Demo Corp - Findings Report - Example 2.docx".to_string()),
+                logical_path: Some(
+                    "[vol 1] /Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx"
+                        .to_string(),
+                ),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some(
+                    "Live file | 42 B | modified 2026-07-07T05:00:00Z".to_string(),
+                ),
+                item_ref_json: serde_json::json!({
+                    "kind": "live_file",
+                    "entry_kind": "file",
+                    "evidence_id": 1,
+                    "logical_path": "[vol 1] /Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx",
+                    "relative_path": "/Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx",
+                    "display_name": "TCMS - Demo Corp - Findings Report - Example 2.docx",
+                    "volume": 1,
+                    "path": "/Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx",
+                    "filesystem": "NTFS",
+                    "volume_start_offset": 1048576,
+                    "volume_size_bytes": 4096,
+                    "size_bytes": 42,
+                    "ntfs_file_record_number": 123,
+                    "mft_record_logical_offset": 6291456,
+                    "mft_record_physical_offset": 7340032,
+                    "file_data_logical_offset": 8192,
+                    "file_data_physical_offset": 1056768,
+                    "created_utc": "2026-07-07T04:00:00Z",
+                    "modified_utc": "2026-07-07T05:00:00Z",
+                    "accessed_utc": "2026-07-07T06:00:00Z",
+                    "ntfs_mft_record_modification_time_utc": "2026-07-07T06:30:00Z",
+                    "is_deleted": false,
+                    "file_extension": "docx",
+                    "metadata": {
+                        "source_kind": "image",
+                        "source_path": "E:\\\\w10_malw.vdi",
+                        "volume_filesystem": "NTFS"
+                    }
+                }),
+            },
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        assert!(html.contains("<dt>Artifact</dt><dd>Live Browse File</dd>"));
+        assert!(html.contains("<dt>Path</dt><dd>[vol 1] /Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx</dd>"));
+        assert!(html.contains("<dt>Size</dt><dd>42</dd>"));
+        assert!(html.contains("<dt>Deleted</dt><dd>false</dd>"));
+        assert!(html.contains("<dt>NTFS File Record</dt><dd>123</dd>"));
+        assert!(html.contains("<dt>MFT Record Logical Offset</dt><dd>6291456</dd>"));
+        assert!(html.contains("<dt>MFT Record Physical Offset</dt><dd>7340032</dd>"));
+        assert!(html.contains("<dt>File Data Logical Offset</dt><dd>8192</dd>"));
+        assert!(html.contains("<dt>File Data Physical Offset</dt><dd>1056768</dd>"));
+        assert!(html.contains("<dt>Created</dt><dd>2026-07-07T04:00:00Z</dd>"));
+        assert!(html.contains("<dt>Modified</dt><dd>2026-07-07T05:00:00Z</dd>"));
+        assert!(html.contains("<dt>Accessed</dt><dd>2026-07-07T06:00:00Z</dd>"));
+        assert!(html.contains("<dt>MFT Modified</dt><dd>2026-07-07T06:30:00Z</dd>"));
+        assert!(html.contains("&quot;metadata&quot;"));
+        assert!(html.contains("E:\\\\w10_malw.vdi"));
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
     fn render_report_html_formats_browser_activity_items() -> Result<()> {
         let case_path = unique_case_path("report-browser-activity");
         create_test_case(&case_path)?;
@@ -19118,6 +21356,98 @@ mod tests {
                 }),
             },
         )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "URL: Example",
+            "/Browser Activities/URLs/example.com/1.record",
+            serde_json::json!({
+                "activity_kind": "browser_url",
+                "url": "https://example.com/url",
+                "title": "Example URL",
+                "last_visit_time_utc": "2026-06-28T09:00:00Z",
+                "visit_count": 4,
+                "source_artifact": "History"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Search: keyword",
+            "/Browser Activities/Searches/keyword-1.record",
+            serde_json::json!({
+                "activity_kind": "browser_search_term",
+                "search_term": "keyword",
+                "url": "https://search.example/?q=keyword",
+                "last_used_utc": "2026-06-28T09:30:00Z",
+                "times_used": 2
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Download: tool.zip",
+            "/Browser Activities/Downloads/7-tool.zip.record",
+            serde_json::json!({
+                "activity_kind": "browser_download",
+                "file_name": "tool.zip",
+                "target_path": "C:\\Users\\me\\Downloads\\tool.zip",
+                "tab_url": "https://example.com/download",
+                "start_time_utc": "2026-06-28T11:00:00Z",
+                "received_bytes": 2048
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Bookmark: Example",
+            "/Browser Activities/Bookmarks/Bar/example.record",
+            serde_json::json!({
+                "activity_kind": "browser_bookmark",
+                "name": "Example Bookmark",
+                "url": "https://example.com/bookmark",
+                "folder": "Bookmarks Bar",
+                "date_added_utc": "2026-06-28T08:00:00Z"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Login: example.com",
+            "/Browser Activities/Logins/example.com/user-1.record",
+            serde_json::json!({
+                "activity_kind": "browser_login",
+                "host": "example.com",
+                "username": "user@example.com",
+                "date_last_used_utc": "2026-06-28T12:00:00Z",
+                "password_note": "encrypted password value not extracted"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Cookie: sid",
+            "/Browser Activities/Cookies/example.com/sid-1.record",
+            serde_json::json!({
+                "activity_kind": "browser_cookie",
+                "host": ".example.com",
+                "cookie_name": "sid",
+                "cookie_path": "/",
+                "last_access_utc": "2026-06-28T12:30:00Z",
+                "value_note": "encrypted cookie value not extracted"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Preference: Downloads",
+            "/Browser Activities/Preferences/Downloads.record",
+            serde_json::json!({
+                "activity_kind": "browser_preference",
+                "category": "downloads",
+                "download_default_directory": "C:\\Users\\Examiner\\Downloads"
+            }),
+        )?;
 
         let html = render_report_html(&report_data(&case_path)?);
         assert!(html.contains("Browser Activity"));
@@ -19127,9 +21457,324 @@ mod tests {
         assert!(html.contains("<dt>Transition</dt><dd>typed</dd>"));
         assert!(html.contains("<dt>Visit Count</dt><dd>3</dd>"));
         assert!(html.contains("<dt>Source Modified</dt>"));
+        assert!(html.contains("<dd>URL</dd>"));
+        assert!(html.contains("<dt>Last Visit</dt><dd>2026-06-28T09:00:00Z</dd>"));
+        assert!(html.contains("<dd>Search</dd>"));
+        assert!(html.contains("<dt>Search Term</dt><dd>keyword</dd>"));
+        assert!(html.contains("<dd>Download</dd>"));
+        assert!(html.contains("<dt>File Name</dt><dd>tool.zip</dd>"));
+        assert!(html.contains("<dd>Bookmark</dd>"));
+        assert!(html.contains("<dt>Folder</dt><dd>Bookmarks Bar</dd>"));
+        assert!(html.contains("<dd>Saved Login</dd>"));
+        assert!(html.contains("<dt>Username</dt><dd>user@example.com</dd>"));
+        assert!(html.contains("<dd>Cookie</dd>"));
+        assert!(html.contains("<dt>Cookie Name</dt><dd>sid</dd>"));
+        assert!(html.contains("<dd>Preference</dd>"));
+        assert!(html.contains("<dt>Download Directory</dt><dd>C:\\Users\\Examiner\\Downloads</dd>"));
         assert!(!html.contains("https://example.com/<q>"));
 
         cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn report_category_bookmark_expands_contained_entries() -> Result<()> {
+        let case_path = unique_case_path("report-category-expansion");
+        create_test_case(&case_path)?;
+        let source_dir = unique_temp_dir("report-category-expansion-source");
+        fs::write(source_dir.join("History"), b"fixture")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let insert_entry =
+            |logical_path: &str, name: &str, metadata: serde_json::Value| -> Result<i64> {
+                conn.execute(
+                    "INSERT INTO filesystem_entries(
+                         case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+                     ) VALUES (?1, ?2, ?3, ?4, 'record', ?5)",
+                    params![
+                        case_id,
+                        evidence_id,
+                        logical_path,
+                        name,
+                        metadata.to_string()
+                    ],
+                )?;
+                Ok(conn.last_insert_rowid())
+            };
+        let search_id = insert_entry(
+            "/Browser Activities/Searches/cyberghost.record",
+            "Search: cyberghost",
+            serde_json::json!({
+                "artifact_kind": "browser_search_term",
+                "category_main": "Web Activity",
+                "category_sub": "Searches",
+                "search_term": "cyberghost",
+                "url": "https://www.google.com/search?q=cyberghost",
+                "last_used_utc": "2026-07-07T04:00:00Z",
+                "source_artifact": "History"
+            }),
+        )?;
+        let visit_id = insert_entry(
+            "/Browser Activities/Visits/example.com/1.record",
+            "Example visit",
+            serde_json::json!({
+                "artifact_kind": "browser_history_visit",
+                "category_main": "Web Activity",
+                "category_sub": "Visits",
+                "title": "Example visit",
+                "url": "https://example.com/",
+                "visit_time_utc": "2026-07-07T04:05:00Z",
+                "source_artifact": "History"
+            }),
+        )?;
+        drop(conn);
+
+        let folder_id = create_bookmark_folder(&case_path, None, "Categories", None, true)?;
+        let searches_bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Category".to_string()),
+                title: Some("Category: Web Activity / Searches".to_string()),
+                examiner_comment: Some("Expand the selected browser search category.".to_string()),
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id: searches_bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("Web Activity / Searches".to_string()),
+                logical_path: Some("/Categories/Web Activity _ Searches.record".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some("Web Activity / Searches".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "category",
+                    "evidence_id": evidence_id,
+                    "category_key": "Web Activity|||Searches",
+                    "category_label": "Web Activity / Searches"
+                }),
+            },
+        )?;
+
+        let all_bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Category".to_string()),
+                title: Some("Category: All Categories".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id: all_bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("All Categories".to_string()),
+                logical_path: Some("/Categories/All Categories.record".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some("All Categories".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "category",
+                    "evidence_id": evidence_id,
+                    "category_key": "",
+                    "category_label": "All Categories"
+                }),
+            },
+        )?;
+
+        let report = report_data(&case_path)?;
+        let bookmarks = &report.folders[0].bookmarks;
+        let searches = bookmarks
+            .iter()
+            .find(|bookmark| bookmark.id == searches_bookmark_id)
+            .expect("searches category bookmark");
+        assert_eq!(searches.items.len(), 2);
+        assert!(searches
+            .items
+            .iter()
+            .any(|item| item.entry_id == Some(search_id)));
+        assert!(!searches
+            .items
+            .iter()
+            .any(|item| item.entry_id == Some(visit_id)));
+        assert!(searches.items[0]
+            .data_preview
+            .as_deref()
+            .unwrap_or("")
+            .contains("Expanded to 1 non-directory entry"));
+
+        let all = bookmarks
+            .iter()
+            .find(|bookmark| bookmark.id == all_bookmark_id)
+            .expect("all categories bookmark");
+        assert_eq!(all.items.len(), 3);
+        assert!(all
+            .items
+            .iter()
+            .any(|item| item.entry_id == Some(search_id)));
+        assert!(all.items.iter().any(|item| item.entry_id == Some(visit_id)));
+
+        let html = render_report_html(&report);
+        assert!(html.contains("Expanded to 1 non-directory entry"));
+        assert!(html.contains("<dt>Search Term</dt><dd>cyberghost</dd>"));
+        assert!(html.contains("https://www.google.com/search?q=cyberghost"));
+        assert!(html.contains("<dt>Visit Time</dt><dd>2026-07-07T04:05:00Z</dd>"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn report_category_bookmark_caps_large_category_expansion() -> Result<()> {
+        let case_path = unique_case_path("report-category-expansion-limit");
+        create_test_case(&case_path)?;
+        let source_dir = unique_temp_dir("report-category-expansion-limit-source");
+        fs::write(source_dir.join("History"), b"fixture")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        for index in 0..(REPORT_CATEGORY_EXPANSION_LIMIT + 2) {
+            let suffix = format!("{index:04}");
+            conn.execute(
+                "INSERT INTO filesystem_entries(
+                     case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+                 ) VALUES (?1, ?2, ?3, ?4, 'record', ?5)",
+                params![
+                    case_id,
+                    evidence_id,
+                    format!("/Browser Activities/Visits/example.com/{suffix}.record"),
+                    format!("Visit {suffix}"),
+                    serde_json::json!({
+                        "artifact_kind": "browser_history_visit",
+                        "category_main": "Web Activity",
+                        "category_sub": "Visits",
+                        "title": format!("Visit {suffix}"),
+                        "url": format!("https://example.com/{suffix}")
+                    })
+                    .to_string()
+                ],
+            )?;
+        }
+        drop(conn);
+
+        let folder_id = create_bookmark_folder(&case_path, None, "Categories", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Category".to_string()),
+                title: Some("Category: All Categories".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("All Categories".to_string()),
+                logical_path: Some("/Categories/All Categories.record".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some("All Categories".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "category",
+                    "evidence_id": evidence_id,
+                    "category_key": "",
+                    "category_label": "All Categories"
+                }),
+            },
+        )?;
+
+        let report = report_data(&case_path)?;
+        let bookmark = &report.folders[0].bookmarks[0];
+        assert_eq!(bookmark.items.len(), REPORT_CATEGORY_EXPANSION_LIMIT + 1);
+        assert_eq!(
+            bookmark
+                .items
+                .iter()
+                .filter(|item| item.entry_id.is_some())
+                .count(),
+            REPORT_CATEGORY_EXPANSION_LIMIT
+        );
+        let summary = bookmark.items[0].data_preview.as_deref().unwrap_or("");
+        assert!(summary.contains(&format!(
+            "Expanded to first {} of {} non-directory entries",
+            REPORT_CATEGORY_EXPANSION_LIMIT,
+            REPORT_CATEGORY_EXPANSION_LIMIT + 2
+        )));
+        assert!(summary.contains("2 omitted"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    fn add_browser_report_item(
+        case_path: &Path,
+        bookmark_id: i64,
+        display_name: &str,
+        logical_path: &str,
+        mut item_ref_json: serde_json::Value,
+    ) -> Result<()> {
+        item_ref_json["kind"] = serde_json::json!("browser_activity");
+        add_bookmark_item(
+            case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: None,
+                entry_id: None,
+                item_order: None,
+                display_name: Some(display_name.to_string()),
+                logical_path: Some(logical_path.to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json,
+            },
+        )?;
         Ok(())
     }
 
@@ -19381,6 +22026,37 @@ mod tests {
             .to_string(),
         )?;
         Ok(())
+    }
+
+    fn create_test_chromium_history_with_pending_wal(history_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(history_path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE urls(
+                id INTEGER PRIMARY KEY,
+                url LONGVARCHAR,
+                title LONGVARCHAR,
+                visit_count INTEGER DEFAULT 0 NOT NULL,
+                typed_count INTEGER DEFAULT 0 NOT NULL,
+                last_visit_time INTEGER NOT NULL,
+                hidden INTEGER DEFAULT 0 NOT NULL
+             );
+             CREATE TABLE visits(
+                id INTEGER PRIMARY KEY,
+                url INTEGER NOT NULL,
+                visit_time INTEGER NOT NULL,
+                from_visit INTEGER,
+                transition INTEGER DEFAULT 0 NOT NULL,
+                segment_id INTEGER,
+                visit_duration INTEGER DEFAULT 0 NOT NULL
+             );
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://wal.example/recent', 'Recent WAL Page', 1, 0, 13300000050000000, 0);
+             INSERT INTO visits(id, url, visit_time, from_visit, transition, segment_id, visit_duration)
+             VALUES (11, 1, 13300000050000000, 0, 1, 0, 0);",
+        )?;
+        Ok(conn)
     }
 
     fn create_test_firefox_profile(profile_dir: &Path) -> Result<()> {

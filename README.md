@@ -179,18 +179,21 @@ FAT12/16/32 and NTFS partition entries when present, and stops at `--max-entries
 acquisition, deleted NTFS record recovery, and non-FAT/non-NTFS partition file-system parsing remain
 later evidence-reader jobs.
 
-Browser history import supports Chromium-style Chrome or Edge profile data:
+Browser history import supports Chromium-style Chrome/Edge, Firefox, and Safari profile data:
 
 ```powershell
-cargo run -p kdft-cli -- history import --case ui-output\workbench.kdft.sqlite --path "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\History" --max-visits 5000 --json
+cargo run -p kdft-cli -- history import --case ui-output\workbench.kdft.sqlite --path "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\History" --max-visits 0 --json
 ```
 
-The path may be a profile folder or its `History` database. The importer copies the History
-database to a temp file, reads it locally, and also processes sibling `Bookmarks` and `Preferences`
-files when present. Visits, bookmarks, and preference summaries are written as `browser_history`
-evidence entries of kind `record`. Those entries appear under `Browser Activities` in the Evidence
-Browser, deep search can match URL/title/host/preference metadata, and records can be selected in
-bulk or bookmarked for reports.
+The path may be a profile folder or a supported history database (`History`, `places.sqlite`, or
+`History.db`). The importer copies SQLite databases, including `-wal`/`-shm` sidecars when present,
+to temp files and reads them locally. It also processes sibling browser artifacts when supported,
+such as Chromium `Bookmarks` and `Preferences`, Firefox `formhistory.sqlite`, `cookies.sqlite`, and
+`logins.json`. `--max-visits 0` imports all available rows; use a positive value only when you want
+an examiner-selected cap. Browser activity artifacts are written as `browser_history` evidence
+entries of kind `record`. Those entries appear under `Browser Activities` in the Evidence Browser,
+deep search can match URL/title/host/preference metadata, and records can be selected in bulk or
+bookmarked for reports.
 
 Each `.kdft.sqlite` file is a single-case database. Bookmark item order is unique within each
 bookmark so report/export output can be deterministic.

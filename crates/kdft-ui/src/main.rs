@@ -1,18 +1,21 @@
 use anyhow::{bail, Context, Result};
 use kdft_case::{
-    add_bookmark_item, add_evidence, analyze_signatures, carve_evidence, case_info,
+    add_bookmark_item, add_evidence, analyze_signatures, bookmark_indexed_folder_recursive,
+    bookmark_live_folder_recursive, bulk_add_bookmark_items, carve_evidence, case_info,
     category_entry_counts, clear_all_findings, create_bookmark, create_bookmark_folder,
     create_case, deep_search, export_image_file, export_image_tree, export_local_file,
     export_local_tree, filesystem_entry_count, hash_evidence, import_browser_history,
     list_bookmark_folders, list_bookmark_items, list_bookmarks, list_entries_by_category,
-    list_evidence, list_filesystem_entries_limited, max_filesystem_entry_id, process_evidence,
-    read_filesystem_entry_bytes, record_live_export, record_live_export_with_source_kind,
-    record_live_tree_export, record_live_tree_export_with_source_kind, record_report_export,
-    recover_filesystem_entry, remove_evidence, render_report, report_data,
+    list_evidence, list_filesystem_entries_limited, list_image_tree_files, list_local_tree_files,
+    max_filesystem_entry_id, process_evidence, read_filesystem_entry_bytes, record_live_export,
+    record_live_export_with_source_kind, record_live_tree_export,
+    record_live_tree_export_with_source_kind, record_report_export, recover_filesystem_entry,
+    remove_bookmark, remove_bookmark_item, remove_evidence, render_report, report_data,
     report_data_with_directory_structure, AddEvidenceOptions, AnalyzeSignaturesOptions,
     BookmarkType, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
     CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserHistoryOptions,
     ProcessEvidenceOptions, ReadEntryBytesOptions, RecoverEntryOptions,
+    RECURSIVE_FOLDER_BOOKMARK_LIMIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -215,6 +218,52 @@ struct QuickBookmarkRequest {
 }
 
 #[derive(Deserialize)]
+struct RemoveBookmarkRequest {
+    case_path: String,
+    bookmark_id: i64,
+}
+
+#[derive(Deserialize)]
+struct BulkBookmarkRequest {
+    case_path: String,
+    folder_name: Option<String>,
+    title: Option<String>,
+    comment: Option<String>,
+    bookmark_type: Option<String>,
+    data_type: Option<String>,
+    entry_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct RemoveBookmarkItemRequest {
+    case_path: String,
+    item_id: i64,
+}
+
+#[derive(Deserialize)]
+struct BookmarkFolderRecursiveIndexedRequest {
+    case_path: String,
+    folder_name: Option<String>,
+    title: Option<String>,
+    comment: Option<String>,
+    evidence_id: i64,
+    logical_path: String,
+    max_entries: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct BookmarkFolderRecursiveLiveRequest {
+    case_path: String,
+    folder_name: Option<String>,
+    title: Option<String>,
+    comment: Option<String>,
+    evidence_id: i64,
+    volume: usize,
+    path: String,
+    max_entries: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct ClearFindingsRequest {
     case_path: String,
 }
@@ -396,6 +445,17 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("POST", "/api/history/import") => api_response(api_import_history(&request.body)),
         ("POST", "/api/search/deep") => api_response(api_deep_search(&request.body)),
         ("POST", "/api/bookmark/quick") => api_response(api_quick_bookmark(&request.body)),
+        ("POST", "/api/bookmark/remove") => api_response(api_remove_bookmark(&request.body)),
+        ("POST", "/api/bookmark/bulk") => api_response(api_bulk_bookmark(&request.body)),
+        ("POST", "/api/bookmark/item/remove") => {
+            api_response(api_remove_bookmark_item(&request.body))
+        }
+        ("POST", "/api/bookmark/folder-recursive-indexed") => {
+            api_response(api_bookmark_folder_recursive_indexed(&request.body))
+        }
+        ("POST", "/api/bookmark/folder-recursive-live") => {
+            api_response(api_bookmark_folder_recursive_live(&request.body))
+        }
         ("POST", "/api/findings/clear") => api_response(api_clear_findings(&request.body)),
         ("POST", "/api/report/export") => api_response(api_export_report(&request.body)),
         ("POST", "/api/report/open") => api_response(api_open_report(&request.body)),
@@ -1016,6 +1076,10 @@ fn run_native_pick_dialog(mode: &str, filter: &str, start: &str) -> Result<Optio
                 "*.E01;*.EX01;*.L01;*.dd;*.raw;*.img;*.001;*.vhd;*.vhdx;*.vmdk;*.vdi;*.iso";
             format!("Disk images ({patterns})|{patterns}|All files (*.*)|*.*")
         }
+        "browser_history" => {
+            let patterns = "History;History.db;places.sqlite;*.sqlite;*.sqlite3;*.db;*.db3";
+            format!("Browser history databases ({patterns})|{patterns}|All files (*.*)|*.*")
+        }
         _ => "All files (*.*)|*.*".to_string(),
     };
     // Single-quoted PowerShell strings only terminate on a quote; doubling
@@ -1217,6 +1281,10 @@ fn run_zenity_pick_dialog(mode: &str, filter: &str, start: &str) -> Result<Optio
     }
     if mode == "file" && filter == "image" {
         command.arg("--file-filter=Disk images | *.E01 *.EX01 *.L01 *.dd *.raw *.img *.001 *.vhd *.vhdx *.vmdk *.vdi *.iso");
+        command.arg("--file-filter=All files | *");
+    }
+    if mode == "file" && filter == "browser_history" {
+        command.arg("--file-filter=Browser history databases | History History.db places.sqlite *.sqlite *.sqlite3 *.db *.db3");
         command.arg("--file-filter=All files | *");
     }
     let output = command.output().context("launching zenity file dialog")?;
@@ -1428,7 +1496,7 @@ fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResu
         &case_path,
         ImportBrowserHistoryOptions {
             history_path,
-            max_visits: request.max_visits.unwrap_or(5000),
+            max_visits: request.max_visits.unwrap_or(0),
             evidence_name: request.evidence_name,
         },
     )
@@ -1544,6 +1612,177 @@ fn api_clear_findings(body: &[u8]) -> Result<kdft_case::ClearStaleFindingsResult
     let request: ClearFindingsRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     clear_all_findings(&case_path)
+}
+
+fn api_remove_bookmark(body: &[u8]) -> Result<kdft_case::RemoveBookmarkResult> {
+    let request: RemoveBookmarkRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    remove_bookmark(&case_path, request.bookmark_id)
+}
+
+fn api_remove_bookmark_item(body: &[u8]) -> Result<kdft_case::RemoveBookmarkItemResult> {
+    let request: RemoveBookmarkItemRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    remove_bookmark_item(&case_path, request.item_id)
+}
+
+fn api_bulk_bookmark(body: &[u8]) -> Result<kdft_case::BulkBookmarkItemsResult> {
+    let request: BulkBookmarkRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    if request.entry_ids.is_empty() {
+        bail!("entry_ids must not be empty");
+    }
+    let folder_name = request
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Findings");
+    let folder_id = ensure_report_folder(&case_path, folder_name)?;
+    let bookmark_type =
+        BookmarkType::parse(request.bookmark_type.as_deref().unwrap_or("file_group"))?;
+    let bookmark_id =
+        create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type,
+                data_type: request.data_type,
+                title: Some(request.title.unwrap_or_else(|| {
+                    format!("Bulk bookmark ({} entries)", request.entry_ids.len())
+                })),
+                examiner_comment: request.comment,
+                in_report: true,
+                source_ref_json: json!({}),
+                content_ref_json: json!({}),
+            },
+        )?;
+    bulk_add_bookmark_items(&case_path, bookmark_id, &request.entry_ids)
+}
+
+fn recursive_bookmark_folder_title(path: &str) -> String {
+    let display = if path.trim().is_empty() { "/" } else { path };
+    format!("Folder (recursive): {display}")
+}
+
+fn api_bookmark_folder_recursive_indexed(
+    body: &[u8],
+) -> Result<kdft_case::RecursiveBookmarkResult> {
+    let request: BookmarkFolderRecursiveIndexedRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let max_entries = request
+        .max_entries
+        .unwrap_or(RECURSIVE_FOLDER_BOOKMARK_LIMIT)
+        .min(RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    let folder_name = request
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Evidence Folders");
+    let folder_id = ensure_report_folder(&case_path, folder_name)?;
+    let bookmark_id = create_bookmark(
+        &case_path,
+        CreateBookmarkOptions {
+            folder_id,
+            bookmark_type: BookmarkType::FolderInfo,
+            data_type: Some("Evidence Folder (recursive)".to_string()),
+            title: Some(
+                request
+                    .title
+                    .unwrap_or_else(|| recursive_bookmark_folder_title(&request.logical_path)),
+            ),
+            examiner_comment: request.comment,
+            in_report: true,
+            source_ref_json: json!({
+                "evidence_id": request.evidence_id,
+                "logical_path": request.logical_path,
+            }),
+            content_ref_json: json!({}),
+        },
+    )?;
+    bookmark_indexed_folder_recursive(
+        &case_path,
+        bookmark_id,
+        request.evidence_id,
+        &request.logical_path,
+        max_entries,
+    )
+}
+
+fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::RecursiveBookmarkResult> {
+    let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let max_entries = request
+        .max_entries
+        .unwrap_or(RECURSIVE_FOLDER_BOOKMARK_LIMIT)
+        .min(RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    let source = live_evidence_source(&case_path, request.evidence_id)?;
+    let (volume_name, filesystem, listing) = match source.source_kind.as_str() {
+        "image" => {
+            let volumes = kdft_case::list_image_volumes(Path::new(&source.source_path))?;
+            let volume = volumes
+                .get(request.volume)
+                .with_context(|| format!("volume index {} out of range", request.volume))?;
+            let listing = list_image_tree_files(
+                Path::new(&source.source_path),
+                request.volume,
+                &request.path,
+                max_entries,
+            )?;
+            (volume.name.clone(), volume.filesystem.clone(), listing)
+        }
+        "folder" => {
+            let listing =
+                list_local_tree_files(&case_path, request.evidence_id, &request.path, max_entries)?;
+            (String::new(), String::new(), listing)
+        }
+        other => bail!("recursive live bookmarking is not available for {other} evidence"),
+    };
+    let folder_name = request
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Live Browse");
+    let folder_id = ensure_report_folder(&case_path, folder_name)?;
+    let path_title = if request.path.trim().is_empty() {
+        "/"
+    } else {
+        &request.path
+    };
+    let bookmark_id = create_bookmark(
+        &case_path,
+        CreateBookmarkOptions {
+            folder_id,
+            bookmark_type: BookmarkType::FolderInfo,
+            data_type: Some("Live folder (recursive)".to_string()),
+            title: Some(
+                request
+                    .title
+                    .unwrap_or_else(|| recursive_bookmark_folder_title(path_title)),
+            ),
+            examiner_comment: request.comment,
+            in_report: true,
+            source_ref_json: json!({
+                "evidence_id": request.evidence_id,
+                "volume": request.volume,
+                "path": request.path,
+            }),
+            content_ref_json: json!({}),
+        },
+    )?;
+    bookmark_live_folder_recursive(
+        &case_path,
+        bookmark_id,
+        request.evidence_id,
+        &source.source_kind,
+        &source.source_path,
+        request.volume,
+        &volume_name,
+        &filesystem,
+        listing,
+    )
 }
 
 const REPORT_DIRECTORY_TREE_MAX_LINES: usize = 2000;
@@ -2512,6 +2751,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
     td.actions {
       width: 190px;
     }
+    .bookmark-items {
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 6px;
+      list-style: none;
+    }
+    .bookmark-items li {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .bookmark-items span {
+      overflow-wrap: anywhere;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -2569,7 +2824,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-workspace {
       display: grid;
       --inspector-width: 520px;
-      grid-template-columns: minmax(230px, 300px) minmax(520px, 1fr) 6px minmax(360px, var(--inspector-width));
+      grid-template-columns: minmax(230px, 300px) minmax(360px, 1fr) 12px minmax(320px, var(--inspector-width));
       grid-template-rows: minmax(0, 1fr);
       gap: 10px;
       height: 100%;
@@ -2583,14 +2838,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
       display: none;
     }
     .pane-resizer {
-      min-width: 6px;
+      min-width: 12px;
+      position: relative;
       border-radius: 999px;
-      background: transparent;
+      background: rgba(14,83,75,.08);
       cursor: col-resize;
+      touch-action: none;
+    }
+    .pane-resizer::before {
+      content: "";
+      position: absolute;
+      inset: 0 3px;
+      border-radius: 999px;
+      background: rgba(14,83,75,.18);
     }
     .pane-resizer:hover,
     .pane-resizer.dragging {
-      background: #bed4cf;
+      background: rgba(14,83,75,.18);
+    }
+    .pane-resizer:hover::before,
+    .pane-resizer.dragging::before {
+      background: #0e534b;
+    }
+    body.resizing-inspector {
+      cursor: col-resize;
+      user-select: none;
     }
     .browser-tree,
     .browser-list,
@@ -3299,6 +3571,79 @@ const INDEX_HTML: &str = r###"<!doctype html>
       font-weight: 800;
       text-transform: uppercase;
     }
+    .data-interpreter {
+      position: fixed;
+      top: 120px;
+      right: 24px;
+      z-index: 1100;
+      min-width: 300px;
+      max-width: 380px;
+      background: #121a19;
+      border: 1px solid rgba(143,213,200,.35);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+      font-size: 12px;
+    }
+    .di-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      cursor: move;
+      color: #8fd5c8;
+      font-weight: 800;
+      font-size: 11px;
+      text-transform: uppercase;
+      border-bottom: 1px solid rgba(255,255,255,.12);
+      user-select: none;
+      touch-action: none;
+    }
+    .di-head .hex-endian {
+      margin-left: auto;
+    }
+    .di-close {
+      background: transparent;
+      border: none;
+      color: #8fd5c8;
+      font-size: 14px;
+      cursor: pointer;
+      padding: 0 4px;
+    }
+    .di-table {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 2px 12px;
+      margin: 0;
+      padding: 8px 10px;
+    }
+    .di-table dt {
+      color: #7fa89f;
+      white-space: nowrap;
+    }
+    .di-table dd {
+      margin: 0;
+      color: #e4efec;
+      font-family: ui-monospace, Consolas, monospace;
+      word-break: break-all;
+    }
+    .hex-endian {
+      display: inline-flex;
+      gap: 2px;
+    }
+    .hex-endian button {
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      background: transparent;
+      color: #8fd5c8;
+      border: 1px solid rgba(143,213,200,.4);
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .hex-endian button.active {
+      background: #8fd5c8;
+      color: #10201c;
+    }
     .hex-decode-grid {
       display: grid;
       grid-template-columns: minmax(320px, 1fr) minmax(260px, .8fr);
@@ -3575,7 +3920,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     body.analysis-fullscreen .browser-workspace {
       --inspector-width: 540px;
-      grid-template-columns: minmax(260px, 340px) minmax(620px, 1fr) 6px minmax(380px, var(--inspector-width));
+      grid-template-columns: minmax(260px, 340px) minmax(420px, 1fr) 12px minmax(340px, var(--inspector-width));
       grid-template-rows: minmax(0, 1fr);
       height: 100%;
       min-height: 0;
@@ -3733,7 +4078,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button class="evidence-type active" data-type="image" title="E01, dd/raw, VHD/VHDX, VMDK, VDI disk images">Disk image</button>
                 <button class="evidence-type" data-type="folder" title="A local folder of files">Folder</button>
                 <button class="evidence-type" data-type="file" title="A single local file">Single file</button>
-                <button class="evidence-type" data-type="browser_history" title="Chrome/Edge/Chromium or Firefox profile folder, or a History / places.sqlite / History.db file">Browser history</button>
+                <button class="evidence-type" data-type="browser_history" title="Chrome/Edge/Chromium, Firefox, or Safari history DB file; profile folders can be pasted manually">Browser history</button>
               </div>
               <p id="evidenceTypeHint" class="muted tiny">E01, dd/raw, VHD/VHDX, VMDK, VDI disk images</p>
               <div class="path-pick-row">
@@ -3744,7 +4089,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <label>Read File System<select id="readFileSystem"><option value="true">yes &mdash; index now (bounded)</option><option value="false">no &mdash; attach only</option></select></label>
               </div>
               <div class="row" id="historyOptionsRow" hidden>
-                <label>Max visits<input id="historyMaxVisits" type="number" min="1" value="5000"></label>
+                <label>Max visits (0 = all)<input id="historyMaxVisits" type="number" min="0" value="0"></label>
               </div>
               <label>Notes<textarea id="evidenceNotes"></textarea></label>
               <button id="addEvidence">Add Evidence</button>
@@ -3771,7 +4116,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <p id="browserTitle" class="muted tiny">Select an evidence source</p>
               </div>
               <div class="toolbar">
+                <button id="analyzeBack" class="ghost" title="Back in Analyze" disabled>&larr; Back</button>
+                <button id="analyzeForward" class="ghost" title="Forward in Analyze" disabled>Forward &rarr;</button>
                 <button id="liveBrowse" class="ghost">Live browse</button>
+                <button id="exportReportFromAnalyze" class="ghost">Export report</button>
                 <button id="openAnalyzeWindow" class="ghost">Open full screen</button>
               </div>
             </div>
@@ -3797,11 +4145,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
                       </span>
                       <span id="selectedCount" class="tiny">0 selected</span>
                       <button id="selectVisibleRows" class="ghost">Select visible</button>
+                      <button id="bookmarkReportSelected" class="ghost" disabled>Report selected</button>
                       <select id="selectedAction" class="toolbar-select" title="Selected actions">
                         <option value="" disabled selected hidden>Selected actions</option>
                         <option value="bookmark">Bookmark selected</option>
                         <option value="bookmark_report">Bookmark + export report</option>
-                        <option value="export_files">Export selected files</option>
+                        <option value="export_files">Export selected file bytes</option>
                         <option value="export_csv">Export selected as CSV</option>
                         <option value="clear">Clear selection</option>
                       </select>
@@ -3830,6 +4179,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                       <button id="hexGo" class="secondary">Go</button>
                       <button id="hexNext" class="ghost">Next</button>
                       <button id="bookmarkSelectedEntry" class="ghost">Bookmark</button>
+                      <button id="dataInterpreterToggle" class="ghost" onclick="toggleDataInterpreter()">Data Interpreter</button>
                       <button id="toggleViewerFullscreen" class="ghost" aria-pressed="false">Full screen</button>
                     </div>
                   </div>
@@ -3944,6 +4294,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       searchResults: [],
       selectedSearchIndexes: new Set(),
       browserState: { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" },
+      analyzeHistory: { back: [], forward: [], applying: false },
       live: { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null },
       idx: { evidenceId: null, dirCache: {}, expanded: new Set(), selPath: "/" },
       cat: { evidenceId: null, key: null, entries: [], total: null, loading: false, error: "", pageSize: 1000 },
@@ -4296,7 +4647,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       image: { label: "Image path", placeholder: "C:\\Evidence\\image.E01", button: "Add Evidence", pick: "file", filter: "image", hint: "E01 (split segments auto-detected), dd/raw, split .001, VHD/VHDX, VMDK, VDI disk images" },
       folder: { label: "Folder path", placeholder: "C:\\Evidence\\source-folder", button: "Add Evidence", pick: "folder", filter: "any", hint: "A local folder of files" },
       file: { label: "File path", placeholder: "C:\\Evidence\\document.pdf", button: "Add Evidence", pick: "file", filter: "any", hint: "A single local file" },
-      browser_history: { label: "Profile folder or DB file", placeholder: "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default", button: "Import Browser History", pick: "folder", filter: "any", hint: "Chrome/Edge/Chromium or Firefox profile folder, or a History / places.sqlite / History.db file" }
+      browser_history: { label: "History DB file", placeholder: "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\History", button: "Import Browser History", pick: "file", filter: "browser_history", hint: "Browse to a History / places.sqlite / History.db file; profile folder paths can still be pasted manually" }
     };
 
     function setEvidenceType(type) {
@@ -4472,28 +4823,47 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!handle || !workspace) {
         return;
       }
+      const applyWidth = (rawWidth) => {
+        const rect = workspace.getBoundingClientRect();
+        const minWidth = 320;
+        const maxWidth = Math.min(900, Math.max(minWidth, rect.width - 620));
+        const width = Math.max(minWidth, Math.min(maxWidth, rawWidth));
+        workspace.style.setProperty("--inspector-width", width + "px");
+        return width;
+      };
+      const storedWidth = Number(localStorage.getItem("kdft.inspectorWidth"));
+      if (Number.isFinite(storedWidth) && storedWidth > 0) {
+        requestAnimationFrame(() => applyWidth(storedWidth));
+      }
       handle.addEventListener("pointerdown", (event) => {
         if (window.matchMedia("(max-width: 980px)").matches) {
           return;
         }
         event.preventDefault();
-        handle.setPointerCapture(event.pointerId);
+        try {
+          handle.setPointerCapture(event.pointerId);
+        } catch (_) {}
+        setInspectorCollapsed(false);
         handle.classList.add("dragging");
+        document.body.classList.add("resizing-inspector");
         const onMove = (moveEvent) => {
           const rect = workspace.getBoundingClientRect();
-          const maxWidth = Math.min(760, Math.max(380, rect.width - 760));
-          const width = Math.max(360, Math.min(maxWidth, rect.right - moveEvent.clientX - 10));
-          workspace.style.setProperty("--inspector-width", width + "px");
+          applyWidth(rect.right - moveEvent.clientX);
         };
         const onUp = () => {
           handle.classList.remove("dragging");
-          handle.removeEventListener("pointermove", onMove);
-          handle.removeEventListener("pointerup", onUp);
-          handle.removeEventListener("pointercancel", onUp);
+          document.body.classList.remove("resizing-inspector");
+          const width = parseFloat(getComputedStyle(workspace).getPropertyValue("--inspector-width"));
+          if (Number.isFinite(width)) {
+            localStorage.setItem("kdft.inspectorWidth", String(Math.round(width)));
+          }
+          document.removeEventListener("pointermove", onMove);
+          document.removeEventListener("pointerup", onUp);
+          document.removeEventListener("pointercancel", onUp);
         };
-        handle.addEventListener("pointermove", onMove);
-        handle.addEventListener("pointerup", onUp);
-        handle.addEventListener("pointercancel", onUp);
+        document.addEventListener("pointermove", onMove);
+        document.addEventListener("pointerup", onUp);
+        document.addEventListener("pointercancel", onUp);
       });
     }
 
@@ -4511,6 +4881,121 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function toggleInspectorPane() {
       setInspectorCollapsed(!state.inspectorCollapsed);
+    }
+
+    function currentAnalyzeLocation() {
+      const browserState = state.browserState || {};
+      if (!browserState.evidenceId) {
+        return null;
+      }
+      const treeMode = browserState.treeMode === "categories" ? "categories" : "filesystem";
+      return {
+        evidenceId: browserState.evidenceId,
+        treeMode,
+        selectedPath: normalizeLogicalPath(browserState.selectedPath || "/"),
+        selectedCategory: treeMode === "categories" ? (browserState.selectedCategory || "") : ""
+      };
+    }
+
+    function analyzeLocationKey(location) {
+      if (!location) {
+        return "";
+      }
+      return [
+        location.evidenceId || "",
+        location.treeMode || "filesystem",
+        normalizeLogicalPath(location.selectedPath || "/"),
+        location.selectedCategory || ""
+      ].join("|");
+    }
+
+    function sameAnalyzeLocation(left, right) {
+      return analyzeLocationKey(left) === analyzeLocationKey(right);
+    }
+
+    function commitAnalyzeNavigation(previous) {
+      if (state.analyzeHistory.applying) {
+        updateAnalyzeNavButtons();
+        return;
+      }
+      const current = currentAnalyzeLocation();
+      if (previous && current && !sameAnalyzeLocation(previous, current)) {
+        state.analyzeHistory.back.push(previous);
+        if (state.analyzeHistory.back.length > 80) {
+          state.analyzeHistory.back.shift();
+        }
+        state.analyzeHistory.forward = [];
+      }
+      updateAnalyzeNavButtons();
+    }
+
+    function updateAnalyzeNavButtons() {
+      const back = $("analyzeBack");
+      const forward = $("analyzeForward");
+      if (back) {
+        back.disabled = state.analyzeHistory.back.length === 0;
+      }
+      if (forward) {
+        forward.disabled = state.analyzeHistory.forward.length === 0;
+      }
+    }
+
+    async function applyAnalyzeLocation(location) {
+      if (!location) {
+        return;
+      }
+      state.analyzeHistory.applying = true;
+      try {
+        const treeMode = location.treeMode === "categories" ? "categories" : "filesystem";
+        state.browserState = {
+          evidenceId: location.evidenceId,
+          selectedPath: normalizeLogicalPath(location.selectedPath || "/"),
+          treeMode,
+          selectedCategory: treeMode === "categories" ? (location.selectedCategory || "") : ""
+        };
+        if (treeMode === "categories") {
+          state.cat = newCategoryCache(location.evidenceId, location.selectedCategory || "");
+        } else {
+          expandTreePath(state.browserState.selectedPath);
+          if (state.idx.evidenceId === location.evidenceId) {
+            state.idx.selPath = state.browserState.selectedPath;
+            state.idx.expanded.add(state.idx.selPath);
+          }
+        }
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+        renderEvidenceBrowserEntries();
+        renderHexViewer();
+        switchView("analyzeView");
+      } finally {
+        state.analyzeHistory.applying = false;
+        updateAnalyzeNavButtons();
+      }
+    }
+
+    async function analyzeBack() {
+      const target = state.analyzeHistory.back.pop();
+      if (!target) {
+        updateAnalyzeNavButtons();
+        return;
+      }
+      const current = currentAnalyzeLocation();
+      if (current && !sameAnalyzeLocation(current, target)) {
+        state.analyzeHistory.forward.push(current);
+      }
+      await applyAnalyzeLocation(target);
+    }
+
+    async function analyzeForward() {
+      const target = state.analyzeHistory.forward.pop();
+      if (!target) {
+        updateAnalyzeNavButtons();
+        return;
+      }
+      const current = currentAnalyzeLocation();
+      if (current && !sameAnalyzeLocation(current, target)) {
+        state.analyzeHistory.back.push(current);
+      }
+      await applyAnalyzeLocation(target);
     }
 
     async function analyzeDiskImageEntry(entryId) {
@@ -4568,7 +5053,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const data = await apiPost("/api/history/import", {
           case_path: currentCasePath(),
           history_path: historyPath.value,
-          max_visits: numberValue("historyMaxVisits", 5000)
+          max_visits: nonNegativeNumberValue("historyMaxVisits", 0)
         });
         const message = "Imported browser activities: " + data.entries_indexed + " records (" + data.status + ").";
         await refresh();
@@ -4579,7 +5064,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    function selectEvidenceSource(id, selectedPath = "/", treeMode = null) {
+    function selectEvidenceSource(id, selectedPath = "/", treeMode = null, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       state.browserState = {
         evidenceId: id,
         selectedPath: normalizeLogicalPath(selectedPath),
@@ -4595,9 +5081,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       switchView("analyzeView");
       const evidence = state.data.evidence.find((item) => item.id === id);
       setNotice(evidence ? "Selected evidence " + evidence.display_name + "." : "Selected evidence.");
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
-    function selectFolder(path) {
+    function selectFolder(path, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       state.browserState.treeMode = "filesystem";
       state.browserState.selectedPath = normalizeLogicalPath(path || "/");
       expandTreePath(state.browserState.selectedPath);
@@ -4605,9 +5097,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderEvidenceBrowserEntries();
       renderHexViewer();
       setNotice("Selected folder " + displayPath(state.browserState.selectedPath) + ".");
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
-    function selectCategory(categoryKey) {
+    function selectCategory(categoryKey, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       const key = categoryKey || "";
       state.browserState.treeMode = "categories";
       state.browserState.selectedCategory = key;
@@ -4618,14 +5116,25 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderEvidenceBrowserEntries();
       renderHexViewer();
       setNotice("Selected category " + (categoryLabel(key) || "All Categories") + ".");
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
-    function setBrowserTreeMode(mode) {
+    function setBrowserTreeMode(mode, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       state.browserState.treeMode = mode === "categories" ? "categories" : "filesystem";
       if (state.browserState.treeMode === "categories") {
         state.browserState.selectedCategory = state.browserState.selectedCategory || "";
       }
       renderEvidenceBrowserEntries();
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
     function toggleEntrySelection(entryId, checked, event) {
@@ -4733,28 +5242,38 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Select one or more entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
-      let succeeded = 0;
-      const failed = [];
-      let lastError = "";
-      for (const entryId of ids) {
-        try {
-          await bookmarkEntry(entryId, false);
-          succeeded += 1;
-        } catch (err) {
-          failed.push(entryId);
-          lastError = err.message || String(err);
+      // One request for the whole selection (bulk_add_bookmark_items runs every insert in a
+      // single server-side transaction) instead of one HTTP round-trip per entry - the old
+      // per-entry loop measured ~17ms/item, so a real ~23k-entry "All Categories" selection
+      // took nearly 7 minutes with no progress feedback, which read as a hung/crashed tab.
+      if (ids.length > 500) {
+        setNotice("Bookmarking " + ids.length.toLocaleString() + " selected entries...");
+      }
+      try {
+        const result = await apiPost("/api/bookmark/bulk", {
+          case_path: currentCasePath(),
+          folder_name: "Findings",
+          title: "Bulk bookmark (" + ids.length + " entries)",
+          comment: "Bookmarked via Selected actions on " + new Date().toISOString() + ".",
+          bookmark_type: "file_group",
+          entry_ids: ids
+        });
+        await refresh();
+        restoreEntrySelection(ids);
+        renderEvidenceBrowserEntries();
+        renderSelectionCount();
+        const succeeded = result.items_added;
+        const failed = (result.skipped_entry_ids || []).length;
+        if (failed) {
+          setNotice("Bookmarked " + succeeded + " selected entries; " + failed + " were no longer available and were skipped.", true);
+          return { succeeded, failed };
         }
+        setNotice("Bookmarked " + succeeded + " selected entries.");
+        return { succeeded, failed: 0 };
+      } catch (err) {
+        setNotice(err.message || String(err), true);
+        return { succeeded: 0, failed: ids.length };
       }
-      await refresh();
-      restoreEntrySelection(ids);
-      renderEvidenceBrowserEntries();
-      renderSelectionCount();
-      if (failed.length) {
-        setNotice("Bookmarked " + succeeded + " selected entries; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
-        return { succeeded, failed: failed.length };
-      }
-      setNotice("Bookmarked " + succeeded + " selected entries.");
-      return { succeeded, failed: 0 };
     }
 
     async function exportSelectedEntries() {
@@ -4763,16 +5282,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Select one or more file entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
+      const fileIds = ids.filter((entryId) => {
+        const entry = findLoadedEntry(entryId);
+        return entry && entry.entry_kind === "file";
+      });
+      if (fileIds.length === 0) {
+        setNotice("Selected rows are records or folders. Use Report selected to add them to the report; only file entries have bytes to export.", true);
+        return { succeeded: 0, failed: ids.length };
+      }
       let succeeded = 0;
       const failed = [];
       let lastError = "";
-      for (const entryId of ids) {
+      for (const entryId of fileIds) {
         const entry = findLoadedEntry(entryId);
-        if (!entry || entry.entry_kind !== "file") {
-          failed.push(entryId);
-          lastError = "Only file entries can be exported.";
-          continue;
-        }
         try {
           await apiPost("/api/entry/recover", {
             case_path: currentCasePath(),
@@ -4789,11 +5311,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       restoreEntrySelection(ids);
       renderEvidenceBrowserEntries();
       renderSelectionCount();
+      const skipped = ids.length - fileIds.length;
       if (failed.length) {
-        setNotice("Exported " + succeeded + " selected files; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
+        const skippedText = skipped ? "; skipped " + skipped + " non-file item" + (skipped === 1 ? "" : "s") : "";
+        setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + skippedText + "; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
         return { succeeded, failed: failed.length };
       }
-      setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + " to ui-output.");
+      const skippedText = skipped ? "; skipped " + skipped + " non-file item" + (skipped === 1 ? "" : "s") : "";
+      setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + " to ui-output" + skippedText + ".");
       return { succeeded, failed: 0 };
     }
 
@@ -4831,6 +5356,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       if (action === "export_files") {
+        if (!selectedFileExportAllowed()) {
+          setNotice(fileExportUnavailableMessage(), true);
+          return;
+        }
         await exportSelectedEntries();
         return;
       }
@@ -4840,6 +5369,33 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (action === "clear") {
         clearEntrySelection();
+      }
+    }
+
+    async function bookmarkSelectionAndExportReport() {
+      const selectedAction = $("selectedAction");
+      if (selectedAction) {
+        selectedAction.selectedIndex = 0;
+      }
+      if (state.live.active) {
+        if (!state.live.selected || state.live.selected.size === 0) {
+          setNotice("Select rows before reporting selected items.", true);
+          return;
+        }
+        setNotice("Bookmarking selected live items for the report...");
+        await bookmarkSelectedLive();
+        await exportReport();
+        return;
+      }
+      const count = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
+      if (count === 0) {
+        setNotice("Select rows before reporting selected items.", true);
+        return;
+      }
+      setNotice("Bookmarking " + count + " selected item" + (count === 1 ? "" : "s") + " for the report...");
+      const result = await bookmarkSelectedEntries();
+      if (result && result.succeeded > 0) {
+        await exportReport();
       }
     }
 
@@ -5119,9 +5675,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Search result is no longer loaded.", true);
         return;
       }
-      const entry = findLoadedEntry(hit.entry_id);
+      goToEntryFolder(hit.entry_id);
+    }
+
+    function goToEntryFolder(entryId) {
+      const entry = findLoadedEntry(entryId);
       if (!entry) {
-        setNotice("Search result entry is not loaded in the current case state.", true);
+        setNotice("Entry is not loaded in the current case state.", true);
         return;
       }
       const selectedPath = entry.entry_kind === "directory"
@@ -5235,6 +5795,118 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    async function bookmarkFolderPath(path, refreshAfter = true) {
+      const evidence = selectedEvidenceSource();
+      if (!evidence) {
+        setNotice("Select an evidence source first.", true);
+        return;
+      }
+      const normalized = normalizeLogicalPath(path || "/");
+      const displayName = normalized === "/" ? evidence.display_name : logicalName(normalized);
+      try {
+        await apiPost("/api/bookmark/quick", {
+          case_path: currentCasePath(),
+          folder_name: "Evidence Folders",
+          title: "Folder: " + displayPath(normalized),
+          comment: "Indexed folder path: " + displayPath(normalized),
+          bookmark_type: "folder_info",
+          data_type: "Evidence Folder",
+          evidence_id: evidence.id,
+          display_name: displayName,
+          logical_path: normalized,
+          data_preview: displayPath(normalized),
+          item_ref_json: {
+            kind: "filesystem_folder",
+            evidence_id: evidence.id,
+            logical_path: normalized,
+            display_name: displayName,
+            source_kind: evidence.source_kind,
+            source_path: evidence.source_path
+          }
+        });
+        if (refreshAfter) {
+          await refresh();
+          setNotice("Bookmarked folder " + displayPath(normalized) + ".");
+        }
+      } catch (err) {
+        setNotice(err.message, true);
+        if (!refreshAfter) {
+          throw err;
+        }
+      }
+    }
+
+    async function bookmarkFolderPathRecursive(path) {
+      const evidence = selectedEvidenceSource();
+      if (!evidence) {
+        setNotice("Select an evidence source first.", true);
+        return;
+      }
+      const normalized = normalizeLogicalPath(path || "/");
+      setNotice("Bookmarking " + displayPath(normalized) + " recursively...");
+      try {
+        const data = await apiPost("/api/bookmark/folder-recursive-indexed", {
+          case_path: currentCasePath(),
+          evidence_id: evidence.id,
+          logical_path: normalized,
+          folder_name: "Evidence Folders"
+        });
+        await refresh();
+        setNotice(
+          "Bookmarked " + data.items_added + " file(s) recursively from " + displayPath(normalized) + "." +
+            (data.truncated ? " Stopped at the bookmark cap (" + data.total_candidates + " total under this folder) - not everything underneath was added." : "")
+        );
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
+    async function bookmarkCategory(key, refreshAfter = true) {
+      const evidence = selectedEvidenceSource();
+      if (!evidence) {
+        setNotice("Select an evidence source first.", true);
+        return;
+      }
+      const label = categoryLabel(key || "") || "All Categories";
+      try {
+        await apiPost("/api/bookmark/quick", {
+          case_path: currentCasePath(),
+          folder_name: "Categories",
+          title: "Category: " + label,
+          comment: "Indexed category: " + label,
+          bookmark_type: "record",
+          data_type: "Category",
+          evidence_id: evidence.id,
+          display_name: label,
+          logical_path: "/Categories/" + sanitizeSegment(label) + ".record",
+          data_preview: label,
+          item_ref_json: {
+            kind: "category",
+            evidence_id: evidence.id,
+            category_key: key || "",
+            category_label: label,
+            source_kind: evidence.source_kind,
+            source_path: evidence.source_path
+          }
+        });
+        if (refreshAfter) {
+          await refresh();
+          setNotice("Bookmarked category " + label + ".");
+        }
+      } catch (err) {
+        setNotice(err.message, true);
+        if (!refreshAfter) {
+          throw err;
+        }
+      }
+    }
+
+    async function bookmarkCategoryAndExport(key) {
+      await bookmarkCategory(key, false);
+      await refresh();
+      await exportReport();
+    }
+
     async function bookmarkSearchResult(index) {
       const hit = state.searchResults[index];
       await bookmarkSearchHit(hit, true);
@@ -5320,6 +5992,40 @@ const INDEX_HTML: &str = r###"<!doctype html>
         });
         await refresh();
         setNotice("Cleared " + cleared.removed_bookmarks + " bookmarks and " + cleared.removed_items + " bookmarked items.");
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
+    async function removeBookmarkUi(bookmarkId, label) {
+      const title = label || ("bookmark " + bookmarkId);
+      if (!window.confirm("Remove bookmark \"" + title + "\" from this case and report?")) {
+        return;
+      }
+      try {
+        const removed = await apiPost("/api/bookmark/remove", {
+          case_path: currentCasePath(),
+          bookmark_id: bookmarkId
+        });
+        await refresh();
+        setNotice("Removed bookmark " + bookmarkId + " and " + removed.removed_items + " item" + (removed.removed_items === 1 ? "" : "s") + ".");
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
+    async function removeBookmarkItemUi(itemId, label) {
+      const title = label || ("item " + itemId);
+      if (!window.confirm("Remove bookmarked item \"" + title + "\" from this bookmark?")) {
+        return;
+      }
+      try {
+        const removed = await apiPost("/api/bookmark/item/remove", {
+          case_path: currentCasePath(),
+          item_id: itemId
+        });
+        await refresh();
+        setNotice("Removed bookmarked item " + removed.item_id + " from bookmark " + removed.bookmark_id + ".");
       } catch (err) {
         setNotice(err.message, true);
       }
@@ -5891,7 +6597,83 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setInspectorCollapsed(false);
     }
 
+    function liveEntryByPath(volume, path) {
+      const normalized = normalizeLogicalPath(path || "/");
+      const slash = normalized.lastIndexOf("/");
+      const parent = slash <= 0 ? "/" : normalized.slice(0, slash);
+      const name = slash < 0 ? normalized : normalized.slice(slash + 1);
+      const entries = state.live.dirCache[liveKey(volume, parent)] || [];
+      return entries.find((entry) => entry.name === name) || null;
+    }
+
+    function liveBookmarkItemRef(volume, path, name, isDir) {
+      const entry = liveEntryByPath(volume, path) || {};
+      const evidence = selectedEvidenceSource() || (state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId)) || {};
+      const volumeInfo = (state.live.volumes || []).find((item) => Number(item.index) === Number(volume)) || {};
+      const logicalPath = "[vol " + volume + "] " + path;
+      const metadata = {
+        source_kind: evidence.source_kind || "",
+        source_path: evidence.source_path || "",
+        source_display_name: evidence.display_name || "",
+        volume_index: volume,
+        volume_name: volumeInfo.name || "",
+        volume_filesystem: volumeInfo.filesystem || "",
+        volume_start_offset: volumeInfo.start_offset,
+        volume_size_bytes: volumeInfo.size_bytes,
+        created_utc: entry.created_utc,
+        modified_utc: entry.modified_utc,
+        accessed_utc: entry.accessed_utc,
+        ntfs_file_record_number: entry.ntfs_file_record_number,
+        mft_record_logical_offset: entry.mft_record_logical_offset,
+        mft_record_physical_offset: entry.mft_record_physical_offset,
+        file_data_logical_offset: entry.file_data_logical_offset,
+        file_data_physical_offset: entry.file_data_physical_offset,
+        ntfs_mft_record_modification_time_utc: entry.ntfs_mft_record_modification_time_utc,
+        symlink: Boolean(entry.symlink)
+      };
+      return {
+        kind: isDir ? "live_dir" : "live_file",
+        entry_kind: isDir ? "directory" : "file",
+        evidence_id: state.live.evidenceId,
+        logical_path: logicalPath,
+        relative_path: path,
+        display_name: name,
+        volume: volume,
+        path: path,
+        volume_name: volumeInfo.name || "",
+        filesystem: volumeInfo.filesystem || "",
+        volume_start_offset: volumeInfo.start_offset,
+        volume_size_bytes: volumeInfo.size_bytes,
+        size_bytes: entry.size_bytes == null ? null : entry.size_bytes,
+        created_utc: entry.created_utc,
+        modified_utc: entry.modified_utc,
+        accessed_utc: entry.accessed_utc,
+        ntfs_file_record_number: entry.ntfs_file_record_number,
+        mft_record_logical_offset: entry.mft_record_logical_offset,
+        mft_record_physical_offset: entry.mft_record_physical_offset,
+        file_data_logical_offset: entry.file_data_logical_offset,
+        file_data_physical_offset: entry.file_data_physical_offset,
+        ntfs_mft_record_modification_time_utc: entry.ntfs_mft_record_modification_time_utc,
+        is_deleted: false,
+        symlink: Boolean(entry.symlink),
+        file_extension: isDir ? "" : fileExtension(name || path),
+        metadata
+      };
+    }
+
+    function liveBookmarkPreview(volume, path, name, isDir) {
+      const entry = liveEntryByPath(volume, path) || {};
+      return compactParts([
+        isDir ? "Live folder" : "Live file",
+        entry.size_bytes == null ? "" : formatBytes(entry.size_bytes),
+        entry.modified_utc ? "modified " + entry.modified_utc : "",
+        entry.created_utc ? "created " + entry.created_utc : "",
+        entry.accessed_utc ? "accessed " + entry.accessed_utc : ""
+      ]) || (isDir ? "Live folder" : "Live file");
+    }
+
     async function postLiveBookmark(volume, path, name, isDir) {
+      const itemRef = liveBookmarkItemRef(volume, path, name, isDir);
       await apiPost("/api/bookmark/quick", {
         case_path: currentCasePath(),
         folder_name: "Live Browse",
@@ -5901,7 +6683,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         evidence_id: state.live.evidenceId,
         logical_path: "[vol " + volume + "] " + path,
         display_name: name,
-        item_ref_json: { kind: isDir ? "live_dir" : "live_file", volume: volume, path: path }
+        data_preview: liveBookmarkPreview(volume, path, name, isDir),
+        item_ref_json: itemRef
       });
     }
 
@@ -5912,6 +6695,28 @@ const INDEX_HTML: &str = r###"<!doctype html>
         state.live.active = true;
         renderEvidenceBrowserEntries();
         setNotice("Bookmarked " + (isDir ? "folder " : "") + name + " from live browse.");
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
+    async function bookmarkLiveFolderRecursive(volume, path, name) {
+      setNotice("Bookmarking " + (name || path) + " recursively (live)...");
+      try {
+        const data = await apiPost("/api/bookmark/folder-recursive-live", {
+          case_path: currentCasePath(),
+          evidence_id: state.live.evidenceId,
+          volume: volume,
+          path: path,
+          folder_name: "Live Browse"
+        });
+        await refresh();
+        state.live.active = true;
+        renderEvidenceBrowserEntries();
+        setNotice(
+          "Bookmarked " + data.items_added + " file(s) recursively from " + (name || path) + "." +
+            (data.truncated ? " Stopped at the bookmark cap - not every file underneath was added." : "")
+        );
       } catch (err) {
         setNotice(err.message, true);
       }
@@ -6142,6 +6947,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (isDir) {
         rows.push(ctxItem("Open folder", `liveSelectDir(${volume}, '${escPath}')`));
         rows.push(ctxItem("Bookmark folder", `bookmarkLiveItem(${args}, true)`));
+        rows.push(ctxItem("Bookmark folder (recursive)", `bookmarkLiveFolderRecursive(${args})`));
         rows.push(ctxItem("Export folder (recursive)", `exportLiveTree(${args})`));
       } else {
         rows.push(ctxItem("View bytes", `openLiveFile(${args})`));
@@ -6154,6 +6960,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         rows.push(ctxItem("Export selected (" + selCount + ")", "exportSelectedLive()"));
         rows.push(ctxItem("Clear selection", "clearLiveSelection()"));
       }
+      openContextMenu(menu, rows, event);
+    }
+
+    function openContextMenu(menu, rows, event) {
       menu.innerHTML = rows.join("");
       menu.hidden = false;
       const menuRect = menu.getBoundingClientRect();
@@ -6161,6 +6971,121 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const y = Math.min(event.clientY, window.innerHeight - menuRect.height - 8);
       menu.style.left = Math.max(4, x) + "px";
       menu.style.top = Math.max(4, y) + "px";
+    }
+
+    function entrySelectionCtxRows(rows) {
+      const selCount = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
+      if (selCount > 0) {
+        rows.push('<div class="sep"></div>');
+        rows.push(ctxItem("Bookmark selected (" + selCount + ")", "bookmarkSelectedEntries()"));
+        rows.push(ctxItem("Report selected (" + selCount + ")", "bookmarkSelectionAndExportReport()"));
+        const fileCount = selectedFileEntryCount();
+        if (fileCount > 0) {
+          rows.push(ctxItem("Export file bytes (" + fileCount + ")", "exportSelectedEntries()"));
+        }
+        rows.push(ctxItem("Export selected as CSV (" + selCount + ")", "exportSelectedCsv()"));
+        rows.push(ctxItem("Clear selection", "clearEntrySelection()"));
+      }
+    }
+
+    function showEntryContextMenu(event, entryId) {
+      const entry = findLoadedEntry(entryId);
+      const menu = $("ctxMenu");
+      if (!entry || !menu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const rows = [];
+      if (entry.entry_kind === "directory") {
+        const escLogicalPath = escapeAttr(escapeJs(entry.logical_path));
+        rows.push(ctxItem("Open folder", `selectFolder('${escLogicalPath}')`));
+        rows.push(ctxItem("Bookmark folder", `bookmarkEntry(${entryId})`));
+        rows.push(ctxItem("Bookmark folder (recursive)", `bookmarkFolderPathRecursive('${escLogicalPath}')`));
+      } else {
+        rows.push(ctxItem("View bytes", `openEntry(${entryId})`));
+        rows.push(ctxItem("Details", `selectBrowserEntry(${entryId})`));
+        rows.push(ctxItem("Bookmark", `bookmarkEntry(${entryId})`));
+        if (entry.entry_kind === "file") {
+          rows.push(ctxItem(recoveryActionText(entry).button, `recoverEntry(${entryId})`));
+        }
+        rows.push(ctxItem("Go to folder", `goToEntryFolder(${entryId})`));
+      }
+      entrySelectionCtxRows(rows);
+      openContextMenu(menu, rows, event);
+    }
+
+    function showFolderContextMenu(event, path, idxDir, entryId) {
+      const menu = $("ctxMenu");
+      if (!menu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const escPath = escapeAttr(escapeJs(path));
+      const rows = [ctxItem("Open folder", idxDir ? `idxSelectDir('${escPath}')` : `selectFolder('${escPath}')`)];
+      const numericEntryId = Number(entryId);
+      if (Number.isFinite(numericEntryId) && numericEntryId > 0) {
+        rows.push(ctxItem("Bookmark folder", `bookmarkEntry(${numericEntryId})`));
+      } else {
+        rows.push(ctxItem("Bookmark folder", `bookmarkFolderPath('${escPath}')`));
+      }
+      rows.push(ctxItem("Bookmark folder (recursive)", `bookmarkFolderPathRecursive('${escPath}')`));
+      entrySelectionCtxRows(rows);
+      openContextMenu(menu, rows, event);
+    }
+
+    function showCategoryContextMenu(event, key) {
+      const menu = $("ctxMenu");
+      if (!menu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const escKey = escapeAttr(escapeJs(key || ""));
+      const rows = [
+        ctxItem("Open category", `selectCategory('${escKey}')`),
+        ctxItem("Bookmark category", `bookmarkCategory('${escKey}')`),
+        ctxItem("Bookmark + export report", `bookmarkCategoryAndExport('${escKey}')`)
+      ];
+      entrySelectionCtxRows(rows);
+      openContextMenu(menu, rows, event);
+    }
+
+    // One delegated handler covers every indexed surface (File System rows,
+    // Categories incl. server-backed pages, lazy browse, search results,
+    // thumbnails). Live rows keep their inline handler, which stops
+    // propagation before this one runs.
+    function handleGlobalContextMenu(event) {
+      const target = event.target;
+      if (!target || !target.closest) {
+        return;
+      }
+      if (target.closest("input, textarea, select, #ctxMenu")) {
+        return;
+      }
+      const categoryRow = target.closest("[data-category-key]");
+      if (categoryRow) {
+        showCategoryContextMenu(event, categoryRow.dataset.categoryKey || "");
+        return;
+      }
+      const entryRow = target.closest("[data-entry-id]");
+      if (entryRow) {
+        const entryId = Number(entryRow.dataset.entryId);
+        if (Number.isFinite(entryId)) {
+          showEntryContextMenu(event, entryId);
+        }
+        return;
+      }
+      const idxDirRow = target.closest("[data-idx-dir]");
+      if (idxDirRow) {
+        showFolderContextMenu(event, idxDirRow.dataset.idxDir, true, idxDirRow.dataset.folderEntryId);
+        return;
+      }
+      const folderRow = target.closest("[data-folder-path]");
+      if (folderRow) {
+        showFolderContextMenu(event, folderRow.dataset.folderPath, false, folderRow.dataset.folderEntryId);
+      }
     }
 
     async function exportLiveFile(volume, path, name) {
@@ -6285,10 +7210,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         </tr>`;
       }).join("");
       $("selectedCount").textContent = state.live.selected.size + " selected";
+      updateSelectedActionControls();
       const caveat = evidence && evidence.source_kind === "folder"
         ? `<div class="analysis-status">Live view reads the current disk state (not a preserved snapshot).</div>`
         : "";
-      const hint = caveat + `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
+      const hint = caveat + `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders can bookmark or export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
       $("entryTable").innerHTML = contentRows
         ? hint + table(["", "Name", "Type", "Size", "Modified"], contentRows, "live-table")
         : empty("This folder is empty.");
@@ -6319,11 +7245,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderIndexedBrowse();
     }
 
-    async function idxSelectDir(path) {
+    async function idxSelectDir(path, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       try { await idxLoadDir(path); } catch (err) { setNotice(err.message, true); return; }
       state.idx.selPath = path;
+      state.browserState.treeMode = "filesystem";
+      state.browserState.selectedPath = normalizeLogicalPath(path || "/");
       state.idx.expanded.add(path);
       renderIndexedBrowse();
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
     // Restores a stored selected_path (fullscreen/query restore) in lazy
@@ -6367,7 +7301,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const toggle = child.has_children
           ? `<span class="tree-toggle can-toggle" onclick="event.stopPropagation(); idxToggleDir('${escapeAttr(escapeJs(childPath))}')">${expanded ? "-" : "+"}</span>`
           : `<span class="tree-toggle"></span>`;
-        rows.push(`<button class="tree-row${active}" style="--depth:${depth}" onclick="idxSelectDir('${escapeAttr(escapeJs(childPath))}')" title="${escapeAttr(displayPath(childPath))}">
+        const entryAttr = child.entry_id != null ? ` data-folder-entry-id="${child.entry_id}"` : "";
+        rows.push(`<button class="tree-row${active}" style="--depth:${depth}" onclick="idxSelectDir('${escapeAttr(escapeJs(childPath))}')" data-idx-dir="${escapeAttr(childPath)}"${entryAttr} title="${escapeAttr(displayPath(childPath))}">
           ${toggle}
           <span class="tree-label">${escapeHtml(child.name)}</span>
           <span class="muted tiny"></span>
@@ -6391,7 +7326,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const device = evidence ? evidence.display_name : "Entries";
       const rootActive = state.idx.selPath === "/" ? " active" : "";
       const rootExpanded = state.idx.expanded.has("/");
-      const rows = [`<button class="tree-row${rootActive}" style="--depth:0" onclick="idxSelectDir('/')" title="/">
+      const rows = [`<button class="tree-row${rootActive}" style="--depth:0" onclick="idxSelectDir('/')" data-idx-dir="/" title="/">
         <span class="tree-toggle can-toggle" onclick="event.stopPropagation(); idxToggleDir('/')">${rootExpanded ? "-" : "+"}</span>
         <span class="tree-label">${escapeHtml(device)}</span>
         <span class="muted tiny"></span>
@@ -6422,7 +7357,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const rowClick = child.is_dir
           ? ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`
           : (selectable ? ` style="cursor:pointer" onclick="handleEntryRowClick(event, ${child.entry_id})"` : "");
-        return `<tr class="entry-row${isChecked ? " multi-selected" : ""}"${rowClick}>
+        const ctxAttr = child.is_dir
+          ? ` data-idx-dir="${escapeAttr(child.logical_path)}"`
+          : (selectable ? ` data-entry-id="${child.entry_id}"` : "");
+        return `<tr class="entry-row${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
           <td>${checkbox}</td>
           <td>${nameCell} ${flags}</td>
           <td class="entry-kind">${child.is_dir ? "Folder" : "File"}</td>
@@ -6510,6 +7448,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderTreeModeControls() {
+      updateAnalyzeNavButtons();
       const mode = state.browserState.treeMode || "filesystem";
       $("treeTitle").textContent = mode === "categories" ? "Categories" : "Entries";
       $("treeModeFilesystem").classList.toggle("active", mode === "filesystem");
@@ -6594,7 +7533,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const label = path === "/"
           ? (device ? device.display_name : "Entries")
           : logicalName(path);
-        rows.push(`<button class="tree-row${active}" style="--depth:${depth}" onclick="selectFolder('${escapeAttr(escapeJs(path))}')" title="${escapeAttr(path)}">
+        const folderEntry = entries.find((entry) =>
+          entry.entry_kind === "directory" && normalizeLogicalPath(entry.logical_path) === normalizeLogicalPath(path)
+        );
+        const entryAttr = folderEntry ? ` data-folder-entry-id="${folderEntry.id}"` : "";
+        rows.push(`<button class="tree-row${active}" style="--depth:${depth}" onclick="selectFolder('${escapeAttr(escapeJs(path))}')" data-folder-path="${escapeAttr(path)}"${entryAttr} title="${escapeAttr(path)}">
           ${toggle}
           <span class="tree-label">${escapeHtml(label)}</span>
           <span class="muted tiny">${count}</span>
@@ -6809,7 +7752,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function categoryTreeRow(key, label, count, depth, active) {
-      return `<button class="tree-row${active ? " active" : ""}" style="--depth:${depth}" onclick="selectCategory('${escapeAttr(escapeJs(key))}')" title="${escapeAttr(categoryLabel(key) || label)}">
+      return `<button class="tree-row${active ? " active" : ""}" style="--depth:${depth}" onclick="selectCategory('${escapeAttr(escapeJs(key))}')" data-category-key="${escapeAttr(key)}" title="${escapeAttr(categoryLabel(key) || label)}">
         <span class="tree-toggle"></span>
         <span class="tree-label">${escapeHtml(label)}</span>
         <span class="muted tiny">${Number(count).toLocaleString()}</span>
@@ -7176,7 +8119,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           entry.entry_kind === "directory" && normalizeLogicalPath(entry.logical_path) === normalizeLogicalPath(path)
         );
         return `
-          <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(path))}')">
+          <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(path))}')"${folderEntry ? ` data-entry-id="${folderEntry.id}"` : ` data-folder-path="${escapeAttr(path)}"`}>
             <td></td>
             <td title="${escapeAttr(path)}"><span class="entry-name">${escapeHtml(logicalName(path))}</span></td>
             <td class="entry-kind" title="${count} ${countKind} item${count === 1 ? "" : "s"}">Folder</td>
@@ -7254,6 +8197,59 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function renderSelectionCount() {
       const count = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
       $("selectedCount").textContent = count + " selected";
+      updateSelectedActionControls();
+    }
+
+    function selectedEntriesForActions() {
+      return Array.from(state.selectedEntryIds || [])
+        .map((entryId) => findLoadedEntry(entryId))
+        .filter(Boolean);
+    }
+
+    function selectedFileEntryCount() {
+      return selectedEntriesForActions().filter((entry) => entry.entry_kind === "file").length;
+    }
+
+    function selectedFileExportAllowed() {
+      if (state.live.active) {
+        return Boolean(state.live.selected && state.live.selected.size > 0);
+      }
+      return selectedFileEntryCount() > 0;
+    }
+
+    function fileExportUnavailableMessage() {
+      if (state.live.active) {
+        return "Select one or more live files or folders before exporting.";
+      }
+      return "Selected rows are records or folders. Use Report selected to add them to the report; only file entries have bytes to export.";
+    }
+
+    function updateSelectedActionControls() {
+      const reportButton = $("bookmarkReportSelected");
+      const selectedAction = $("selectedAction");
+      const count = state.live.active
+        ? (state.live.selected ? state.live.selected.size : 0)
+        : (state.selectedEntryIds ? state.selectedEntryIds.size : 0);
+      if (reportButton) {
+        reportButton.disabled = count === 0;
+      }
+      if (!selectedAction) {
+        return;
+      }
+      const exportOption = selectedAction.querySelector('option[value="export_files"]');
+      if (!exportOption) {
+        return;
+      }
+      if (state.live.active) {
+        exportOption.disabled = count === 0;
+        exportOption.textContent = "Export selected source items";
+        return;
+      }
+      const fileCount = selectedFileEntryCount();
+      exportOption.disabled = fileCount === 0;
+      exportOption.textContent = fileCount > 0 && fileCount < count
+        ? "Export file bytes (" + fileCount + ")"
+        : "Export selected file bytes";
     }
 
     function activityLabel(entry) {
@@ -7265,7 +8261,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const kind = entry.metadata_json && entry.metadata_json.artifact_kind;
       if (kind === "browser_history_visit") return "Visit";
+      if (kind === "browser_url") return "URL";
+      if (kind === "browser_search_term") return "Search";
+      if (kind === "browser_download") return "Download";
       if (kind === "browser_bookmark") return "Bookmark";
+      if (kind === "browser_login") return "Saved Login";
+      if (kind === "browser_cookie") return "Cookie";
       if (kind === "browser_preference") return "Preference";
       return "Record";
     }
@@ -7754,6 +8755,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return parts[parts.length - 1] || normalized;
     }
 
+    function sanitizeSegment(value) {
+      const sanitized = String(value || "")
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+        .replace(/\s+/g, " ")
+        .trim();
+      return sanitized || "item";
+    }
+
     function pathDepth(path) {
       return normalizeLogicalPath(path).split("/").filter(Boolean).length;
     }
@@ -7773,7 +8782,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function isBrowserActivityEntry(entry) {
       const kind = entry && entry.metadata_json && entry.metadata_json.artifact_kind;
       return entry && entry.entry_kind === "record"
-        && (kind === "browser_history_visit" || kind === "browser_bookmark" || kind === "browser_preference");
+        && isBrowserActivityKind(kind);
+    }
+
+    function isBrowserActivityKind(kind) {
+      return kind === "browser_history_visit"
+        || kind === "browser_url"
+        || kind === "browser_search_term"
+        || kind === "browser_download"
+        || kind === "browser_bookmark"
+        || kind === "browser_login"
+        || kind === "browser_cookie"
+        || kind === "browser_preference";
     }
 
     function isEmailEntry(entry) {
@@ -7883,8 +8903,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (metadata.artifact_kind === "browser_history_visit") {
         return firstText(metadata.title, metadata.url, entry.name, logicalName(entry.logical_path));
       }
+      if (metadata.artifact_kind === "browser_url") {
+        return firstText(metadata.title, metadata.url, entry.name, logicalName(entry.logical_path));
+      }
+      if (metadata.artifact_kind === "browser_search_term") {
+        return firstText(metadata.search_term ? "Search: " + metadata.search_term : "", metadata.url, entry.name, logicalName(entry.logical_path));
+      }
+      if (metadata.artifact_kind === "browser_download") {
+        return firstText(metadata.file_name, metadata.target_path, metadata.current_path, entry.name, logicalName(entry.logical_path));
+      }
       if (metadata.artifact_kind === "browser_bookmark") {
         return firstText(metadata.name, metadata.title, metadata.url, entry.name, logicalName(entry.logical_path));
+      }
+      if (metadata.artifact_kind === "browser_login") {
+        return firstText(compactParts([metadata.username || metadata.http_realm, metadata.host ? "@ " + metadata.host : ""]), metadata.origin_url, metadata.hostname, entry.name, logicalName(entry.logical_path));
+      }
+      if (metadata.artifact_kind === "browser_cookie") {
+        return firstText(compactParts([metadata.cookie_name, metadata.host]), entry.name, logicalName(entry.logical_path));
       }
       if (metadata.artifact_kind === "browser_preference") {
         return firstText(metadata.category, metadata.name, entry.name, logicalName(entry.logical_path));
@@ -7897,8 +8932,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (metadata.artifact_kind === "browser_history_visit") {
         return compactParts([metadata.visit_time_utc, firstText(metadata.title), metadata.url]);
       }
+      if (metadata.artifact_kind === "browser_url") {
+        return compactParts([metadata.last_visit_time_utc, firstText(metadata.title), metadata.url, metadata.visit_count !== undefined ? "visits " + metadata.visit_count : ""]);
+      }
+      if (metadata.artifact_kind === "browser_search_term") {
+        return compactParts([metadata.last_visit_time_utc, metadata.search_term ? "Search: " + metadata.search_term : "", metadata.url]);
+      }
+      if (metadata.artifact_kind === "browser_download") {
+        return compactParts([metadata.start_time_utc, metadata.file_name, metadata.target_path, metadata.tab_url || metadata.source_url]);
+      }
       if (metadata.artifact_kind === "browser_bookmark") {
         return compactParts([firstText(metadata.name, metadata.title), metadata.url, metadata.folder]);
+      }
+      if (metadata.artifact_kind === "browser_login") {
+        return compactParts([metadata.date_last_used_utc || metadata.time_last_used_utc, metadata.username || metadata.http_realm, metadata.host || metadata.origin_url || metadata.hostname]);
+      }
+      if (metadata.artifact_kind === "browser_cookie") {
+        return compactParts([metadata.creation_utc, metadata.cookie_name, metadata.host, metadata.cookie_path]);
       }
       if (metadata.artifact_kind === "browser_preference") {
         return compactParts([metadata.category, preferenceSummary(metadata)]);
@@ -7936,7 +8986,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "last_visit_time_utc", "visit_time_chrome", "last_visit_time_chrome",
         "transition", "hidden", "name", "folder", "date_added_utc",
         "date_last_used_utc", "date_added_chrome", "date_last_used_chrome",
-        "guid", "category", "startup_urls", "homepage", "restore_on_startup",
+        "guid", "search_term", "file_name", "target_path", "current_path",
+        "start_time_utc", "end_time_utc", "start_time_chrome", "end_time_chrome",
+        "received_bytes", "total_bytes", "state", "danger_type",
+        "interrupt_reason", "referrer", "tab_url", "source_url", "mime_type",
+        "origin_url", "action_url", "hostname", "http_realm", "username",
+        "date_created_utc", "date_last_used_utc", "time_created_utc",
+        "time_last_used_utc", "time_password_changed_utc", "times_used",
+        "password_note", "cookie_name", "cookie_path", "creation_utc",
+        "last_access_utc", "last_accessed_utc", "expires_utc", "expiry_utc",
+        "is_secure", "is_httponly", "value_note",
+        "category", "startup_urls", "homepage", "restore_on_startup",
         "homepage_is_newtabpage", "download_default_directory", "prompt_for_download",
         "created_by_version", "last_used", "avatar_index", "extension_count",
         "source_artifact", "source_artifact_path", "source_file_size_bytes",
@@ -8194,6 +9254,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderHexViewer(error) {
+      updateDataInterpreter();
       const data = state.hex.data;
       const entry = currentHexEntry();
       const mode = $("viewerMode").value;
@@ -8332,28 +9393,40 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function hexDecodePanel(decode) {
       const bytes = decode.bytes;
+      const be = hexEndianness() === "be";
+      const suffix = be ? "BE" : "LE";
       const stringRows = [
         ["ASCII", decodeAscii(bytes)],
         ["Binary (Base 64)", encodeBase64(bytes)],
         ["UTF-7 (ASCII fallback)", decodeAscii(bytes)],
         ["UTF-8", decodeWithTextDecoder("utf-8", bytes)],
-        ["UTF-16 LE (Unicode)", decodeWithTextDecoder("utf-16le", bytes)],
-        ["UTF-32 LE", decodeUtf32Le(bytes)]
+        [`UTF-16 ${suffix} (Unicode)`, decodeWithTextDecoder(be ? "utf-16be" : "utf-16le", bytes)],
+        [`UTF-32 ${suffix}`, decodeUtf32(bytes, be)]
+      ];
+      const integerRows = [
+        ["8-bit U / S", decodeIntPair(bytes, 1, be)],
+        ["16-bit U / S", decodeIntPair(bytes, 2, be)],
+        ["32-bit U / S", decodeIntPair(bytes, 4, be)],
+        ["64-bit U / S", decodeIntPair(bytes, 8, be)]
       ];
       const dateRows = [
-        ["Chrome", decodeChromeTime(bytes)],
-        ["FireFox", decodeFirefoxTime(bytes)],
+        ["Chrome", decodeChromeTime(bytes, be)],
+        ["FireFox", decodeFirefoxTime(bytes, be)],
         ["HFS+ 32-bit BE", decodeHfsTime(bytes)],
-        ["Windows FILETIME", decodeFiletime(bytes)],
-        ["Unix 32-bit LE", decodeUnixTime(bytes)]
+        ["Windows FILETIME", decodeFiletime(bytes, be)],
+        [`Unix 32-bit ${suffix}`, decodeUnixTime(bytes, be)]
       ];
       return `
         <section class="hex-decode">
-          <div class="hex-decode-head"><span>DECODE</span></div>
+          <div class="hex-decode-head"><span>DECODE</span><span class="hex-endian"><button class="${be ? "" : "active"}" onclick="setHexEndianness('le')" title="Interpret multi-byte values little-endian">LE</button><button class="${be ? "active" : ""}" onclick="setHexEndianness('be')" title="Interpret multi-byte values big-endian">BE</button></span></div>
           <div class="hex-decode-grid">
             <section class="hex-decode-group">
               <h3>STRING</h3>
               <dl class="hex-decode-table">${decodeRows(stringRows)}</dl>
+            </section>
+            <section class="hex-decode-group">
+              <h3>INTEGER</h3>
+              <dl class="hex-decode-table">${decodeRows(integerRows)}</dl>
             </section>
             <section class="hex-decode-group">
               <h3>DATE / TIME</h3>
@@ -8362,6 +9435,222 @@ const INDEX_HTML: &str = r###"<!doctype html>
           </div>
         </section>
       `;
+    }
+
+    function hexEndianness() {
+      return localStorage.getItem("kdft.hexEndianness") === "be" ? "be" : "le";
+    }
+
+    function setHexEndianness(value) {
+      localStorage.setItem("kdft.hexEndianness", value === "be" ? "be" : "le");
+      renderHexViewer();
+    }
+
+    function readUintFirst(bytes, size, be) {
+      if (!bytes || bytes.length < size) {
+        return null;
+      }
+      let value = 0n;
+      if (be) {
+        for (let index = 0; index < size; index += 1) {
+          value = (value << 8n) | BigInt(bytes[index] & 255);
+        }
+      } else {
+        for (let index = size - 1; index >= 0; index -= 1) {
+          value = (value << 8n) | BigInt(bytes[index] & 255);
+        }
+      }
+      return value;
+    }
+
+    function decodeIntPair(bytes, size, be) {
+      const value = readUintFirst(bytes, size, be);
+      if (value == null) {
+        return null;
+      }
+      const bits = BigInt(size * 8);
+      const signed = value >= (1n << (bits - 1n)) ? value - (1n << bits) : value;
+      return signed === value ? value.toString(10) : `${value.toString(10)} / ${signed.toString(10)}`;
+    }
+
+    function firstBytes(bytes, size) {
+      return bytes && bytes.length >= size ? bytes.slice(0, size) : null;
+    }
+
+    function decodeFloat(bytes, size, be) {
+      const slice = firstBytes(bytes, size);
+      if (!slice) {
+        return null;
+      }
+      const view = new DataView(Uint8Array.from(slice).buffer);
+      const value = size === 4 ? view.getFloat32(0, !be) : view.getFloat64(0, !be);
+      return String(value);
+    }
+
+    function decodeUnixMillis(bytes, be) {
+      const slice = firstBytes(bytes, 8);
+      if (!slice) {
+        return null;
+      }
+      return saneIsoDate(Number(readUintFirst(slice, 8, be)));
+    }
+
+    function decodeDosDateTime(bytes, be) {
+      const slice = firstBytes(bytes, 4);
+      if (!slice) {
+        return null;
+      }
+      // FAT layout: 16-bit time then 16-bit date; the toggle sets each word's order.
+      const time = Number(readUintFirst(slice.slice(0, 2), 2, be));
+      const date = Number(readUintFirst(slice.slice(2, 4), 2, be));
+      const day = date & 31;
+      const month = (date >> 5) & 15;
+      const year = 1980 + ((date >> 9) & 127);
+      const seconds = (time & 31) * 2;
+      const minutes = (time >> 5) & 63;
+      const hours = (time >> 11) & 31;
+      if (month < 1 || month > 12 || day < 1 || hours > 23 || minutes > 59 || seconds > 59) {
+        return null;
+      }
+      return saneIsoDate(Date.UTC(year, month - 1, day, hours, minutes, seconds));
+    }
+
+    function decodeGuid(bytes) {
+      const b = firstBytes(bytes, 16);
+      if (!b) {
+        return null;
+      }
+      const hex = (arr) => arr.map(byteHex).join("").toLowerCase();
+      return `${hex([b[3], b[2], b[1], b[0]])}-${hex([b[5], b[4]])}-${hex([b[7], b[6]])}-${hex([b[8], b[9]])}-${hex(b.slice(10, 16))}`;
+    }
+
+    function ensureDataInterpreterDom() {
+      let panel = document.getElementById("dataInterpreter");
+      if (panel) {
+        return panel;
+      }
+      panel = document.createElement("div");
+      panel.id = "dataInterpreter";
+      panel.className = "data-interpreter";
+      panel.hidden = true;
+      panel.innerHTML = `
+        <div class="di-head" id="diHead">
+          <span>Data Interpreter</span>
+          <span class="hex-endian"><button id="diLe" onclick="setHexEndianness('le')" title="Little-endian">LE</button><button id="diBe" onclick="setHexEndianness('be')" title="Big-endian">BE</button></span>
+          <button class="di-close" onclick="toggleDataInterpreter(false)" title="Close">&times;</button>
+        </div>
+        <dl class="di-table" id="diTable"></dl>`;
+      document.body.appendChild(panel);
+      bindDataInterpreterDrag(panel);
+      return panel;
+    }
+
+    function toggleDataInterpreter(force) {
+      const panel = ensureDataInterpreterDom();
+      const open = typeof force === "boolean" ? force : panel.hidden;
+      panel.hidden = !open;
+      localStorage.setItem("kdft.dataInterpreter.open", open ? "1" : "0");
+      if (open) {
+        applyDataInterpreterPos(panel);
+        updateDataInterpreter();
+      }
+    }
+
+    function positionDataInterpreter(panel, left, top) {
+      const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+      const maxTop = Math.max(0, window.innerHeight - 48);
+      panel.style.right = "auto";
+      panel.style.left = Math.min(Math.max(0, left), maxLeft) + "px";
+      panel.style.top = Math.min(Math.max(0, top), maxTop) + "px";
+    }
+
+    function applyDataInterpreterPos(panel) {
+      let pos = null;
+      try {
+        pos = JSON.parse(localStorage.getItem("kdft.dataInterpreter.pos") || "null");
+      } catch (_) {}
+      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+        positionDataInterpreter(panel, pos.left, pos.top);
+      }
+    }
+
+    function bindDataInterpreterDrag(panel) {
+      const head = panel.querySelector("#diHead");
+      let drag = null;
+      head.addEventListener("pointerdown", (event) => {
+        if (event.target.closest("button")) {
+          return;
+        }
+        const rect = panel.getBoundingClientRect();
+        drag = { dx: event.clientX - rect.left, dy: event.clientY - rect.top, id: event.pointerId };
+        if (head.setPointerCapture) {
+          try {
+            head.setPointerCapture(event.pointerId);
+          } catch (_) {}
+        }
+        event.preventDefault();
+      });
+      head.addEventListener("pointermove", (event) => {
+        if (!drag || event.pointerId !== drag.id) {
+          return;
+        }
+        positionDataInterpreter(panel, event.clientX - drag.dx, event.clientY - drag.dy);
+      });
+      const stop = (event) => {
+        if (!drag || event.pointerId !== drag.id) {
+          return;
+        }
+        drag = null;
+        const rect = panel.getBoundingClientRect();
+        localStorage.setItem("kdft.dataInterpreter.pos", JSON.stringify({ left: rect.left, top: rect.top }));
+      };
+      head.addEventListener("pointerup", stop);
+      head.addEventListener("pointercancel", stop);
+    }
+
+    function dataInterpreterRows(bytes, be) {
+      const chrome8 = firstBytes(bytes, 8);
+      const hfs4 = firstBytes(bytes, 4);
+      return [
+        ["uint8 / int8", decodeIntPair(bytes, 1, be)],
+        ["uint16 / int16", decodeIntPair(bytes, 2, be)],
+        ["uint32 / int32", decodeIntPair(bytes, 4, be)],
+        ["uint64 / int64", decodeIntPair(bytes, 8, be)],
+        ["float32", decodeFloat(bytes, 4, be)],
+        ["float64", decodeFloat(bytes, 8, be)],
+        ["DOS date/time", decodeDosDateTime(bytes, be)],
+        ["Unix 32-bit", firstBytes(bytes, 4) ? decodeUnixTime(bytes, be) : null],
+        ["Unix ms 64-bit", decodeUnixMillis(bytes, be)],
+        ["Windows FILETIME", chrome8 ? decodeFiletime(bytes, be) : null],
+        ["Chrome/WebKit", chrome8 ? decodeChromeTime(chrome8, be) : null],
+        ["FireFox PRTime", chrome8 ? decodeFirefoxTime(chrome8, be) : null],
+        ["HFS+ 32-bit BE", hfs4 ? decodeHfsTime(hfs4) : null],
+        ["GUID/UUID", decodeGuid(bytes)]
+      ];
+    }
+
+    function updateDataInterpreter() {
+      const panel = document.getElementById("dataInterpreter");
+      if (!panel || panel.hidden) {
+        return;
+      }
+      const be = hexEndianness() === "be";
+      panel.querySelector("#diLe").className = be ? "" : "active";
+      panel.querySelector("#diBe").className = be ? "active" : "";
+      const table = panel.querySelector("#diTable");
+      const data = state.hex && state.hex.data;
+      if (!data || !data.bytes || data.bytes.length === 0) {
+        table.innerHTML = "<dt>Cursor</dt><dd>&mdash; open bytes in the hex view</dd>";
+        return;
+      }
+      const windowStart = Number(data.offset) || 0;
+      const selection = normalizedHexSelection();
+      const cursor = selection ? selection.start : windowStart;
+      const index = Math.max(0, cursor - windowStart);
+      const bytes = Array.from(data.bytes).slice(index, index + 16);
+      const rows = dataInterpreterRows(bytes, be);
+      table.innerHTML = `<dt>Cursor</dt><dd>${escapeHtml(formatOffsetPair(cursor))}</dd>` +
+        rows.map((row) => `<dt>${escapeHtml(row[0])}</dt><dd>${decodeValue(row[1])}</dd>`).join("");
     }
 
     function decodeRows(rows) {
@@ -8406,17 +9695,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    function decodeUtf32Le(bytes) {
+    function decodeUtf32(bytes, be) {
       if (!bytes || bytes.length === 0) {
         return "";
       }
       const chars = [];
       for (let index = 0; index + 3 < bytes.length; index += 4) {
-        const point =
-          (bytes[index] & 255) +
-          ((bytes[index + 1] & 255) * 0x100) +
-          ((bytes[index + 2] & 255) * 0x10000) +
-          ((bytes[index + 3] & 255) * 0x1000000);
+        const point = be
+          ? ((bytes[index] & 255) * 0x1000000) +
+            ((bytes[index + 1] & 255) * 0x10000) +
+            ((bytes[index + 2] & 255) * 0x100) +
+            (bytes[index + 3] & 255)
+          : (bytes[index] & 255) +
+            ((bytes[index + 1] & 255) * 0x100) +
+            ((bytes[index + 2] & 255) * 0x10000) +
+            ((bytes[index + 3] & 255) * 0x1000000);
         if (point <= 0x10FFFF && (point < 0xD800 || point > 0xDFFF)) {
           chars.push(String.fromCodePoint(point));
         } else {
@@ -8429,20 +9722,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return chars.join("");
     }
 
-    function decodeChromeTime(bytes) {
+    function decodeChromeTime(bytes, be) {
       if (!bytes || bytes.length !== 8) {
         return null;
       }
-      const micros = readUint64Le(bytes);
+      const micros = readUintFirst(bytes, 8, be);
       const millis = Number(micros / 1000n) - 11644473600000;
       return saneIsoDate(millis);
     }
 
-    function decodeFirefoxTime(bytes) {
+    function decodeFirefoxTime(bytes, be) {
       if (!bytes || bytes.length !== 8) {
         return null;
       }
-      const micros = readUint64Le(bytes);
+      const micros = readUintFirst(bytes, 8, be);
       const millis = Number(micros / 1000n);
       return saneIsoDate(millis);
     }
@@ -8457,14 +9750,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ((bytes[2] & 255) * 0x100) +
         (bytes[3] & 255);
       return saneIsoDate(Date.UTC(1904, 0, 1) + (seconds * 1000));
-    }
-
-    function readUint64Le(bytes) {
-      let value = 0n;
-      for (let index = 7; index >= 0; index -= 1) {
-        value = (value << 8n) + BigInt(bytes[index] & 255);
-      }
-      return value;
     }
 
     function saneIsoDate(millis) {
@@ -8645,11 +9930,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setNotice("Saved " + bytes.length + " selected bytes to " + fileName + ".");
     }
 
-    function decodeUnixTime(bytes) {
+    function decodeUnixTime(bytes, be) {
       if (!bytes || bytes.length < 4) {
         return "";
       }
-      const seconds = ((bytes[0]) | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
+      const seconds = Number(readUintFirst(bytes, 4, be));
       if (seconds === 0) {
         return "";
       }
@@ -8658,14 +9943,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return Number.isFinite(date.getTime()) && year >= 1980 && year <= 2100 ? date.toISOString() : "";
     }
 
-    function decodeFiletime(bytes) {
+    function decodeFiletime(bytes, be) {
       if (!bytes || bytes.length < 8) {
         return "";
       }
-      let value = 0n;
-      for (let index = 7; index >= 0; index--) {
-        value = (value << 8n) | BigInt(bytes[index] & 0xFF);
-      }
+      const value = readUintFirst(bytes, 8, be);
       if (value === 0n) {
         return "";
       }
@@ -9034,7 +10316,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const deleted = entry && entry.is_deleted ? ' <span class="pill bad">deleted</span>' : "";
         const offset = entry ? entryPrimaryOffset(entry) : "";
         return `
-        <tr class="entry-row" onclick="goToSearchResult(${index})">
+        <tr class="entry-row" onclick="goToSearchResult(${index})" data-entry-id="${hit.entry_id}" data-search-index="${index}">
           <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleSearchResultSelection(${index}, this.checked)"></td>
           <td><strong>${escapeHtml(hit.display_name)}</strong><br><span class="muted tiny">${escapeHtml(hit.logical_path)}</span></td>
           <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${deleted}</td>
@@ -9058,15 +10340,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const folderNames = new Map(state.data.folders.map((folder) => [folder.id, folder.name]));
       const rows = state.data.bookmarks.map((bookmark) => {
         const items = state.data.items.filter((item) => item.bookmark_id === bookmark.id);
+        const title = bookmark.title || bookmark.bookmark_type;
+        const itemRows = items.length
+          ? `<ul class="bookmark-items">${items.map((item) => {
+              const itemLabel = item.display_name || item.logical_path || ("Item " + item.id);
+              return `<li>
+                <span>${escapeHtml(itemLabel)}</span>
+                <button class="ghost danger" onclick="removeBookmarkItemUi(${item.id}, '${escapeAttr(escapeJs(itemLabel))}')">Remove item</button>
+              </li>`;
+            }).join("")}</ul>`
+          : '<span class="muted tiny">No items</span>';
         return `
           <tr>
-            <td><strong>${escapeHtml(bookmark.title || bookmark.bookmark_type)}</strong><br><span class="muted tiny">${escapeHtml(folderNames.get(bookmark.folder_id) || "")}</span></td>
+            <td><strong>${escapeHtml(title)}</strong><br><span class="muted tiny">${escapeHtml(folderNames.get(bookmark.folder_id) || "")}</span></td>
             <td><span class="pill">${escapeHtml(bookmark.bookmark_type)}</span></td>
-            <td>${items.length}</td>
+            <td>${itemRows}</td>
             <td>${escapeHtml(bookmark.examiner_comment || "")}</td>
+            <td class="actions"><button class="ghost danger" onclick="removeBookmarkUi(${bookmark.id}, '${escapeAttr(escapeJs(title))}')">Remove</button></td>
           </tr>`;
       }).join("");
-      $("bookmarksTable").innerHTML = rows ? table(["Bookmark", "Type", "Items", "Comment"], rows) : empty("No bookmarks.");
+      $("bookmarksTable").innerHTML = rows ? table(["Bookmark", "Type", "Items", "Comment", ""], rows) : empty("No bookmarks.");
     }
 
     function renderReport() {
@@ -9086,6 +10379,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function numberValue(id, fallback) {
       const value = Number($(id).value);
       return Number.isFinite(value) && value > 0 ? value : fallback;
+    }
+
+    function nonNegativeNumberValue(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) && value >= 0 ? value : fallback;
     }
 
     function escapeHtml(value) {
@@ -9254,7 +10552,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     new MutationObserver(enhanceRenderedTables).observe(document.body, { childList: true, subtree: true });
     enhanceRenderedTables();
 
-    // The live-browse context menu closes on any outside click, Escape, or scroll.
+    // The context menu closes on any outside click, Escape, or scroll.
     document.addEventListener("click", hideContextMenu);
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
@@ -9262,10 +10560,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     });
     document.addEventListener("scroll", hideContextMenu, true);
+    document.addEventListener("contextmenu", handleGlobalContextMenu);
 
     $("casePath").value = normalizePathInput(state.casePath);
     $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
+    if (localStorage.getItem("kdft.dataInterpreter.open") === "1") {
+      toggleDataInterpreter(true);
+    }
     $("refreshCase").addEventListener("click", refresh);
     $("toggleSidebar").addEventListener("click", () => {
       const collapsed = document.querySelector(".app").classList.toggle("sidebar-collapsed");
@@ -9282,6 +10584,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       button.addEventListener("click", () => setEvidenceType(button.dataset.type));
     });
     $("selectVisibleRows").addEventListener("click", selectVisibleEntries);
+    $("bookmarkReportSelected").addEventListener("click", bookmarkSelectionAndExportReport);
     $("selectedAction").addEventListener("change", handleSelectedAction);
     // "input" fires as soon as a complete date is typed or picked - no Enter
     // needed; the value stays "" until the date is complete.
@@ -9306,6 +10609,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderEvidenceBrowserEntries();
     });
     $("toggleInspector").addEventListener("click", toggleInspectorPane);
+    $("analyzeBack").addEventListener("click", analyzeBack);
+    $("analyzeForward").addEventListener("click", analyzeForward);
+    $("exportReportFromAnalyze").addEventListener("click", exportReport);
     $("openAnalyzeWindow").addEventListener("click", openAnalyzeWindow);
     $("liveBrowse").addEventListener("click", toggleLiveBrowse);
     $("treeModeFilesystem").addEventListener("click", () => setBrowserTreeMode("filesystem"));
@@ -9349,6 +10655,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     bindInspectorResize();
     bindHexSelection();
     setInspectorCollapsed(state.inspectorCollapsed);
+    updateAnalyzeNavButtons();
     if (ANALYSIS_MODE) {
       switchView("analyzeView");
     }
