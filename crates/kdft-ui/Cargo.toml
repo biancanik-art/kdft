@@ -13,3 +13,6 @@ anyhow.workspace = true
 kdft-case = { path = "../kdft-case" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

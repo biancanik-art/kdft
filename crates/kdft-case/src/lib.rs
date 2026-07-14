@@ -932,6 +932,11 @@ pub fn add_evidence(case_path: &Path, options: AddEvidenceOptions) -> Result<i64
     let case_id = active_case_id(&conn)?;
     let metadata = fs::metadata(&options.path)
         .with_context(|| format!("reading bounded metadata for {}", options.path.display()))?;
+    if metadata.is_file() {
+        if let Some(family) = detect_browser_database(&options.path)? {
+            return Err(BrowserDatabaseDetected { family }.into());
+        }
+    }
     let source_kind = infer_evidence_kind(&options.path, options.kind, &metadata)?;
     let source_path = stable_path_string(&options.path);
     let display_name = options
@@ -1055,6 +1060,52 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("listing evidence sources")
+}
+
+/// Cheap active-case existence check for coordinating follow-up processing
+/// passes with concurrent evidence removal.
+pub fn evidence_source_exists(case_path: &Path, evidence_id: i64) -> Result<bool> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM evidence_sources
+            WHERE id = ?1 AND case_id = ?2 AND attach_status <> 'superseded'
+         )",
+        params![evidence_id, case_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .context("checking whether evidence source exists")
+}
+
+/// Preserve the underlying failure for an optional processing pass without
+/// exposing low-level database text in the examiner-facing API response. Audit
+/// object IDs are deliberately not foreign-key constrained, so this remains
+/// recordable after the evidence row itself has been removed.
+pub fn record_processing_pass_failure_audit(
+    case_path: &Path,
+    evidence_id: i64,
+    pass_name: &str,
+    underlying_error: &str,
+) -> Result<()> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let actor = audit_actor(&conn, case_id)?;
+    let details = serde_json::json!({
+        "evidence_id": evidence_id,
+        "pass": pass_name,
+        "underlying_error": underlying_error,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO audit_events(
+            case_id, event_type, actor, object_type, object_id, details_json
+         ) VALUES (?1, 'evidence.processing_pass.failed', ?2, 'evidence', ?3, ?4)",
+        params![case_id, actor, evidence_id, details],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2608,14 +2659,41 @@ pub fn import_chromium_history(
     case_path: &Path,
     options: ImportBrowserHistoryOptions,
 ) -> Result<BrowserHistoryImportResult> {
-    import_browser_history(case_path, options)
+    import_browser_history_for_family(case_path, BrowserFamily::Chromium, options)
+}
+
+pub fn import_firefox_history(
+    case_path: &Path,
+    options: ImportBrowserHistoryOptions,
+) -> Result<BrowserHistoryImportResult> {
+    import_browser_history_for_family(case_path, BrowserFamily::Firefox, options)
+}
+
+pub fn import_safari_history(
+    case_path: &Path,
+    options: ImportBrowserHistoryOptions,
+) -> Result<BrowserHistoryImportResult> {
+    import_browser_history_for_family(case_path, BrowserFamily::Safari, options)
 }
 
 pub fn import_browser_history(
     case_path: &Path,
     options: ImportBrowserHistoryOptions,
 ) -> Result<BrowserHistoryImportResult> {
-    let import_data = collect_browser_history_import(&options.history_path, options.max_visits)?;
+    let family = detect_browser_family(&options.history_path)?;
+    import_browser_history_for_family(case_path, family, options)
+}
+
+pub fn import_browser_history_for_family(
+    case_path: &Path,
+    family: BrowserFamily,
+    options: ImportBrowserHistoryOptions,
+) -> Result<BrowserHistoryImportResult> {
+    let import_data = collect_browser_history_import_for_family(
+        &options.history_path,
+        options.max_visits,
+        family,
+    )?;
     persist_browser_history_import(case_path, options.evidence_name, import_data)
 }
 
@@ -2623,8 +2701,16 @@ fn collect_browser_history_import(
     history_path: &Path,
     max_visits: usize,
 ) -> Result<BrowserHistoryImportData> {
-    let max_visits = unlimited_if_zero(max_visits);
     let family = detect_browser_family(history_path)?;
+    collect_browser_history_import_for_family(history_path, max_visits, family)
+}
+
+fn collect_browser_history_import_for_family(
+    history_path: &Path,
+    max_visits: usize,
+    family: BrowserFamily,
+) -> Result<BrowserHistoryImportData> {
+    let max_visits = unlimited_if_zero(max_visits);
     let import_data = match family {
         BrowserFamily::Chromium => collect_chromium_history_import(history_path, max_visits)?,
         BrowserFamily::Firefox => collect_firefox_history_import(history_path, max_visits)?,
@@ -6291,14 +6377,14 @@ struct SafariProfilePaths {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserFamily {
+pub enum BrowserFamily {
     Chromium,
     Firefox,
     Safari,
 }
 
 impl BrowserFamily {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Chromium => "chromium",
             Self::Firefox => "firefox",
@@ -6306,7 +6392,7 @@ impl BrowserFamily {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Chromium => "Chromium",
             Self::Firefox => "Firefox",
@@ -6314,6 +6400,27 @@ impl BrowserFamily {
         }
     }
 }
+
+/// Returned by [`add_evidence`] when a regular file is a supported browser
+/// history database. Callers should route the file's parent directory through
+/// the browser-history import flow instead of attaching the database as an
+/// ordinary file or disk image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserDatabaseDetected {
+    pub family: BrowserFamily,
+}
+
+impl std::fmt::Display for BrowserDatabaseDetected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "detected {} browser history database",
+            self.family.label()
+        )
+    }
+}
+
+impl std::error::Error for BrowserDatabaseDetected {}
 
 struct BrowserHistoryImportData {
     family: BrowserFamily,
@@ -6836,6 +6943,68 @@ fn open_sqlite_copy_read_only(path: &Path) -> Result<(Connection, TempFileGuard)
     let conn = Connection::open_with_flags(&guard.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening browser database copy {}", guard.path.display()))?;
     Ok((conn, guard))
+}
+
+/// Detect a supported browser history database by SQLite header and schema.
+///
+/// This is deliberately a best-effort attach-time sniff: inaccessible,
+/// locked, truncated, and corrupt files are reported as `Ok(None)` so a failed
+/// probe can never prevent the caller from attaching the file normally.
+pub fn detect_browser_database(path: &Path) -> Result<Option<BrowserFamily>> {
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+    let mut header = [0_u8; SQLITE_HEADER.len()];
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    if file.read_exact(&mut header).is_err() || &header != SQLITE_HEADER {
+        return Ok(None);
+    }
+
+    let (conn, _guard) = match open_sqlite_copy_read_only(path) {
+        Ok(opened) => opened,
+        Err(_) => return Ok(None),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT lower(name)
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND lower(name) IN (
+               'urls', 'visits', 'moz_places', 'history_visits', 'history_items'
+           )",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Ok(None),
+    };
+    let names = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(rows) => {
+            let mut names = HashSet::new();
+            for row in rows {
+                let Ok(name) = row else {
+                    return Ok(None);
+                };
+                names.insert(name);
+            }
+            names
+        }
+        Err(_) => return Ok(None),
+    };
+
+    let mut matches = Vec::new();
+    if names.contains("urls") && names.contains("visits") {
+        matches.push(BrowserFamily::Chromium);
+    }
+    if names.contains("moz_places") {
+        matches.push(BrowserFamily::Firefox);
+    }
+    if names.contains("history_visits") || names.contains("history_items") {
+        matches.push(BrowserFamily::Safari);
+    }
+    Ok(match matches.as_slice() {
+        [family] => Some(*family),
+        _ => None,
+    })
 }
 
 fn copy_sqlite_database_to_temp(path: &Path) -> Result<TempFileGuard> {
@@ -25097,31 +25266,10 @@ fn detect_browser_family(input_path: &Path) -> Result<BrowserFamily> {
 }
 
 fn sniff_browser_family_from_sqlite(input_path: &Path) -> Result<BrowserFamily> {
-    let (conn, _guard) = open_sqlite_copy_read_only(input_path).with_context(|| {
-        format!(
-            "sniffing browser history SQLite schema from {}",
-            input_path.display()
-        )
-    })?;
-    let mut matches = Vec::new();
-    if sqlite_table_exists(&conn, "moz_places")? {
-        matches.push(BrowserFamily::Firefox);
-    }
-    if sqlite_table_exists(&conn, "history_items")? && sqlite_table_exists(&conn, "history_visits")?
-    {
-        matches.push(BrowserFamily::Safari);
-    }
-    if sqlite_table_exists(&conn, "urls")? && sqlite_table_exists(&conn, "visits")? {
-        matches.push(BrowserFamily::Chromium);
-    }
-    match matches.as_slice() {
-        [family] => Ok(*family),
-        [] => bail!(
+    match detect_browser_database(input_path)? {
+        Some(family) => Ok(family),
+        None => bail!(
             "could not identify browser history database schema in {}; expected Firefox moz_places, Safari history_items/history_visits, or Chromium urls/visits tables",
-            input_path.display()
-        ),
-        _ => bail!(
-            "ambiguous browser history database schema in {}; point at a specific supported browser history DB",
             input_path.display()
         ),
     }
@@ -25838,6 +25986,114 @@ mod tests {
         assert_eq!(evidence[0].source_kind, "folder");
         assert!(evidence[0].read_file_system_requested);
         assert_eq!(evidence[0].indexed_at, None);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_database_attach_signals_import_without_plain_evidence_row() -> Result<()> {
+        let case_path = unique_case_path("detected-browser-attach");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("detected-browser-profile");
+        let history_path = profile_dir.join("History");
+        create_test_chromium_history(&history_path)?;
+
+        assert_eq!(
+            detect_browser_database(&history_path)?,
+            Some(BrowserFamily::Chromium)
+        );
+        let error = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: history_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )
+        .expect_err("a browser database should be routed to the history importer");
+        let detected = error
+            .downcast_ref::<BrowserDatabaseDetected>()
+            .expect("attach should return the typed browser-database signal");
+        assert_eq!(detected.family, BrowserFamily::Chromium);
+        assert!(list_evidence(&case_path)?.is_empty());
+        assert_eq!(filesystem_entry_count(&case_path)?, 0);
+
+        let imported = import_chromium_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 2);
+        assert!(imported.entries_indexed >= imported.visits_indexed);
+        let evidence = list_evidence(&case_path)?;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source_kind, "browser_history");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn non_browser_sqlite_attaches_as_plain_file() -> Result<()> {
+        let case_path = unique_case_path("non-browser-sqlite-attach");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("non-browser-sqlite-source");
+        let sqlite_path = evidence_dir.join("notes.sqlite");
+        Connection::open(&sqlite_path)?
+            .execute_batch("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);")?;
+
+        assert_eq!(detect_browser_database(&sqlite_path)?, None);
+        let corrupt_path = evidence_dir.join("corrupt.sqlite");
+        fs::write(&corrupt_path, b"SQLite format 3\0not a valid database")?;
+        assert_eq!(detect_browser_database(&corrupt_path)?, None);
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: sqlite_path,
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let evidence = list_evidence(&case_path)?;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id, evidence_id);
+        assert_eq!(evidence[0].source_kind, "file");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn non_sqlite_raw_file_keeps_image_attach_path() -> Result<()> {
+        let case_path = unique_case_path("non-sqlite-raw-attach");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("non-sqlite-raw-source");
+        let raw_path = evidence_dir.join("disk.raw");
+        fs::write(&raw_path, b"not a sqlite database; raw media bytes")?;
+
+        assert_eq!(detect_browser_database(&raw_path)?, None);
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: raw_path,
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let evidence = list_evidence(&case_path)?;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id, evidence_id);
+        assert_eq!(evidence[0].source_kind, "image");
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -33882,6 +34138,13 @@ mod tests {
              CREATE TABLE history_visits(id INTEGER PRIMARY KEY);",
         )?;
         assert_eq!(detect_browser_family(&sniff_safari)?, BrowserFamily::Safari);
+        let sniff_safari_single_table = root.join("unknown-safari-single-table.sqlite");
+        Connection::open(&sniff_safari_single_table)?
+            .execute_batch("CREATE TABLE history_visits(id INTEGER PRIMARY KEY);")?;
+        assert_eq!(
+            detect_browser_database(&sniff_safari_single_table)?,
+            Some(BrowserFamily::Safari)
+        );
         let sniff_chromium = root.join("unknown-chromium.sqlite");
         Connection::open(&sniff_chromium)?.execute_batch(
             "CREATE TABLE urls(id INTEGER PRIMARY KEY);

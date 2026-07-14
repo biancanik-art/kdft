@@ -3,15 +3,16 @@ use clap::{Args, Parser, Subcommand};
 use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, case_info, create_bookmark,
     create_bookmark_folder, create_case, deep_search, filesystem_entry_count, global_options,
-    import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
-    list_evidence, list_installed_resources, remove_bookmark, remove_bookmark_item, report_data,
-    update_global_options, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
-    CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions,
-    EvidenceKind, GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
+    import_browser_history, import_browser_history_for_family, list_bookmark_folders,
+    list_bookmark_items, list_bookmarks, list_evidence, list_installed_resources, remove_bookmark,
+    remove_bookmark_item, report_data, update_global_options, AddEvidenceOptions,
+    AnalyzeSignaturesOptions, BookmarkType, BrowserDatabaseDetected, CreateBookmarkItemOptions,
+    CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions, EvidenceKind,
+    GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
     UpdateGlobalOptions,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "kdft")]
@@ -397,7 +398,8 @@ fn main() -> Result<()> {
         },
         Command::Evidence { command } => match command {
             EvidenceCommand::Add(args) => {
-                let id = add_evidence(
+                let evidence_path = args.path.clone();
+                let add_result = add_evidence(
                     &args.case,
                     AddEvidenceOptions {
                         path: args.path,
@@ -407,19 +409,66 @@ fn main() -> Result<()> {
                             .unwrap_or(!args.no_read_file_system),
                         notes: args.notes,
                     },
-                )?;
-                let entry_count = filesystem_entry_count(&args.case)?;
-                if args.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "evidence_id": id,
-                            "filesystem_entries": entry_count,
-                            "indexed": false
-                        })
-                    );
-                } else {
-                    println!("Attached evidence source {id}; no indexing was run.");
+                );
+                match add_result {
+                    Ok(id) => {
+                        let entry_count = filesystem_entry_count(&args.case)?;
+                        if args.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "evidence_id": id,
+                                    "filesystem_entries": entry_count,
+                                    "indexed": false
+                                })
+                            );
+                        } else {
+                            println!("Attached evidence source {id}; no indexing was run.");
+                        }
+                    }
+                    Err(error) => {
+                        let Some(detected) = error.downcast_ref::<BrowserDatabaseDetected>() else {
+                            return Err(error);
+                        };
+                        let family = detected.family;
+                        let profile_root = evidence_path
+                            .parent()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."));
+                        let result = import_browser_history_for_family(
+                            &args.case,
+                            family,
+                            ImportBrowserHistoryOptions {
+                                history_path: profile_root.to_path_buf(),
+                                max_visits: 0,
+                                evidence_name: None,
+                            },
+                        )?;
+                        if args.json {
+                            let mut value = serde_json::to_value(&result)?;
+                            let object = value.as_object_mut().with_context(|| {
+                                "browser history import result was not a JSON object"
+                            })?;
+                            object.insert(
+                                "detected".to_string(),
+                                serde_json::Value::String(format!(
+                                    "{}_history_database",
+                                    family.as_str()
+                                )),
+                            );
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        } else {
+                            println!(
+                                "Detected {} history database at {} - parsed {} records ({} visits) from profile {}.",
+                                family.label(),
+                                evidence_path.display(),
+                                result.entries_indexed,
+                                result.visits_indexed,
+                                profile_root.display()
+                            );
+                            print_json_or_debug(false, &result)?;
+                        }
+                    }
                 }
             }
             EvidenceCommand::Process(args) => {

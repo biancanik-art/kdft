@@ -3,18 +3,20 @@ use kdft_case::{
     add_evidence, analyze_signatures, bookmark_indexed_folder_recursive,
     bookmark_live_folder_recursive, carve_evidence, case_info, category_entry_counts,
     clear_all_findings, count_filesystem_entries_for_timeline, create_bookmark,
-    create_bookmark_folder, create_case, deep_search, export_image_file, export_image_tree,
-    export_local_file, export_local_tree, filesystem_entry_by_id, filesystem_entry_count,
-    filesystem_entry_disk_location, hash_evidence, import_browser_artifacts_into_evidence,
-    import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
+    create_bookmark_folder, create_case, deep_search, evidence_source_exists, export_image_file,
+    export_image_tree, export_local_file, export_local_tree, filesystem_entry_by_id,
+    filesystem_entry_count, filesystem_entry_disk_location, hash_evidence,
+    import_browser_artifacts_into_evidence, import_browser_history,
+    import_browser_history_for_family, list_bookmark_folders, list_bookmark_items, list_bookmarks,
     list_entries_by_category, list_evidence, list_filesystem_entries_for_timeline,
     list_filesystem_entries_limited, list_image_tree_files, list_local_tree_files,
     max_filesystem_entry_id, read_filesystem_entry_bytes, record_live_export,
     record_live_export_with_source_kind, record_live_tree_export,
-    record_live_tree_export_with_source_kind, record_report_export, recover_filesystem_entry,
-    remove_bookmark, remove_bookmark_item, remove_evidence, render_report, report_data,
-    report_data_with_directory_structure, AddEvidenceOptions, AnalyzeSignaturesOptions,
-    BookmarkType, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
+    record_live_tree_export_with_source_kind, record_processing_pass_failure_audit,
+    record_report_export, recover_filesystem_entry, remove_bookmark, remove_bookmark_item,
+    remove_evidence, render_report, report_data, report_data_with_directory_structure,
+    AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType, BrowserDatabaseDetected,
+    BrowserFamily, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
     CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
     ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
     RecoverEntryOptions,
@@ -1781,24 +1783,62 @@ fn api_add_evidence(body: &[u8]) -> Result<serde_json::Value> {
     let case_path = request_path(&request.case_path, "case_path")?;
     let evidence_path = request_path(&request.path, "path")?;
     let kind = EvidenceKind::parse(request.kind.as_deref().unwrap_or("auto"))?;
-    let evidence_id = add_evidence(
+    let add_result = add_evidence(
         &case_path,
         AddEvidenceOptions {
-            path: evidence_path,
+            path: evidence_path.clone(),
             kind,
             read_file_system_requested: request.read_file_system.unwrap_or(true),
             notes: request.notes,
         },
+    );
+    match add_result {
+        Ok(evidence_id) => Ok(json!({
+            "evidence_id": evidence_id,
+            // Add-evidence only inserts an evidence_sources row; it never creates filesystem_entries
+            // for the new source (that happens in a later explicit process step), so this is always 0.
+            // Previously reported the case-wide entry count, which was misleading once a case has more
+            // than one evidence source.
+            "filesystem_entries": 0,
+            "indexed": false
+        })),
+        Err(error) => {
+            let Some(detected) = error.downcast_ref::<BrowserDatabaseDetected>() else {
+                return Err(error);
+            };
+            import_detected_browser_database(&case_path, &evidence_path, detected.family)
+        }
+    }
+}
+
+fn import_detected_browser_database(
+    case_path: &Path,
+    database_path: &Path,
+    family: BrowserFamily,
+) -> Result<serde_json::Value> {
+    let profile_root = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let result = import_browser_history_for_family(
+        case_path,
+        family,
+        ImportBrowserHistoryOptions {
+            history_path: profile_root.to_path_buf(),
+            max_visits: 0,
+            evidence_name: None,
+        },
     )?;
-    Ok(json!({
-        "evidence_id": evidence_id,
-        // Add-evidence only inserts an evidence_sources row; it never creates filesystem_entries
-        // for the new source (that happens in a later explicit process step), so this is always 0.
-        // Previously reported the case-wide entry count, which was misleading once a case has more
-        // than one evidence source.
-        "filesystem_entries": 0,
-        "indexed": false
-    }))
+    let mut response =
+        serde_json::to_value(result).context("serializing detected browser import result")?;
+    response
+        .as_object_mut()
+        .context("detected browser import result serialized to a non-object")?
+        .insert(
+            "detected".to_string(),
+            serde_json::Value::String(format!("{}_history_database", family.as_str())),
+        );
+    Ok(response)
 }
 
 fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
@@ -1825,66 +1865,76 @@ fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
     // failed optional pass must not discard the completed index.
     let mut response =
         serde_json::to_value(&index_result).context("serializing processing result")?;
+    append_optional_processing_passes(&case_path, &request, &mut response)?;
+    Ok(response)
+}
+
+fn append_optional_processing_passes(
+    case_path: &Path,
+    request: &ProcessEvidenceRequest,
+    response: &mut serde_json::Value,
+) -> Result<()> {
     let extras = response
         .as_object_mut()
         .context("processing result serialized to a non-object")?;
     if request.run_hash.unwrap_or(false) {
         extras.insert(
             "hash".to_string(),
-            match hash_evidence(&case_path, request.evidence_id) {
-                Ok(result) => serde_json::to_value(result)?,
-                Err(error) => serde_json::json!({ "error": error.to_string() }),
-            },
+            run_optional_processing_pass(case_path, request.evidence_id, "hash", || {
+                hash_evidence(case_path, request.evidence_id)
+            })?,
         );
     }
     if request.run_signature_analysis.unwrap_or(false) {
         extras.insert(
             "signature_analysis".to_string(),
-            match analyze_signatures(
-                &case_path,
-                AnalyzeSignaturesOptions {
-                    evidence_id: Some(request.evidence_id),
-                    // NO ARBITRARY LIMITS: the signature pass covers every indexed
-                    // entry of the evidence (0 = unlimited).
-                    max_entries: 0,
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "signature analysis",
+                || {
+                    analyze_signatures(
+                        case_path,
+                        AnalyzeSignaturesOptions {
+                            evidence_id: Some(request.evidence_id),
+                            // NO ARBITRARY LIMITS: the signature pass covers every indexed
+                            // entry of the evidence (0 = unlimited).
+                            max_entries: 0,
+                        },
+                    )
                 },
-            ) {
-                Ok(result) => serde_json::to_value(result)?,
-                Err(error) => serde_json::json!({ "error": error.to_string() }),
-            },
+            )?,
         );
     }
     if request.run_carve.unwrap_or(false) {
         extras.insert(
             "carve".to_string(),
-            match carve_evidence(
-                &case_path,
-                request.evidence_id,
-                CarveOptions {
-                    // NO ARBITRARY LIMITS: default is the whole media, every hit.
-                    max_scan_bytes: request.carve_max_scan_bytes.unwrap_or(0),
-                    max_files: request.carve_max_files.unwrap_or(0),
-                },
-            ) {
-                Ok(result) => serde_json::to_value(result)?,
-                Err(error) => serde_json::json!({ "error": error.to_string() }),
-            },
+            run_optional_processing_pass(case_path, request.evidence_id, "carve", || {
+                carve_evidence(
+                    case_path,
+                    request.evidence_id,
+                    CarveOptions {
+                        // NO ARBITRARY LIMITS: default is the whole media, every hit.
+                        max_scan_bytes: request.carve_max_scan_bytes.unwrap_or(0),
+                        max_files: request.carve_max_files.unwrap_or(0),
+                    },
+                )
+            })?,
         );
     }
     if request.run_file_hash.unwrap_or(false) {
         extras.insert(
             "file_hash".to_string(),
-            match kdft_case::hash_indexed_files(
-                &case_path,
-                kdft_case::HashIndexedFilesOptions {
-                    evidence_id: request.evidence_id,
-                    max_files: 0,
-                    max_file_bytes: 0,
-                },
-            ) {
-                Ok(result) => serde_json::to_value(result)?,
-                Err(error) => serde_json::json!({ "error": error.to_string() }),
-            },
+            run_optional_processing_pass(case_path, request.evidence_id, "file hashing", || {
+                kdft_case::hash_indexed_files(
+                    case_path,
+                    kdft_case::HashIndexedFilesOptions {
+                        evidence_id: request.evidence_id,
+                        max_files: 0,
+                        max_file_bytes: 0,
+                    },
+                )
+            })?,
         );
     }
     if request.parse_browsers.unwrap_or(true) {
@@ -1892,13 +1942,117 @@ fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
         // covers NTFS/FAT images and local folder evidence.
         extras.insert(
             "browser_parsing".to_string(),
-            match run_browser_parsing_pass(&case_path, request.evidence_id) {
-                Ok(result) => result,
-                Err(error) => serde_json::json!({ "error": error.to_string() }),
-            },
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "browser parsing",
+                || run_browser_parsing_pass(&case_path.to_path_buf(), request.evidence_id),
+            )?,
         );
     }
-    Ok(response)
+    Ok(())
+}
+
+fn run_optional_processing_pass<T, F>(
+    case_path: &Path,
+    evidence_id: i64,
+    pass_name: &str,
+    operation: F,
+) -> Result<serde_json::Value>
+where
+    T: Serialize,
+    F: FnOnce() -> Result<T>,
+{
+    if !processing_evidence_exists(case_path, evidence_id)? {
+        return Ok(removed_evidence_pass_result(evidence_id, pass_name));
+    }
+    match operation() {
+        Ok(result) => {
+            let value =
+                serde_json::to_value(result).context("serializing optional processing pass")?;
+            let removed_after_start = processing_evidence_exists(case_path, evidence_id)
+                .map(|exists| !exists)
+                .unwrap_or(false);
+            let nested_foreign_key = json_contains_foreign_key_failure(&value);
+            if nested_foreign_key {
+                preserve_processing_pass_failure(
+                    case_path,
+                    evidence_id,
+                    pass_name,
+                    &value.to_string(),
+                );
+            }
+            if removed_after_start || nested_foreign_key {
+                Ok(removed_evidence_pass_result(evidence_id, pass_name))
+            } else {
+                Ok(value)
+            }
+        }
+        Err(error) => {
+            // The source can disappear in the narrow race after the existence
+            // check. A foreign-key failure is the other observable shape of
+            // that same removal race, so neither is exposed to the examiner.
+            let removed_after_start = processing_evidence_exists(case_path, evidence_id)
+                .map(|exists| !exists)
+                .unwrap_or(false);
+            if removed_after_start || is_foreign_key_failure(&error) {
+                preserve_processing_pass_failure(
+                    case_path,
+                    evidence_id,
+                    pass_name,
+                    &format!("{error:#}"),
+                );
+                Ok(removed_evidence_pass_result(evidence_id, pass_name))
+            } else {
+                Ok(serde_json::json!({ "error": error.to_string() }))
+            }
+        }
+    }
+}
+
+fn preserve_processing_pass_failure(
+    case_path: &Path,
+    evidence_id: i64,
+    pass_name: &str,
+    underlying_error: &str,
+) {
+    // The examiner response must remain the clean removal wording even if the
+    // audit database is itself unavailable during teardown. The raw text is
+    // never copied into the response or UI notice.
+    let _ =
+        record_processing_pass_failure_audit(case_path, evidence_id, pass_name, underlying_error);
+}
+
+fn processing_evidence_exists(case_path: &Path, evidence_id: i64) -> Result<bool> {
+    evidence_source_exists(case_path, evidence_id)
+}
+
+fn removed_evidence_pass_result(evidence_id: i64, pass_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!(
+            "evidence {evidence_id} was removed while processing was running; the {pass_name} pass did not run"
+        )
+    })
+}
+
+fn is_foreign_key_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("foreign key constraint failed")
+    })
+}
+
+fn json_contains_foreign_key_failure(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text
+            .to_ascii_lowercase()
+            .contains("foreign key constraint failed"),
+        serde_json::Value::Array(values) => values.iter().any(json_contains_foreign_key_failure),
+        serde_json::Value::Object(values) => values.values().any(json_contains_foreign_key_failure),
+        _ => false,
+    }
 }
 
 /// Post-index browser-artifact pass: detect profiles among the indexed
@@ -3010,11 +3164,256 @@ fn is_separator(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        external_preview_extension, external_preview_output_path, normalize_request_path,
-        safe_external_preview_name, trim_balanced_path_quotes,
+        api_add_evidence, append_optional_processing_passes, external_preview_extension,
+        external_preview_output_path, normalize_request_path, run_optional_processing_pass,
+        safe_external_preview_name, trim_balanced_path_quotes, ProcessEvidenceRequest,
     };
     use super::{DeepSearchRequest, RawSearchRequest};
-    use std::path::Path;
+    use rusqlite::Connection;
+    use std::path::{Path, PathBuf};
+
+    fn unique_test_path(label: &str, suffix: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "kdft-ui-{label}-{}-{nonce}{suffix}",
+            std::process::id()
+        ))
+    }
+
+    fn create_ui_test_case(case_path: &Path, name: &str) -> anyhow::Result<()> {
+        kdft_case::create_case(
+            case_path,
+            kdft_case::CreateCaseOptions {
+                name: name.to_string(),
+                examiner_name: None,
+                case_number: None,
+                case_type: None,
+                description: None,
+                default_export_folder: None,
+                temporary_folder: None,
+                index_folder: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn create_ui_test_chromium_history(history_path: &Path) -> anyhow::Result<()> {
+        let conn = Connection::open(history_path)?;
+        conn.execute_batch(
+            "CREATE TABLE urls(
+                id INTEGER PRIMARY KEY,
+                url TEXT,
+                title TEXT,
+                visit_count INTEGER NOT NULL,
+                typed_count INTEGER NOT NULL,
+                last_visit_time INTEGER NOT NULL,
+                hidden INTEGER NOT NULL
+             );
+             CREATE TABLE visits(
+                id INTEGER PRIMARY KEY,
+                url INTEGER NOT NULL,
+                visit_time INTEGER NOT NULL,
+                from_visit INTEGER,
+                transition INTEGER NOT NULL,
+                segment_id INTEGER,
+                visit_duration INTEGER NOT NULL
+             );
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://example.test/detected', 'Detected History', 1, 1, 13300000020000000, 0);
+             INSERT INTO visits(id, url, visit_time, from_visit, transition, segment_id, visit_duration)
+             VALUES (1, 1, 13300000020000000, 0, 1, 0, 1000);",
+        )?;
+        Ok(())
+    }
+
+    fn cleanup_ui_test_case(case_path: &Path) {
+        let _ = std::fs::remove_file(case_path);
+        let case_text = case_path.to_string_lossy();
+        let _ = std::fs::remove_file(format!("{case_text}-wal"));
+        let _ = std::fs::remove_file(format!("{case_text}-shm"));
+    }
+
+    #[test]
+    fn add_evidence_api_detects_and_imports_bare_chromium_history() -> anyhow::Result<()> {
+        let case_path = unique_test_path("detected-history", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "detected-history")?;
+        let profile_dir = unique_test_path("chromium-profile", "");
+        std::fs::create_dir_all(&profile_dir)?;
+        let history_path = profile_dir.join("History");
+        create_ui_test_chromium_history(&history_path)?;
+        // The already-detected family must stay authoritative even if another
+        // supported DB name is present beside the selected History file.
+        Connection::open(profile_dir.join("places.sqlite"))?
+            .execute_batch("CREATE TABLE moz_places(id INTEGER PRIMARY KEY, url TEXT);")?;
+
+        let body = serde_json::json!({
+            "case_path": case_path.to_string_lossy(),
+            "path": history_path.to_string_lossy(),
+            // Reproduce the Image-path UI flow that originally misclassified
+            // the extensionless SQLite database as disk evidence.
+            "kind": "image",
+            "read_file_system": true
+        })
+        .to_string();
+        let response = api_add_evidence(body.as_bytes())?;
+        assert_eq!(response["detected"], "chromium_history_database");
+        assert_eq!(response["visits_indexed"], 1);
+        assert!(response["entries_indexed"].as_u64().unwrap_or_default() >= 2);
+
+        let evidence = kdft_case::list_evidence(&case_path)?;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source_kind, "browser_history");
+        assert!(evidence
+            .iter()
+            .all(|source| source.source_kind != "image" && source.source_kind != "file"));
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn removed_evidence_follow_up_passes_report_clean_errors_and_keep_index_result(
+    ) -> anyhow::Result<()> {
+        let case_path = unique_test_path("removed-follow-ups", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "removed-follow-ups")?;
+        let source_dir = unique_test_path("removed-follow-up-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("evidence.txt"), b"indexed before removal")?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let index_result = kdft_case::process_evidence_with_profile(
+            &case_path,
+            kdft_case::ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            kdft_case::ProcessingProfile {
+                capture_content: true,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+        let expected_job_id = index_result.job_id;
+        let expected_entries = index_result.entries_indexed;
+        let expected_status = index_result.status.clone();
+
+        // This is the seam between the completed index and the first optional
+        // pass in api_process_evidence: reproduce a concurrent examiner remove.
+        kdft_case::remove_evidence(&case_path, evidence_id)?;
+        let request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            capture_content: Some(true),
+            parse_emails: Some(false),
+            parse_browsers: Some(true),
+            run_hash: Some(true),
+            run_file_hash: Some(true),
+            run_signature_analysis: Some(true),
+            run_carve: Some(true),
+            carve_max_scan_bytes: Some(0),
+            carve_max_files: Some(0),
+        };
+        let mut response = serde_json::to_value(index_result)?;
+        append_optional_processing_passes(&case_path, &request, &mut response)?;
+
+        assert_eq!(response["job_id"], expected_job_id);
+        assert_eq!(response["entries_indexed"], expected_entries);
+        assert_eq!(response["status"], expected_status);
+        for (field, pass_name) in [
+            ("hash", "hash"),
+            ("signature_analysis", "signature analysis"),
+            ("carve", "carve"),
+            ("file_hash", "file hashing"),
+            ("browser_parsing", "browser parsing"),
+        ] {
+            assert_eq!(
+                response[field]["error"],
+                format!(
+                    "evidence {evidence_id} was removed while processing was running; the {pass_name} pass did not run"
+                )
+            );
+        }
+        let response_text = response.to_string();
+        assert!(!response_text.contains("FOREIGN KEY"));
+        assert!(!response_text.contains("not found"));
+
+        // Defense in depth: even if a pass loses the removal race after its
+        // existence check and only returns SQLite's FK text, the API result is
+        // still the same clean examiner-facing wording.
+        let replacement_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let foreign_key_result = run_optional_processing_pass(
+            &case_path,
+            replacement_id,
+            "signature analysis",
+            || -> anyhow::Result<serde_json::Value> {
+                Err(anyhow::anyhow!("FOREIGN KEY constraint failed"))
+            },
+        )?;
+        assert_eq!(
+            foreign_key_result["error"],
+            format!(
+                "evidence {replacement_id} was removed while processing was running; the signature analysis pass did not run"
+            )
+        );
+        assert!(!foreign_key_result.to_string().contains("FOREIGN KEY"));
+        let nested_foreign_key_result =
+            run_optional_processing_pass(&case_path, replacement_id, "browser parsing", || {
+                Ok(serde_json::json!({
+                    "errors": [{ "error": "FOREIGN KEY constraint failed" }]
+                }))
+            })?;
+        assert_eq!(
+            nested_foreign_key_result["error"],
+            format!(
+                "evidence {replacement_id} was removed while processing was running; the browser parsing pass did not run"
+            )
+        );
+        assert!(!nested_foreign_key_result
+            .to_string()
+            .contains("FOREIGN KEY"));
+        let audit_conn = Connection::open(&case_path)?;
+        let mut audit_stmt = audit_conn.prepare(
+            "SELECT details_json
+             FROM audit_events
+             WHERE event_type = 'evidence.processing_pass.failed'
+             ORDER BY id",
+        )?;
+        let audit_details = audit_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(audit_details.len(), 2);
+        assert!(audit_details
+            .iter()
+            .all(|details| details.contains("FOREIGN KEY constraint failed")));
+        drop(audit_stmt);
+        drop(audit_conn);
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
+        Ok(())
+    }
 
     // A rejected quick-bookmark request must not write anything to the case:
     // the folder used to be created before bookmark_type validation, leaving
@@ -6157,6 +6556,114 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
 
+    function newLiveBrowseState() {
+      return { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+    }
+
+    function newIndexedBrowseState() {
+      return { evidenceId: null, dirCache: {}, expanded: new Set(), selPath: "/" };
+    }
+
+    function evidenceListSignature(data = state.data) {
+      return ((data && data.evidence) || [])
+        .map((item) => [Number(item.id), item.source_kind || "", item.source_path || "", item.attached_at || ""])
+        .sort((left, right) => left[0] - right[0])
+        .map((identity) => JSON.stringify(identity))
+        .join("|");
+    }
+
+    function sameEvidenceIdentity(left, right) {
+      return Boolean(left && right)
+        && Number(left.id) === Number(right.id)
+        && left.source_kind === right.source_kind
+        && left.source_path === right.source_path
+        && left.attached_at === right.attached_at;
+    }
+
+    function selectedEvidenceIdentityMatches(expected) {
+      return sameEvidenceIdentity(selectedEvidenceSource(), expected);
+    }
+
+    function clearRemovedEvidenceViewState(evidenceId) {
+      const id = Number(evidenceId);
+      if (state.browserState.evidenceId === id) {
+        state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
+      }
+      if (state.live.evidenceId === id) {
+        state.live = newLiveBrowseState();
+      }
+      if (state.idx.evidenceId === id) {
+        state.idx = newIndexedBrowseState();
+      }
+      // Category caches can be scoped to "all" while still containing rows
+      // from the removed source, so every removal invalidates the whole cache.
+      state.cat = newCategoryCache();
+      state.selectedEntryIds = new Set();
+      state.lastSelectedEntryId = null;
+      state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      setCurrentEntryGrid("", []);
+      setCurrentLiveGrid("", []);
+      state.analyzeHistory.back = state.analyzeHistory.back.filter((location) => Number(location.evidenceId) !== id);
+      state.analyzeHistory.forward = state.analyzeHistory.forward.filter((location) => Number(location.evidenceId) !== id);
+      state.expandedTreePaths.delete(String(id));
+      if (state.liveAutoTried) {
+        state.liveAutoTried.delete(id);
+      }
+      if (state.pendingAnalysisSelection && Number(state.pendingAnalysisSelection.evidenceId) === id) {
+        state.pendingAnalysisSelection.evidenceId = null;
+        state.pendingAnalysisSelection.selectedPath = null;
+        state.pendingAnalysisSelection.selectedCategory = "";
+      }
+      // Search and timeline results are independent caches, not projections of
+      // state.data, and otherwise retain rows belonging to removed evidence.
+      state.searchResults = [];
+      state.selectedSearchKeys = new Set();
+      state.rawSearchResult = null;
+      state.timeline = newTimelineState();
+      state.timeline.casePath = state.casePath;
+      updateAnalyzeNavButtons();
+      // Analyze evidence/path selection is carried in state and URL params.
+      // No localStorage key persists it; kdft.evidencePath is only the Add
+      // Evidence input and intentionally remains untouched.
+    }
+
+    function reconcileAnalyzeEvidenceState() {
+      if (!state.data) {
+        return;
+      }
+      const validIds = new Set(state.data.evidence.map((item) => Number(item.id)));
+      const currentId = Number(state.browserState.evidenceId);
+      if (!validIds.has(currentId)) {
+        const treeMode = state.browserState.treeMode || "filesystem";
+        state.browserState = {
+          evidenceId: state.data.evidence.length ? state.data.evidence[0].id : null,
+          selectedPath: "/",
+          treeMode,
+          selectedCategory: ""
+        };
+        state.selectedEntryIds = new Set();
+        state.lastSelectedEntryId = null;
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      }
+      const selectedId = Number(state.browserState.evidenceId);
+      if (state.live.evidenceId != null && (!validIds.has(Number(state.live.evidenceId)) || Number(state.live.evidenceId) !== selectedId)) {
+        state.live = newLiveBrowseState();
+        setCurrentLiveGrid("", []);
+      }
+      if (state.idx.evidenceId != null && (!validIds.has(Number(state.idx.evidenceId)) || Number(state.idx.evidenceId) !== selectedId)) {
+        state.idx = newIndexedBrowseState();
+      }
+      if (state.cat.evidenceId != null && state.cat.evidenceId !== "all" && !validIds.has(Number(state.cat.evidenceId))) {
+        state.cat = newCategoryCache();
+      }
+      const hexEvidenceId = state.hex && state.hex.live
+        ? Number(state.hex.live.evidenceId)
+        : (state.hex && state.hex.raw ? Number(state.hex.raw.evidenceId) : null);
+      if (hexEvidenceId != null && !validIds.has(hexEvidenceId)) {
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      }
+    }
+
     function setNotice(message, bad) {
       const notice = $("notice");
       if (notice) {
@@ -6391,7 +6898,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       try {
-        state.data = await apiGet("/api/state", { case_path: casePath });
+        const nextData = await apiGet("/api/state", { case_path: casePath });
+        if (state.data) {
+          const nextById = new Map(nextData.evidence.map((item) => [Number(item.id), item]));
+          state.data.evidence
+            .filter((item) => {
+              const replacement = nextById.get(Number(item.id));
+              return !replacement
+                || replacement.source_kind !== item.source_kind
+                || replacement.source_path !== item.source_path
+                || replacement.attached_at !== item.attached_at;
+            })
+            .map((item) => Number(item.id))
+            .forEach(clearRemovedEvidenceViewState);
+          if (evidenceListSignature(state.data) !== evidenceListSignature(nextData)) {
+            // An attach/remove changes the context of every mirrored notice.
+            // Clear a prior processing result before rendering the new list.
+            setNotice("");
+          }
+        }
+        state.data = nextData;
         renderState();
         applyPendingAnalysisSelection();
         // Once a case is open the sidebar is rarely needed - collapse it for
@@ -6526,8 +7052,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
           read_file_system: processNow,
           notes: $("evidenceNotes").value
         });
+        setNotice("");
+        if (data.detected) {
+          await refresh();
+          const importedEvidence = state.data && state.data.evidence.find((item) => item.id === data.evidence_id);
+          if (!importedEvidence) {
+            setNotice("");
+            return;
+          }
+          selectEvidenceSource(data.evidence_id, data.visits_indexed > 0 ? "/Browser Activities/Visits" : "/Browser Activities");
+          const detectedFamily = String(data.detected).split("_")[0];
+          const familyLabel = detectedFamily === "firefox" ? "Firefox" : (detectedFamily === "safari" ? "Safari" : "Chromium");
+          setNotice(withPathCorrectionNotice(
+            "Detected " + familyLabel + " history database - parsed " + Number(data.entries_indexed || 0).toLocaleString()
+              + " records (" + Number(data.visits_indexed || 0).toLocaleString() + " visits).",
+            evidencePath
+          ));
+          return;
+        }
         if (!processNow) {
           await refresh();
+          if (!state.data || !state.data.evidence.some((item) => item.id === data.evidence_id)) {
+            setNotice("");
+            return;
+          }
           selectEvidenceSource(data.evidence_id, "/");
           setNotice(withPathCorrectionNotice("Attached evidence " + data.evidence_id + ".", evidencePath));
           return;
@@ -6540,10 +7088,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
             ...processingOptionsPayload()
           });
           await refresh();
+          if (!state.data || !state.data.evidence.some((item) => item.id === data.evidence_id)) {
+            setNotice("");
+            return;
+          }
           selectEvidenceSource(data.evidence_id, preferredAnalysisPath(data.evidence_id), "filesystem");
           setNotice(withPathCorrectionNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries." + processingExtrasSummary(processed), evidencePath));
         } catch (processErr) {
           await refresh();
+          if (!state.data || !state.data.evidence.some((item) => item.id === data.evidence_id)) {
+            setNotice("");
+            return;
+          }
           selectEvidenceSource(data.evidence_id, "/");
           setNotice(withPathCorrectionNotice("Attached evidence " + data.evidence_id + ", but processing failed: " + processErr.message, evidencePath), true);
         }
@@ -6688,6 +7244,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     async function processEvidence(id) {
       const evidence = state.data && state.data.evidence.find((item) => item.id === id);
       const label = evidence ? evidence.display_name : "evidence #" + id;
+      const evidenceSignatureBefore = evidenceListSignature();
       await runAnalyze(label, async () => {
         try {
           const data = await apiPost("/api/evidence/process", {
@@ -6702,13 +7259,28 @@ const INDEX_HTML: &str = r###"<!doctype html>
           }
           message += processingExtrasSummary(data);
           await refresh();
+          if (evidenceListSignature() !== evidenceSignatureBefore
+            || !state.data
+            || !state.data.evidence.some((item) => item.id === id)) {
+            // A late process callback must not restore a sticky message (or
+            // selection) after attach/remove changed the evidence context.
+            setNotice("");
+            return;
+          }
           if (state.live.evidenceId === id) {
-            state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+            state.live = newLiveBrowseState();
           }
           selectEvidenceSource(id, preferredAnalysisPath(id), "filesystem");
           setNotice(message);
         } catch (err) {
-          setNotice(err.message, true);
+          await refresh();
+          if (evidenceListSignature() !== evidenceSignatureBefore
+            || !state.data
+            || !state.data.evidence.some((item) => item.id === id)) {
+            setNotice("");
+          } else {
+            setNotice(err.message, true);
+          }
         }
       });
     }
@@ -6724,12 +7296,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           case_path: currentCasePath(),
           evidence_id: id
         });
-        if (state.browserState.evidenceId === id) {
-          state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
-          state.selectedEntryIds = new Set();
-          state.cat = newCategoryCache();
-          state.hex = makeHexState();
-        }
+        setNotice("");
+        clearRemovedEvidenceViewState(id);
         const message = "Removed evidence " + data.evidence_id + " and " + data.removed_entries + " indexed entries.";
         await refresh();
         setNotice(message);
@@ -6920,16 +7488,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.analyzeHistory.applying = true;
       try {
         if (location.treeMode === "live") {
+          const expectedEvidence = state.data && state.data.evidence.find((item) => item.id === location.evidenceId);
+          if (!expectedEvidence) {
+            return;
+          }
+          state.browserState = {
+            evidenceId: location.evidenceId,
+            selectedPath: normalizeLogicalPath(location.selectedPath || "/"),
+            treeMode: "filesystem",
+            selectedCategory: ""
+          };
           if (!(state.live.active && state.live.evidenceId === location.evidenceId)) {
+            const initialLiveState = state.live;
             const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: location.evidenceId });
+            if (state.live !== initialLiveState
+              || Number(state.browserState.evidenceId) !== Number(location.evidenceId)
+              || !selectedEvidenceIdentityMatches(expectedEvidence)) {
+              return;
+            }
             state.live = { active: true, evidenceId: location.evidenceId, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
           }
+          const liveState = state.live;
           const path = normalizeLogicalPath(location.selectedPath || "/");
           try {
-            await liveLoadDir(location.liveVolume, path);
+            const entries = await liveLoadDir(location.liveVolume, path);
+            if (entries === null || state.live !== liveState) {
+              return;
+            }
             state.live.selKey = liveKey(location.liveVolume, path);
             state.live.expanded.add(state.live.selKey);
           } catch (err) {
+            if (state.live !== liveState) {
+              return;
+            }
             setNotice(err.message, true);
           }
         } else {
@@ -7012,6 +7603,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
             read_file_system: true,
             notes: "Promoted from " + evidence.display_name + " " + entry.logical_path
           });
+          setNotice("");
           await refresh();
           imageEvidence = state.data.evidence.find((item) => item.id === attached.evidence_id);
         }
@@ -7027,8 +7619,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
         });
         const message = "Analyzed image " + imageEvidence.display_name + ": " + processed.entries_indexed + " entries (" + processed.status + ")." + processingExtrasSummary(processed);
         await refresh();
+        if (!state.data || !state.data.evidence.some((item) => item.id === imageEvidence.id)) {
+          setNotice("");
+          return;
+        }
         if (state.live.evidenceId === imageEvidence.id) {
-          state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+          state.live = newLiveBrowseState();
         }
         selectEvidenceSource(imageEvidence.id, preferredAnalysisPath(imageEvidence.id), "filesystem");
         setNotice(message);
@@ -7050,7 +7646,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
           max_visits: nonNegativeNumberValue("historyMaxVisits", 0)
         });
         const message = "Imported browser activities: " + data.entries_indexed + " records (" + data.status + ").";
+        setNotice("");
         await refresh();
+        if (!state.data || !state.data.evidence.some((item) => item.id === data.evidence_id)) {
+          setNotice("");
+          return;
+        }
         selectEvidenceSource(data.evidence_id, data.visits_indexed > 0 ? "/Browser Activities/Visits" : "/Browser Activities");
         setNotice(withPathCorrectionNotice(message, historyPath));
       } catch (err) {
@@ -7060,6 +7661,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function selectEvidenceSource(id, selectedPath = "/", treeMode = null, recordNavigation = true) {
       const previous = currentAnalyzeLocation();
+      if (state.live.active && state.live.evidenceId !== id) {
+        state.live = newLiveBrowseState();
+        setCurrentLiveGrid("", []);
+      }
       state.browserState = {
         evidenceId: id,
         selectedPath: normalizeLogicalPath(selectedPath),
@@ -9006,23 +9611,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const previous = currentAnalyzeLocation();
+      const initialLiveState = state.live;
+      let openedLiveState = null;
       setNotice(evidence.source_kind === "image"
         ? "Reading volumes from " + evidence.display_name + "..."
         : "Opening live view for " + evidence.display_name + "...");
       try {
         const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: evidence.id });
-        state.live = { active: true, evidenceId: evidence.id, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
-        const first = state.live.volumes.find((volume) => volume.browsable);
+        if (state.live !== initialLiveState || !selectedEvidenceIdentityMatches(evidence)) {
+          return;
+        }
+        openedLiveState = { active: true, evidenceId: evidence.id, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+        state.live = openedLiveState;
+        const first = openedLiveState.volumes.find((volume) => volume.browsable);
         if (first) {
-          await liveLoadDir(first.index, "/");
-          state.live.expanded.add(liveKey(first.index, "/"));
-          state.live.selKey = liveKey(first.index, "/");
+          const entries = await liveLoadDir(first.index, "/");
+          if (entries === null || state.live !== openedLiveState) {
+            return;
+          }
+          openedLiveState.expanded.add(liveKey(first.index, "/"));
+          openedLiveState.selKey = liveKey(first.index, "/");
         }
         renderEvidenceBrowserEntries();
+        if (state.live !== openedLiveState || !selectedEvidenceIdentityMatches(evidence)) {
+          return;
+        }
         setNotice(liveBrowseReadyNotice(evidence));
         commitAnalyzeNavigation(previous);
       } catch (err) {
-        state.live.active = false;
+        if (!selectedEvidenceIdentityMatches(evidence)
+          || (state.live !== initialLiveState && state.live !== openedLiveState)) {
+          return;
+        }
+        state.live = newLiveBrowseState();
         setNotice(err.message, true);
         // Fall back to the attached-source placeholder (matters when live
         // browse was auto-started for an un-indexed image).
@@ -9032,11 +9653,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function liveLoadDir(volume, path) {
       const key = liveKey(volume, path);
-      if (!state.live.dirCache[key]) {
-        const data = await apiGet("/api/image/dir", { case_path: currentCasePath(), evidence_id: state.live.evidenceId, volume: volume, path: path });
-        state.live.dirCache[key] = data.entries || [];
+      const liveState = state.live;
+      const evidenceId = liveState.evidenceId;
+      if (!liveState.dirCache[key]) {
+        const data = await apiGet("/api/image/dir", { case_path: currentCasePath(), evidence_id: evidenceId, volume: volume, path: path });
+        if (state.live !== liveState || state.live.evidenceId !== evidenceId) {
+          return null;
+        }
+        liveState.dirCache[key] = data.entries || [];
       }
-      return state.live.dirCache[key];
+      return liveState.dirCache[key];
     }
 
     async function liveToggleDir(volume, path) {
@@ -9044,7 +9670,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (state.live.expanded.has(key)) {
         state.live.expanded.delete(key);
       } else {
-        try { await liveLoadDir(volume, path); } catch (err) { setNotice(err.message, true); return; }
+        const liveState = state.live;
+        try {
+          const entries = await liveLoadDir(volume, path);
+          if (entries === null || state.live !== liveState) { return; }
+        } catch (err) {
+          if (state.live !== liveState) { return; }
+          setNotice(err.message, true);
+          return;
+        }
         state.live.expanded.add(key);
       }
       renderLiveBrowse();
@@ -9052,7 +9686,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function liveSelectDir(volume, path, recordNavigation = true) {
       const previous = currentAnalyzeLocation();
-      try { await liveLoadDir(volume, path); } catch (err) { setNotice(err.message, true); return; }
+      const liveState = state.live;
+      try {
+        const entries = await liveLoadDir(volume, path);
+        if (entries === null || state.live !== liveState) { return; }
+      } catch (err) {
+        if (state.live !== liveState) { return; }
+        setNotice(err.message, true);
+        return;
+      }
       state.live.selKey = liveKey(volume, path);
       state.live.expanded.add(state.live.selKey);
       renderLiveBrowse();
@@ -10037,22 +10679,35 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // on demand from the case database (/api/entries/dir). Same data as the
     // normal indexed tree, but never loads more than one folder at a time.
     async function idxLoadDir(path) {
-      if (!state.idx.dirCache[path]) {
+      const idxState = state.idx;
+      const evidenceId = idxState.evidenceId;
+      if (!idxState.dirCache[path]) {
         const data = await apiGet("/api/entries/dir", {
           case_path: currentCasePath(),
-          evidence_id: state.idx.evidenceId,
+          evidence_id: evidenceId,
           path: path
         });
-        state.idx.dirCache[path] = data.children || [];
+        if (state.idx !== idxState || state.idx.evidenceId !== evidenceId) {
+          return null;
+        }
+        idxState.dirCache[path] = data.children || [];
       }
-      return state.idx.dirCache[path];
+      return idxState.dirCache[path];
     }
 
     async function idxToggleDir(path) {
       if (state.idx.expanded.has(path)) {
         state.idx.expanded.delete(path);
       } else {
-        try { await idxLoadDir(path); } catch (err) { setNotice(err.message, true); return; }
+        const idxState = state.idx;
+        try {
+          const children = await idxLoadDir(path);
+          if (children === null || state.idx !== idxState) { return; }
+        } catch (err) {
+          if (state.idx !== idxState) { return; }
+          setNotice(err.message, true);
+          return;
+        }
         state.idx.expanded.add(path);
       }
       renderIndexedBrowse();
@@ -10060,7 +10715,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function idxSelectDir(path, recordNavigation = true) {
       const previous = currentAnalyzeLocation();
-      try { await idxLoadDir(path); } catch (err) { setNotice(err.message, true); return; }
+      const idxState = state.idx;
+      try {
+        const children = await idxLoadDir(path);
+        if (children === null || state.idx !== idxState) { return; }
+      } catch (err) {
+        if (state.idx !== idxState) { return; }
+        setNotice(err.message, true);
+        return;
+      }
       state.idx.selPath = path;
       state.browserState.treeMode = "filesystem";
       state.browserState.selectedPath = normalizeLogicalPath(path || "/");
@@ -10078,7 +10741,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // opens down to the selection. The synthetic containers are collapsed
     // out of the tree, so they are skipped rather than loaded.
     async function idxRestorePath(path) {
-      await idxLoadDir("/");
+      const idxState = state.idx;
+      const root = await idxLoadDir("/");
+      if (root === null || state.idx !== idxState) {
+        return;
+      }
       const target = normalizeLogicalPath(path || "/");
       if (target === "/") {
         return;
@@ -10092,7 +10759,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           continue;
         }
         try {
-          await idxLoadDir(current);
+          const children = await idxLoadDir(current);
+          if (children === null || state.idx !== idxState) {
+            return;
+          }
         } catch (err) {
           return;
         }
@@ -10255,6 +10925,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderEvidenceBrowserEntries() {
+      reconcileAnalyzeEvidenceState();
       if (state.live.active) {
         renderLiveBrowse();
         renderHexViewer();
