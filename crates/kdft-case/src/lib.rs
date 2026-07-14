@@ -2442,7 +2442,13 @@ pub fn analyze_signatures(
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![case_id, options.evidence_id, (max_entries + 1) as i64],
+            // saturating_add keeps 0/unlimited (usize::MAX) from overflowing; usize::MAX
+            // as i64 is -1, which SQLite LIMIT treats as no limit.
+            params![
+                case_id,
+                options.evidence_id,
+                max_entries.saturating_add(1) as i64
+            ],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,

@@ -17,7 +17,7 @@ use kdft_case::{
     BookmarkType, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
     CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
     ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
-    RecoverEntryOptions, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT,
+    RecoverEntryOptions,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -642,16 +642,13 @@ struct TimelineEntriesResponse {
 /// client-side state.
 const TIMELINE_DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// Shared "0 means no limit" resolution for operations that only read/write
-/// the already-indexed case database (recursive bookmarking, Timeline
-/// building) - these do not touch or copy the evidence itself, so unlike
-/// evidence processing there is no real safety reason to force a ceiling.
-/// `None` (examiner didn't specify anything) still gets a sane default.
-fn resolve_unlimited_max_entries(requested: Option<usize>, default: usize) -> usize {
+/// Shared "0 means no limit" resolution. NO ARBITRARY LIMITS (Cristina,
+/// 2026-07-14): omitting max_entries means unlimited - operations cover the
+/// whole selected scope. Callers that want a bound must send one explicitly.
+fn resolve_unlimited_max_entries(requested: Option<usize>) -> usize {
     match requested {
-        Some(0) => usize::MAX,
+        Some(0) | None => usize::MAX,
         Some(value) => value,
-        None => default,
     }
 }
 
@@ -1811,11 +1808,10 @@ fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
         &case_path,
         ProcessEvidenceOptions {
             evidence_id: request.evidence_id,
-            // A caller may still explicitly opt into unlimited by sending max_entries: 0
-            // (kdft-case treats 0 as unlimited) - but OMITTING the field must never silently mean
-            // unlimited, since a one-click "process now" against a multi-hundred-GB image with no
-            // cap can exhaust disk space in seconds. Matches the kdft-cli default of 5000.
-            max_entries: request.max_entries.unwrap_or(5000),
+            // NO ARBITRARY LIMITS (Cristina, 2026-07-14): omitting max_entries means
+            // unlimited (kdft-case treats 0 as no cap). Processing covers the whole
+            // selected evidence; a caller that wants a bound must send one explicitly.
+            max_entries: request.max_entries.unwrap_or(0),
         },
         kdft_case::ProcessingProfile {
             capture_content: request.capture_content.unwrap_or(true),
@@ -1848,7 +1844,9 @@ fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
                 &case_path,
                 AnalyzeSignaturesOptions {
                     evidence_id: Some(request.evidence_id),
-                    max_entries: 100_000,
+                    // NO ARBITRARY LIMITS: the signature pass covers every indexed
+                    // entry of the evidence (0 = unlimited).
+                    max_entries: 0,
                 },
             ) {
                 Ok(result) => serde_json::to_value(result)?,
@@ -2007,7 +2005,8 @@ fn api_analyze_signatures(body: &[u8]) -> Result<kdft_case::AnalyzeSignaturesRes
         &case_path,
         AnalyzeSignaturesOptions {
             evidence_id: request.evidence_id,
-            max_entries: request.max_entries.unwrap_or(100_000),
+            // NO ARBITRARY LIMITS: omitted max_entries means unlimited (0 = no cap).
+            max_entries: request.max_entries.unwrap_or(0),
         },
     )
 }
@@ -2592,8 +2591,7 @@ fn api_bookmark_folder_recursive_indexed(
 ) -> Result<kdft_case::RecursiveBookmarkResult> {
     let request: BookmarkFolderRecursiveIndexedRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    let max_entries =
-        resolve_unlimited_max_entries(request.max_entries, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT);
+    let max_entries = resolve_unlimited_max_entries(request.max_entries);
     let folder_name = request
         .folder_name
         .as_deref()
@@ -2633,8 +2631,7 @@ fn api_bookmark_folder_recursive_indexed(
 fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::RecursiveBookmarkResult> {
     let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    let max_entries =
-        resolve_unlimited_max_entries(request.max_entries, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT);
+    let max_entries = resolve_unlimited_max_entries(request.max_entries);
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     let (volume_name, filesystem, listing) = match source.source_kind.as_str() {
         "image" => {
@@ -5788,8 +5785,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button id="browseEvidence" class="secondary">Browse&hellip;</button>
               </div>
               <div class="row" id="fsOptionsRow">
-                <label>Read File System<select id="readFileSystem"><option value="true">yes &mdash; index now (bounded)</option><option value="false">no &mdash; attach only</option></select></label>
-                <label>Processing limit<input id="processMaxEntries" type="number" min="0" value="5000" title="Entries to index when processing. 0 = unlimited - only use this deliberately on large images; unbounded indexing writes real data into the case database and can consume a lot of disk space. Applies to Add Evidence (process now), the Process button, and Analyze image."></label>
+                <label>Read File System<select id="readFileSystem"><option value="true">yes &mdash; index now</option><option value="false">no &mdash; attach only</option></select></label>
               </div>
               <details id="processingOptions" class="processing-options">
                 <summary class="muted tiny">Processing options (applies to every Process / Analyze run)</summary>
@@ -6052,29 +6048,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     const PAGE_PARAMS = new URLSearchParams(window.location.search);
     const ANALYSIS_MODE = PAGE_PARAMS.get("mode") === "analysis";
     const REQUESTED_EVIDENCE_ID = Number(PAGE_PARAMS.get("evidence_id") || "");
-    // "process now" / one-click processing must stay bounded by default - the backend treats
-    // max_entries: 0 as UNLIMITED, which previously let one click walk an entire multi-hundred-GB
-    // image with no cap. Matches the kdft-cli default (`evidence process --max-entries`, default
-    // 5000). The examiner can raise this (including to 0/unlimited) via the "Processing limit"
-    // input in the Add Evidence panel - currentProcessMaxEntries() reads that value, persisted in
-    // localStorage, with an explicit confirmation gate before ever sending 0/unlimited.
-    const DEFAULT_PROCESS_MAX_ENTRIES = 5000;
-
+    // NO ARBITRARY LIMITS (Cristina, 2026-07-13/14): processing always indexes
+    // the whole selected evidence. The former "Processing limit" input and its
+    // unlimited-confirmation gate are gone; the helper stays for its call
+    // sites and always reports "unlimited" (backend treats 0 as no cap).
     function currentProcessMaxEntries() {
-      const input = $("processMaxEntries");
-      const raw = input ? Number(input.value) : NaN;
-      const value = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_PROCESS_MAX_ENTRIES;
-      if (value === 0) {
-        const confirmed = window.confirm(
-          "Processing limit is set to 0 (unlimited). This indexes every entry with no cap - on a " +
-          "large image this can write a large amount of data into the case database and use a lot " +
-          "of disk space. Continue with no limit?"
-        );
-        if (!confirmed) {
-          return DEFAULT_PROCESS_MAX_ENTRIES;
-        }
-      }
-      return value;
+      return 0;
     }
 
     // Recursive folder bookmarking (right-click a folder -> "Bookmark folder
@@ -6652,8 +6631,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     // Examiner-selected processing options (professional-suite style), sent
-    // with every Process / Analyze run. Checkbox state persists like the
-    // processing limit so a chosen profile sticks across sessions.
+    // with every Process / Analyze run. Checkbox state persists in
+    // localStorage so a chosen profile sticks across sessions.
     const PROCESSING_OPTION_CHECKBOXES = ["optCaptureContent", "optParseEmails", "optRunHash", "optRunFileHash", "optRunSignatures", "optRunCarve", "optRunBrowserParse"];
 
     function processingOptionsPayload() {
@@ -16038,15 +16017,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("casePath").value = normalizePathInput(state.casePath);
     $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
-    const storedMaxEntries = localStorage.getItem("kdft.processMaxEntries");
-    if (storedMaxEntries !== null && Number.isFinite(Number(storedMaxEntries))) {
-      $("processMaxEntries").value = storedMaxEntries;
-    }
-    $("processMaxEntries").addEventListener("change", () => {
-      const value = Math.max(0, Math.floor(Number($("processMaxEntries").value) || 0));
-      $("processMaxEntries").value = value;
-      localStorage.setItem("kdft.processMaxEntries", String(value));
-    });
+    // Clear any persisted processing cap from the removed "Processing limit" input.
+    localStorage.removeItem("kdft.processMaxEntries");
     PROCESSING_OPTION_CHECKBOXES.forEach((id) => {
       const stored = localStorage.getItem("kdft." + id);
       if (stored !== null) {

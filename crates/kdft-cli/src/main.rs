@@ -127,7 +127,9 @@ struct ProcessEvidenceArgs {
     case: PathBuf,
     #[arg(long)]
     evidence_id: i64,
-    #[arg(long, default_value_t = 5000)]
+    /// Maximum entries to index; 0 (the default) means unlimited - the whole
+    /// selected evidence is processed.
+    #[arg(long, default_value_t = 0)]
     max_entries: usize,
     /// Skip every per-file content read (fast metadata-only index). Content
     /// search stays unavailable for this evidence until re-processed.
@@ -146,7 +148,8 @@ struct SignatureAnalysisArgs {
     case: PathBuf,
     #[arg(long)]
     evidence_id: Option<i64>,
-    #[arg(long, default_value_t = 100000)]
+    /// Maximum entries to analyze; 0 (the default) means unlimited.
+    #[arg(long, default_value_t = 0)]
     max_entries: usize,
     #[arg(long)]
     json: bool,
