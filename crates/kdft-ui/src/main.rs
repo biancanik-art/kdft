@@ -5971,9 +5971,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <label>Category scope<input id="searchCategory" placeholder="e.g. Email, Pictures, Recovery"></label>
                 <label>File types<input id="searchFileTypes" placeholder="jpg,png,zip"></label>
               </div>
-              <div id="bitwiseControls" class="row" hidden>
-                <label>Bitwise scan limit (bytes, per source)<input id="rawSearchMaxScanBytes" type="number" min="0" step="1" value="536870912" title="0 scans the entire evidence source with no limit - can take a long time on a large image. The default (512 MB) keeps the bitwise pass fast; raise it or set 0 for full coverage."></label>
-              </div>
               <p class="muted tiny">Prefix the query with <strong>hex:</strong> for a byte-pattern search (e.g. hex:FF D8 FF); hits report byte offsets. Category/file-type scopes and Max file bytes apply to the indexed pass. <strong>All</strong> mode additionally scans the selected evidence (or every image/file source when "All evidence" is chosen) byte-for-byte, covering allocated files, unallocated space, and file slack, in ASCII and UTF-16, reporting the absolute byte offset of each hit; the bitwise pass reads real evidence I/O so it is bounded by the scan limit above by default.</p>
               <button id="runSearch">Run Search</button>
             </div>
@@ -7984,7 +7981,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const maxResults = boundedNumberValue("maxResults", 50, 1, 1000);
-      const maxScanBytes = boundedNumberValue("rawSearchMaxScanBytes", 536870912, 0, Number.MAX_SAFE_INTEGER);
+      // NO ARBITRARY LIMITS: the bitwise pass always scans the entire selected
+      // evidence (0 = unlimited); the former scan-limit input is gone.
+      const maxScanBytes = 0;
       state.rawSearchRunning = true;
       renderRawSearchResults();
       const status = $("rawSearchStatus");

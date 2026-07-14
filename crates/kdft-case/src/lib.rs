@@ -1732,8 +1732,6 @@ pub fn find_browser_profile_candidates(
     Ok(candidates)
 }
 
-const CARVE_DEFAULT_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
-const CARVE_DEFAULT_MAX_FILES: usize = 1000;
 const CARVE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const CARVE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -21467,10 +21465,11 @@ fn content_search_results(
     scope: &SearchScope,
     results: &mut Vec<DeepSearchResult>,
 ) -> Result<()> {
-    const CONTENT_SEARCH_MAX_FILES: usize = 100_000;
     // Content Deep Search is an index lookup over the first CONTENT_INDEX_BYTES of each processed
     // non-media file. Matches beyond that window, media files, and entries from existing cases that
     // have not been reprocessed are not indexed and therefore keep content_head NULL.
+    // NO ARBITRARY LIMITS: every indexed file in scope is examined; rows stream
+    // off the cursor so memory stays bounded regardless of case size.
     let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
                 fe.content_head, fe.metadata_json
@@ -21478,24 +21477,20 @@ fn content_search_results(
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
            AND fe.entry_kind = 'file'{}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id
-         LIMIT ?3",
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
         scope.sql_clause
     ))?;
-    let rows = stmt.query_map(
-        params![case_id, evidence_id, CONTENT_SEARCH_MAX_FILES as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
     for row in rows {
         if results.len() >= max_results {
             break;
@@ -21547,7 +21542,8 @@ fn content_hex_search_results(
     scope: &SearchScope,
     results: &mut Vec<DeepSearchResult>,
 ) -> Result<()> {
-    const CONTENT_SEARCH_MAX_FILES: usize = 100_000;
+    // NO ARBITRARY LIMITS: every content-indexed file in scope is examined;
+    // rows stream off the cursor so memory stays bounded regardless of case size.
     let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
                 fe.content_head, fe.metadata_json
@@ -21556,24 +21552,20 @@ fn content_hex_search_results(
            AND (?2 IS NULL OR fe.evidence_id = ?2)
            AND fe.entry_kind = 'file'
            AND fe.content_head IS NOT NULL{}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id
-         LIMIT ?3",
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
         scope.sql_clause
     ))?;
-    let rows = stmt.query_map(
-        params![case_id, evidence_id, CONTENT_SEARCH_MAX_FILES as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
     for row in rows {
         if results.len() >= max_results {
             break;
