@@ -2654,6 +2654,8 @@ fn persist_browser_history_import(
         + import_data.preference_records.len()
         + import_data.url_records.len()
         + import_data.search_records.len()
+        + import_data.omnibox_records.len()
+        + import_data.autofill_records.len()
         + import_data.download_records.len()
         + import_data.login_records.len()
         + import_data.cookie_records.len();
@@ -2692,6 +2694,8 @@ fn persist_browser_history_import(
         .chain(import_data.preference_records.iter())
         .chain(import_data.url_records.iter())
         .chain(import_data.search_records.iter())
+        .chain(import_data.omnibox_records.iter())
+        .chain(import_data.autofill_records.iter())
         .chain(import_data.download_records.iter())
         .chain(import_data.login_records.iter())
         .chain(import_data.cookie_records.iter())
@@ -2813,6 +2817,7 @@ fn persist_browser_artifacts_into_evidence(
         case_id,
         options.evidence_id,
         &options.source_profile_path,
+        options.volume_index_zero_based,
     )?;
     let mut parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)
         .context("parsing browser import job parameters")?;
@@ -2942,7 +2947,7 @@ fn browser_profile_derivation_key(
     let normalized = source_profile_path
         .replace('\\', "/")
         .trim_matches('/')
-        .to_ascii_lowercase();
+        .to_string();
     format!(
         "browser-profile:v1:{}:{normalized}",
         volume_index_zero_based
@@ -4068,6 +4073,7 @@ const TIMELINE_TIME_FIELD_KEYS: &[&str] = &[
     "email_date",
     "visit_time_utc",
     "last_visit_time_utc",
+    "last_access_time_utc",
     "first_used_utc",
     "last_used_utc",
     "date_added_utc",
@@ -4319,6 +4325,8 @@ fn browser_history_source_filename(family: &str, artifact_kind: &str) -> Option<
         ("chromium", "browser_login") => Some("Login Data"),
         ("chromium", "browser_cookie") => Some("Cookies"),
         ("chromium", "browser_preference") => Some("Preferences"),
+        ("chromium", "browser_omnibox_shortcut") => Some("Shortcuts"),
+        ("chromium", "browser_autofill") => Some("Web Data"),
         ("safari", _) => Some("History.db"),
         _ => None,
     }
@@ -6266,6 +6274,8 @@ struct ChromiumProfilePaths {
     history_path: PathBuf,
     bookmarks_path: PathBuf,
     preferences_path: PathBuf,
+    shortcuts_path: PathBuf,
+    web_data_path: PathBuf,
 }
 
 struct FirefoxProfilePaths {
@@ -6318,6 +6328,8 @@ struct BrowserHistoryImportData {
     preference_records: Vec<BrowserActivityRecord>,
     url_records: Vec<BrowserActivityRecord>,
     search_records: Vec<BrowserActivityRecord>,
+    omnibox_records: Vec<BrowserActivityRecord>,
+    autofill_records: Vec<BrowserActivityRecord>,
     download_records: Vec<BrowserActivityRecord>,
     login_records: Vec<BrowserActivityRecord>,
     cookie_records: Vec<BrowserActivityRecord>,
@@ -6352,6 +6364,13 @@ struct ChromiumHistoryRow {
     transition: Option<i64>,
     visit_duration: Option<i64>,
     hidden: Option<i64>,
+    from_visit_id: Option<i64>,
+    referrer_url: Option<String>,
+    referrer_visit_time: Option<i64>,
+    opener_visit_id: Option<i64>,
+    opener_url: Option<String>,
+    external_referrer_url: Option<String>,
+    visit_source: Option<i64>,
 }
 
 impl ChromiumHistoryRow {
@@ -6373,6 +6392,31 @@ impl ChromiumHistoryRow {
             host, self.visit_time, self.visit_id
         )
     }
+}
+
+struct ChromiumDownloadRow {
+    id: i64,
+    current_path: Option<String>,
+    target_path: Option<String>,
+    full_path: Option<String>,
+    legacy_url: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    received_bytes: Option<i64>,
+    total_bytes: Option<i64>,
+    state: Option<i64>,
+    danger_type: Option<i64>,
+    interrupt_reason: Option<i64>,
+    referrer: Option<String>,
+    tab_url: Option<String>,
+    mime_type: Option<String>,
+    guid: Option<String>,
+    site_url: Option<String>,
+    tab_referrer_url: Option<String>,
+    original_mime_type: Option<String>,
+    last_access_time: Option<i64>,
+    opened: Option<i64>,
+    hash_hex: Option<String>,
 }
 
 #[derive(Default)]
@@ -6708,14 +6752,42 @@ fn read_chromium_history_rows(
             |row| row.get(0),
         )
         .context("counting Chromium history visits")?;
-    let mut stmt = conn.prepare(
-        "SELECT v.id, v.url, u.url, u.title, v.visit_time, u.last_visit_time,
-                u.visit_count, u.typed_count, v.transition, v.visit_duration, u.hidden
+    let last_visit_time = sql_column_or_null(&conn, "urls", "u.", "last_visit_time")?;
+    let visit_count = sql_column_or_null(&conn, "urls", "u.", "visit_count")?;
+    let typed_count = sql_column_or_null(&conn, "urls", "u.", "typed_count")?;
+    let transition = sql_column_or_null(&conn, "visits", "v.", "transition")?;
+    let visit_duration = sql_column_or_null(&conn, "visits", "v.", "visit_duration")?;
+    let hidden = sql_column_or_null(&conn, "urls", "u.", "hidden")?;
+    let from_visit = sql_column_or_null(&conn, "visits", "v.", "from_visit")?;
+    let opener_visit = sql_column_or_null(&conn, "visits", "v.", "opener_visit")?;
+    let external_referrer_url = sql_column_or_null(&conn, "visits", "v.", "external_referrer_url")?;
+    let (visit_source, visit_source_join) = if sqlite_table_exists(&conn, "visit_source")? {
+        (
+            sql_column_or_null(&conn, "visit_source", "vs.", "source")?,
+            "LEFT JOIN visit_source vs ON vs.id = v.id",
+        )
+    } else {
+        ("NULL".to_string(), "")
+    };
+    // Resolve referrer and opener rows before applying LIMIT. A capped import
+    // can therefore still explain a retained visit whose predecessor is older
+    // than the cap instead of presenting a broken navigation chain.
+    let sql = format!(
+        "SELECT v.id, v.url, u.url, u.title, v.visit_time, {last_visit_time},
+                {visit_count}, {typed_count}, {transition}, {visit_duration}, {hidden},
+                {from_visit}, ref_url.url, ref_visit.visit_time,
+                {opener_visit}, opener_url.url, {external_referrer_url}, {visit_source}
          FROM visits v
          JOIN urls u ON u.id = v.url
+         LEFT JOIN visits ref_visit ON ref_visit.id = {from_visit}
+         LEFT JOIN urls ref_url ON ref_url.id = ref_visit.url
+         LEFT JOIN visits opener ON opener.id = {opener_visit}
+         LEFT JOIN urls opener_url ON opener_url.id = opener.url
+         {visit_source_join}
          ORDER BY v.visit_time DESC, v.id DESC
-         LIMIT ?1",
-    )?;
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_visits)], |row| {
         Ok(ChromiumHistoryRow {
             visit_id: row.get(0)?,
@@ -6729,6 +6801,13 @@ fn read_chromium_history_rows(
             transition: row.get(8)?,
             visit_duration: row.get(9)?,
             hidden: row.get(10)?,
+            from_visit_id: nonzero_optional_i64(row.get(11)?),
+            referrer_url: row.get(12)?,
+            referrer_visit_time: row.get(13)?,
+            opener_visit_id: nonzero_optional_i64(row.get(14)?),
+            opener_url: row.get(15)?,
+            external_referrer_url: row.get(16)?,
+            visit_source: row.get(17)?,
         })
     })?;
     let rows = rows
@@ -6896,6 +6975,54 @@ fn reader_records_or_disclosed_error(
     }
 }
 
+fn chromium_browser_brand(profile_path: &str) -> Option<&'static str> {
+    let normalized = profile_path.replace('\\', "/").to_ascii_lowercase();
+    if normalized.contains("google/chrome") {
+        Some("chrome")
+    } else if normalized.contains("microsoft/edge") {
+        Some("edge")
+    } else if normalized.contains("bravesoftware") {
+        Some("brave")
+    } else if normalized.contains("opera") {
+        Some("opera")
+    } else if normalized.contains("chromium") {
+        Some("chromium")
+    } else {
+        None
+    }
+}
+
+fn apply_chromium_browser_brand(
+    import_data: &mut BrowserHistoryImportData,
+    profile_path: &str,
+) -> Result<()> {
+    let browser_brand = chromium_browser_brand(profile_path);
+    for record in import_data
+        .visit_records
+        .iter_mut()
+        .chain(import_data.bookmark_records.iter_mut())
+        .chain(import_data.preference_records.iter_mut())
+        .chain(import_data.url_records.iter_mut())
+        .chain(import_data.search_records.iter_mut())
+        .chain(import_data.omnibox_records.iter_mut())
+        .chain(import_data.autofill_records.iter_mut())
+        .chain(import_data.download_records.iter_mut())
+        .chain(import_data.login_records.iter_mut())
+        .chain(import_data.cookie_records.iter_mut())
+    {
+        let mut metadata: serde_json::Value = serde_json::from_str(&record.metadata_json)
+            .with_context(|| format!("parsing Chromium record {}", record.logical_path))?;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "browser_brand".to_string(),
+                serde_json::json!(browser_brand),
+            );
+        }
+        record.metadata_json = metadata.to_string();
+    }
+    Ok(())
+}
+
 fn collect_chromium_history_import(
     input_path: &Path,
     max_visits: usize,
@@ -6931,6 +7058,16 @@ fn collect_chromium_history_import(
         read_chromium_search_records_inner(&profile_paths.history_path, max_visits),
         &mut parse_errors,
     );
+    let omnibox_records = reader_records_or_disclosed_error(
+        "omnibox shortcuts",
+        read_chromium_omnibox_shortcut_records_inner(&profile_paths.shortcuts_path, max_visits),
+        &mut parse_errors,
+    );
+    let autofill_records = reader_records_or_disclosed_error(
+        "autofill",
+        read_chromium_autofill_records_inner(&profile_paths.web_data_path, max_visits),
+        &mut parse_errors,
+    );
     let download_records = reader_records_or_disclosed_error(
         "downloads",
         read_chromium_download_records_inner(&profile_paths.history_path, max_visits),
@@ -6954,11 +7091,13 @@ fn collect_chromium_history_import(
         "history_db": profile_paths.history_path.to_string_lossy(),
         "bookmarks_file": profile_paths.bookmarks_path.to_string_lossy(),
         "preferences_file": profile_paths.preferences_path.to_string_lossy(),
+        "shortcuts_file": profile_paths.shortcuts_path.to_string_lossy(),
+        "web_data_file": profile_paths.web_data_path.to_string_lossy(),
         "max_visits": history_limit_json(max_visits),
         "parse_errors": parse_errors
     })
     .to_string();
-    Ok(BrowserHistoryImportData {
+    let mut import_data = BrowserHistoryImportData {
         family: BrowserFamily::Chromium,
         source_path,
         primary_db_path: profile_paths.history_path.clone(),
@@ -6972,12 +7111,19 @@ fn collect_chromium_history_import(
         preference_records,
         url_records,
         search_records,
+        omnibox_records,
+        autofill_records,
         download_records,
         login_records,
         cookie_records,
         total_visits: history_rows.total_visits,
         parse_errors,
-    })
+    };
+    apply_chromium_browser_brand(
+        &mut import_data,
+        &profile_paths.profile_dir.to_string_lossy(),
+    )?;
+    Ok(import_data)
 }
 
 fn collect_firefox_history_import(
@@ -7059,6 +7205,8 @@ fn collect_firefox_history_import(
         preference_records,
         url_records,
         search_records,
+        omnibox_records: Vec::new(),
+        autofill_records: Vec::new(),
         download_records,
         login_records,
         cookie_records,
@@ -7112,6 +7260,8 @@ fn collect_safari_history_import(
         preference_records: Vec::new(),
         url_records,
         search_records: Vec::new(),
+        omnibox_records: Vec::new(),
+        autofill_records: Vec::new(),
         download_records: Vec::new(),
         login_records: Vec::new(),
         cookie_records: Vec::new(),
@@ -7165,7 +7315,7 @@ fn read_chromium_url_records_inner(
             "visit_count": visit_count,
             "typed_count": typed_count,
             "last_visit_time_chrome": last_visit_time,
-            "last_visit_time_utc": last_visit_time.and_then(chrome_time_to_rfc3339),
+            "last_visit_time_utc": optional_chrome_time_to_rfc3339(last_visit_time),
             "hidden": hidden.map(|value| value != 0),
         });
         merge_json_object(&mut metadata, &source_metadata);
@@ -7199,40 +7349,308 @@ fn read_chromium_search_records_inner(
     max_rows: usize,
 ) -> Result<Vec<BrowserActivityRecord>> {
     let (conn, _guard) = open_sqlite_copy_read_only(history_path)?;
+    if !sqlite_table_exists(&conn, "keyword_search_terms")? {
+        return Ok(Vec::new());
+    }
     let source_metadata = source_artifact_metadata(history_path, "History");
-    let mut stmt = conn.prepare(
-        "SELECT k.url_id, k.term, u.url, u.last_visit_time
+    let keyword_id = sql_column_or_null(&conn, "keyword_search_terms", "k.", "keyword_id")?;
+    let normalized_term =
+        sql_column_or_null(&conn, "keyword_search_terms", "k.", "normalized_term")?;
+    let lower_term = sql_column_or_null(&conn, "keyword_search_terms", "k.", "lower_term")?;
+    let sql = format!(
+        "SELECT {keyword_id}, k.url_id, k.term, {normalized_term}, {lower_term},
+                u.url, u.last_visit_time
          FROM keyword_search_terms k
          JOIN urls u ON u.id = k.url_id
-         ORDER BY u.last_visit_time DESC, k.url_id DESC LIMIT ?1",
-    )?;
+         ORDER BY u.last_visit_time DESC, k.url_id DESC, {keyword_id} DESC LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
-        let url_id: i64 = row.get(0)?;
-        let term: String = row.get(1)?;
-        let url: String = row.get(2)?;
-        let last_visit_time: Option<i64> = row.get(3)?;
-        Ok((url_id, term, url, last_visit_time))
+        let keyword_id: Option<i64> = row.get(0)?;
+        let url_id: i64 = row.get(1)?;
+        let term: String = row.get(2)?;
+        let normalized_term: Option<String> = row.get(3)?;
+        let lower_term: Option<String> = row.get(4)?;
+        let url: String = row.get(5)?;
+        let last_visit_time: Option<i64> = row.get(6)?;
+        Ok((
+            keyword_id,
+            url_id,
+            term,
+            normalized_term,
+            lower_term,
+            url,
+            last_visit_time,
+        ))
     })?;
     let mut records = Vec::new();
+    let mut used_paths = HashSet::new();
     for row in rows {
-        let (url_id, term, url, last_visit_time) = row?;
+        let (keyword_id, url_id, term, normalized_term, lower_term, url, last_visit_time) = row?;
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_search_term",
             "browser_family": "chromium",
+            "keyword_id": keyword_id,
             "url_id": url_id,
             "search_term": term,
+            "normalized_term": normalized_term,
+            "lower_term": lower_term,
             "url": url,
             "host": host_from_url(&url),
             "last_visit_time_chrome": last_visit_time,
-            "last_visit_time_utc": last_visit_time.and_then(chrome_time_to_rfc3339),
+            "last_visit_time_utc": optional_chrome_time_to_rfc3339(last_visit_time),
         });
         merge_json_object(&mut metadata, &source_metadata);
-        let logical_path = format!(
+        let base_logical_path = format!(
             "/Browser Activities/Searches/{}-{}.record",
             sanitize_logical_segment(term.chars().take(60).collect::<String>().as_str()),
             url_id
         );
+        let logical_path = if used_paths.insert(base_logical_path.clone()) {
+            base_logical_path
+        } else {
+            let disambiguated = format!(
+                "/Browser Activities/Searches/{}-{}-{}.record",
+                sanitize_logical_segment(term.chars().take(60).collect::<String>().as_str()),
+                keyword_id.unwrap_or_default(),
+                url_id
+            );
+            used_paths.insert(disambiguated.clone());
+            disambiguated
+        };
         let display_name: String = format!("Search: {term}").chars().take(180).collect();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+/// Exact omnibox text retained by Chromium's `Shortcuts` database.
+fn read_chromium_omnibox_shortcut_records_inner(
+    shortcuts_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    if !shortcuts_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let (conn, _guard) = open_sqlite_copy_read_only(shortcuts_path)?;
+    // Chromium's production table name is `omni_box_shortcuts`. Accept the
+    // compact spelling too because some downstream Chromium-family builds and
+    // older exported fixtures use it.
+    let table_name = if sqlite_table_exists(&conn, "omni_box_shortcuts")? {
+        "omni_box_shortcuts"
+    } else if sqlite_table_exists(&conn, "omnibox_shortcuts")? {
+        "omnibox_shortcuts"
+    } else {
+        return Ok(Vec::new());
+    };
+    let source_metadata = source_artifact_metadata(shortcuts_path, "Shortcuts");
+    let id = if sqlite_column_exists(&conn, table_name, "id")? {
+        "CAST(s.id AS TEXT)".to_string()
+    } else {
+        "CAST(s.rowid AS TEXT)".to_string()
+    };
+    let text = sql_column_or_null(&conn, table_name, "s.", "text")?;
+    let fill_into_edit = sql_column_or_null(&conn, table_name, "s.", "fill_into_edit")?;
+    let url = sql_column_or_null(&conn, table_name, "s.", "url")?;
+    let contents = sql_column_or_null(&conn, table_name, "s.", "contents")?;
+    let description = sql_column_or_null(&conn, table_name, "s.", "description")?;
+    let shortcut_type = sql_column_or_null(&conn, table_name, "s.", "type")?;
+    let keyword = sql_column_or_null(&conn, table_name, "s.", "keyword")?;
+    let last_access_time = sql_column_or_null(&conn, table_name, "s.", "last_access_time")?;
+    let number_of_hits = sql_column_or_null(&conn, table_name, "s.", "number_of_hits")?;
+    let sql = format!(
+        "SELECT {id}, {text}, {fill_into_edit}, {url}, {contents}, {description},
+                {shortcut_type}, {keyword}, {last_access_time}, {number_of_hits}
+         FROM {table_name} s
+         ORDER BY {last_access_time} DESC, {id} DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            id,
+            text,
+            fill_into_edit,
+            url,
+            contents,
+            description,
+            shortcut_type,
+            keyword,
+            last_access_time,
+            number_of_hits,
+        ) = row?;
+        let path_text = text.as_deref().unwrap_or("");
+        let display_text = text
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(url.as_deref())
+            .unwrap_or(&id);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_omnibox_shortcut",
+            "browser_family": "chromium",
+            "shortcut_id": id,
+            "id": id,
+            "text": text,
+            "fill_into_edit": fill_into_edit,
+            "url": url,
+            "contents": contents,
+            "description": description,
+            "type": shortcut_type,
+            "keyword": keyword,
+            "last_access_time_chrome": last_access_time,
+            "last_access_time_utc": optional_chrome_time_to_rfc3339(last_access_time),
+            "last_access_utc": optional_chrome_time_to_rfc3339(last_access_time),
+            "number_of_hits": number_of_hits,
+            "search_text": format!("{} {} {} {}", path_text, fill_into_edit.as_deref().unwrap_or(""), contents.as_deref().unwrap_or(""), description.as_deref().unwrap_or("")),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Omnibox/{}-{}.record",
+            sanitize_logical_segment(&id),
+            sanitize_logical_segment(&path_text.chars().take(60).collect::<String>())
+        );
+        let display_name: String = format!("Omnibox: {display_text}")
+            .chars()
+            .take(180)
+            .collect();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+/// Plain-text form entries from Chromium's `Web Data` database. Credit-card
+/// and encrypted tables are deliberately outside this reader.
+fn read_chromium_autofill_records_inner(
+    web_data_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    if !web_data_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let (conn, _guard) = open_sqlite_copy_read_only(web_data_path)?;
+    if !sqlite_table_exists(&conn, "autofill")? {
+        return Ok(Vec::new());
+    }
+    let source_metadata = source_artifact_metadata(web_data_path, "Web Data");
+    let name = sql_column_or_null(&conn, "autofill", "a.", "name")?;
+    let value = sql_column_or_null(&conn, "autofill", "a.", "value")?;
+    let has_count = sqlite_column_exists(&conn, "autofill", "count")?;
+    let has_date_created = sqlite_column_exists(&conn, "autofill", "date_created")?;
+    let has_date_last_used = sqlite_column_exists(&conn, "autofill", "date_last_used")?;
+    let has_legacy_dates = sqlite_column_exists(&conn, "autofill", "pair_id")?
+        && sqlite_table_exists(&conn, "autofill_dates")?
+        && sqlite_column_exists(&conn, "autofill_dates", "pair_id")?
+        && sqlite_column_exists(&conn, "autofill_dates", "date_created")?;
+    let legacy_join = if has_legacy_dates {
+        "LEFT JOIN (
+             SELECT pair_id, MIN(NULLIF(date_created, 0)) AS first_date,
+                    MAX(NULLIF(date_created, 0)) AS last_date,
+                    COUNT(NULLIF(date_created, 0)) AS use_count
+             FROM autofill_dates GROUP BY pair_id
+         ) ad ON ad.pair_id = a.pair_id"
+    } else {
+        ""
+    };
+    let date_created = if has_date_created {
+        "a.date_created"
+    } else if has_legacy_dates {
+        "ad.first_date"
+    } else {
+        "NULL"
+    };
+    let count = if has_count {
+        "a.count"
+    } else if has_legacy_dates {
+        "ad.use_count"
+    } else {
+        "NULL"
+    };
+    let date_last_used = if has_date_last_used {
+        "a.date_last_used"
+    } else if has_legacy_dates {
+        "ad.last_date"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT a.rowid, {name}, {value}, {count}, {date_created}, {date_last_used}
+         FROM autofill a
+         {legacy_join}
+         ORDER BY {date_last_used} DESC, a.rowid DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (rowid, name, value, count, date_created, date_last_used) = row?;
+        let date_created_utc = nonzero_optional_i64(date_created).and_then(unix_seconds_to_rfc3339);
+        let date_last_used_utc =
+            nonzero_optional_i64(date_last_used).and_then(unix_seconds_to_rfc3339);
+        let path_name = name.as_deref().unwrap_or("");
+        let display_field = name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unnamed field");
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_autofill",
+            "browser_family": "chromium",
+            "rowid": rowid,
+            "name": name,
+            "value": value,
+            "count": count,
+            "date_created": date_created,
+            "date_created_unix_seconds": date_created,
+            "date_created_utc": date_created_utc,
+            "date_last_used": date_last_used,
+            "date_last_used_unix_seconds": date_last_used,
+            "date_last_used_utc": date_last_used_utc,
+            "search_text": format!("{} {}", path_name, value.as_deref().unwrap_or("")),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Autofill/{}-{}.record",
+            rowid,
+            sanitize_logical_segment(&path_name.chars().take(60).collect::<String>())
+        );
+        let display_name: String = format!("Autofill: {display_field}")
+            .chars()
+            .take(180)
+            .collect();
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(BrowserActivityRecord {
             logical_path,
@@ -7250,62 +7668,108 @@ fn read_chromium_download_records_inner(
     max_rows: usize,
 ) -> Result<Vec<BrowserActivityRecord>> {
     let (conn, _guard) = open_sqlite_copy_read_only(history_path)?;
+    if !sqlite_table_exists(&conn, "downloads")? {
+        return Ok(Vec::new());
+    }
     let source_metadata = source_artifact_metadata(history_path, "History");
-    let mut stmt = conn.prepare(
-        "SELECT id, current_path, target_path, start_time, end_time, received_bytes,
-                total_bytes, state, danger_type, interrupt_reason, referrer, tab_url, mime_type
-         FROM downloads ORDER BY start_time DESC, id DESC LIMIT ?1",
-    )?;
+    let current_path = sql_column_or_null(&conn, "downloads", "d.", "current_path")?;
+    let target_path = sql_column_or_null(&conn, "downloads", "d.", "target_path")?;
+    let full_path = sql_column_or_null(&conn, "downloads", "d.", "full_path")?;
+    let legacy_url = sql_column_or_null(&conn, "downloads", "d.", "url")?;
+    let start_time = sql_column_or_null(&conn, "downloads", "d.", "start_time")?;
+    let end_time = sql_column_or_null(&conn, "downloads", "d.", "end_time")?;
+    let received_bytes = sql_column_or_null(&conn, "downloads", "d.", "received_bytes")?;
+    let total_bytes = sql_column_or_null(&conn, "downloads", "d.", "total_bytes")?;
+    let state = sql_column_or_null(&conn, "downloads", "d.", "state")?;
+    let danger_type = sql_column_or_null(&conn, "downloads", "d.", "danger_type")?;
+    let interrupt_reason = sql_column_or_null(&conn, "downloads", "d.", "interrupt_reason")?;
+    let referrer = sql_column_or_null(&conn, "downloads", "d.", "referrer")?;
+    let tab_url = sql_column_or_null(&conn, "downloads", "d.", "tab_url")?;
+    let mime_type = sql_column_or_null(&conn, "downloads", "d.", "mime_type")?;
+    let guid = sql_column_or_null(&conn, "downloads", "d.", "guid")?;
+    let site_url = sql_column_or_null(&conn, "downloads", "d.", "site_url")?;
+    let tab_referrer_url = sql_column_or_null(&conn, "downloads", "d.", "tab_referrer_url")?;
+    let original_mime_type = sql_column_or_null(&conn, "downloads", "d.", "original_mime_type")?;
+    let last_access_time = sql_column_or_null(&conn, "downloads", "d.", "last_access_time")?;
+    let opened = sql_column_or_null(&conn, "downloads", "d.", "opened")?;
+    let hash_hex = if sqlite_column_exists(&conn, "downloads", "hash")? {
+        "CASE WHEN d.hash IS NULL OR length(d.hash) = 0
+              THEN NULL ELSE lower(hex(d.hash)) END"
+            .to_string()
+    } else {
+        "NULL".to_string()
+    };
+    let sql = format!(
+        "SELECT d.id, {current_path}, {target_path}, {full_path}, {legacy_url},
+                {start_time}, {end_time}, {received_bytes}, {total_bytes}, {state},
+                {danger_type}, {interrupt_reason}, {referrer}, {tab_url}, {mime_type},
+                {guid}, {site_url}, {tab_referrer_url}, {original_mime_type},
+                {last_access_time}, {opened}, {hash_hex}
+         FROM downloads d
+         ORDER BY {start_time} DESC, d.id DESC LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
-        let id: i64 = row.get(0)?;
-        let current_path: Option<String> = row.get(1)?;
-        let target_path: Option<String> = row.get(2)?;
-        let start_time: Option<i64> = row.get(3)?;
-        let end_time: Option<i64> = row.get(4)?;
-        let received_bytes: Option<i64> = row.get(5)?;
-        let total_bytes: Option<i64> = row.get(6)?;
-        let state: Option<i64> = row.get(7)?;
-        let danger_type: Option<i64> = row.get(8)?;
-        let interrupt_reason: Option<i64> = row.get(9)?;
-        let referrer: Option<String> = row.get(10)?;
-        let tab_url: Option<String> = row.get(11)?;
-        let mime_type: Option<String> = row.get(12)?;
-        Ok((
-            id,
-            current_path,
-            target_path,
-            start_time,
-            end_time,
-            received_bytes,
-            total_bytes,
-            state,
-            danger_type,
-            interrupt_reason,
-            referrer,
-            tab_url,
-            mime_type,
-        ))
+        Ok(ChromiumDownloadRow {
+            id: row.get(0)?,
+            current_path: row.get(1)?,
+            target_path: row.get(2)?,
+            full_path: row.get(3)?,
+            legacy_url: row.get(4)?,
+            start_time: row.get(5)?,
+            end_time: row.get(6)?,
+            received_bytes: row.get(7)?,
+            total_bytes: row.get(8)?,
+            state: row.get(9)?,
+            danger_type: row.get(10)?,
+            interrupt_reason: row.get(11)?,
+            referrer: row.get(12)?,
+            tab_url: row.get(13)?,
+            mime_type: row.get(14)?,
+            guid: row.get(15)?,
+            site_url: row.get(16)?,
+            tab_referrer_url: row.get(17)?,
+            original_mime_type: row.get(18)?,
+            last_access_time: row.get(19)?,
+            opened: row.get(20)?,
+            hash_hex: row.get(21)?,
+        })
     })?;
+    let rows = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("reading Chromium downloads")?;
+    drop(stmt);
+
+    let mut chains: HashMap<i64, Vec<String>> = HashMap::new();
+    if sqlite_table_exists(&conn, "downloads_url_chains")? {
+        let mut chain_stmt = conn.prepare(
+            "SELECT url FROM downloads_url_chains
+             WHERE id = ?1 ORDER BY chain_index ASC",
+        )?;
+        for row in &rows {
+            let urls = chain_stmt.query_map(params![row.id], |chain_row| {
+                chain_row.get::<_, Option<String>>(0)
+            })?;
+            let urls = urls
+                .collect::<std::result::Result<Vec<Option<String>>, _>>()
+                .context("reading Chromium download URL chain")?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if !urls.is_empty() {
+                chains.insert(row.id, urls);
+            }
+        }
+    }
     let mut records = Vec::new();
     for row in rows {
-        let (
-            id,
-            current_path,
-            target_path,
-            start_time,
-            end_time,
-            received_bytes,
-            total_bytes,
-            state,
-            danger_type,
-            interrupt_reason,
-            referrer,
-            tab_url,
-            mime_type,
-        ) = row?;
-        let file_name = target_path
+        let id = row.id;
+        let effective_target_path = row.target_path.clone().or_else(|| row.full_path.clone());
+        let file_name = row
+            .target_path
             .as_deref()
-            .or(current_path.as_deref())
+            .or(row.current_path.as_deref())
+            .or(row.full_path.as_deref())
             .map(|value| {
                 value
                     .rsplit(['\\', '/'])
@@ -7315,26 +7779,103 @@ fn read_chromium_download_records_inner(
             })
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| format!("download-{id}"));
+        let url_chain = chains.remove(&id).unwrap_or_default();
+        let original_url = url_chain.first().cloned();
+        let download_url = url_chain.last().cloned().or_else(|| row.legacy_url.clone());
+        let duration_microseconds =
+            chromium_download_duration_microseconds(row.start_time, row.end_time);
+        let duration_seconds = duration_microseconds.map(|value| value as f64 / 1_000_000.0);
+        let duration_human = duration_microseconds.map(duration_human_from_microseconds);
+        let start_time_unix_seconds = row
+            .start_time
+            .filter(|value| chromium_download_time_is_unix_seconds(*value));
+        let end_time_unix_seconds = row
+            .end_time
+            .filter(|value| chromium_download_time_is_unix_seconds(*value));
+        let start_time_chrome = row
+            .start_time
+            .filter(|value| *value != 0 && !chromium_download_time_is_unix_seconds(*value));
+        let end_time_chrome = row
+            .end_time
+            .filter(|value| *value != 0 && !chromium_download_time_is_unix_seconds(*value));
+        let download_time_basis =
+            if start_time_unix_seconds.is_some() || end_time_unix_seconds.is_some() {
+                Some("unix_seconds_legacy")
+            } else if start_time_chrome.is_some() || end_time_chrome.is_some() {
+                Some("chrome_epoch_microseconds")
+            } else {
+                None
+            };
+        let percent_complete = row
+            .total_bytes
+            .filter(|value| *value > 0)
+            .and_then(|total| {
+                row.received_bytes
+                    .map(|received| received as f64 / total as f64 * 100.0)
+            });
+        let state_label = row.state.map(chromium_download_state_label);
+        let danger_type_label = row.danger_type.map(chromium_download_danger_type_label);
+        let interrupt_reason_label = row
+            .interrupt_reason
+            .map(chromium_download_interrupt_reason_label);
+        let outcome_summary = chromium_download_outcome_summary(
+            &row,
+            state_label.as_deref(),
+            interrupt_reason_label.as_deref(),
+            duration_human.as_deref(),
+            percent_complete,
+        );
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_download",
             "browser_family": "chromium",
             "download_id": id,
             "file_name": file_name,
-            "target_path": target_path,
-            "current_path": current_path,
-            "start_time_chrome": start_time,
-            "start_time_utc": start_time.and_then(chrome_time_to_rfc3339),
-            "end_time_chrome": end_time,
-            "end_time_utc": end_time.and_then(chrome_time_to_rfc3339),
-            "received_bytes": received_bytes,
-            "total_bytes": total_bytes,
-            "state": state,
-            "danger_type": danger_type,
-            "interrupt_reason": interrupt_reason,
-            "referrer": referrer,
-            "tab_url": tab_url,
-            "mime_type": mime_type,
+            "target_path": effective_target_path,
+            "current_path": row.current_path,
+            "full_path": row.full_path,
+            "url": row.legacy_url,
+            "start_time_raw": row.start_time,
+            "start_time_chrome": start_time_chrome,
+            "start_time_unix_seconds": start_time_unix_seconds,
+            "start_time_utc": chromium_download_time_to_rfc3339(row.start_time),
+            "end_time_raw": row.end_time,
+            "end_time_chrome": end_time_chrome,
+            "end_time_unix_seconds": end_time_unix_seconds,
+            "end_time_utc": chromium_download_time_to_rfc3339(row.end_time),
+            "download_time_basis": download_time_basis,
+            "last_access_time_chrome": row.last_access_time,
+            "last_access_time_utc": optional_chrome_time_to_rfc3339(row.last_access_time),
+            "last_access_utc": optional_chrome_time_to_rfc3339(row.last_access_time),
         });
+        let download_details = serde_json::json!({
+            "duration_microseconds": duration_microseconds,
+            "duration_seconds": duration_seconds,
+            "duration_human": duration_human,
+            "received_bytes": row.received_bytes,
+            "total_bytes": row.total_bytes,
+            "percent_complete": percent_complete,
+            "state": row.state,
+            "state_label": state_label,
+            "danger_type": row.danger_type,
+            "danger_type_label": danger_type_label,
+            "interrupt_reason": row.interrupt_reason,
+            "interrupt_reason_label": interrupt_reason_label,
+            "referrer": row.referrer,
+            "site_url": row.site_url,
+            "tab_url": row.tab_url,
+            "tab_referrer_url": row.tab_referrer_url,
+            "mime_type": row.mime_type,
+            "original_mime_type": row.original_mime_type,
+            "guid": row.guid,
+            "opened": row.opened.map(|value| value != 0),
+            "hash": row.hash_hex,
+            "hash_hex": row.hash_hex,
+            "url_chain": url_chain,
+            "original_url": original_url,
+            "download_url": download_url,
+            "outcome_summary": outcome_summary,
+        });
+        merge_json_object(&mut metadata, &download_details);
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
             "/Browser Activities/Downloads/{}-{}.record",
@@ -7403,9 +7944,9 @@ fn read_chromium_login_records_inner(
             "username": username,
             "host": host,
             "date_created_chrome": date_created,
-            "date_created_utc": date_created.and_then(chrome_time_to_rfc3339),
+            "date_created_utc": optional_chrome_time_to_rfc3339(date_created),
             "date_last_used_chrome": date_last_used,
-            "date_last_used_utc": date_last_used.and_then(chrome_time_to_rfc3339),
+            "date_last_used_utc": optional_chrome_time_to_rfc3339(date_last_used),
             "times_used": times_used,
             "password_note": "encrypted password value not extracted",
         });
@@ -7481,11 +8022,11 @@ fn read_chromium_cookie_records_inner(
             "cookie_name": name,
             "cookie_path": path,
             "creation_chrome": creation,
-            "creation_utc": creation.and_then(chrome_time_to_rfc3339),
+            "creation_utc": optional_chrome_time_to_rfc3339(creation),
             "expires_chrome": expires,
-            "expires_utc": expires.and_then(chrome_time_to_rfc3339),
+            "expires_utc": optional_chrome_time_to_rfc3339(expires),
             "last_access_chrome": last_access,
-            "last_access_utc": last_access.and_then(chrome_time_to_rfc3339),
+            "last_access_utc": optional_chrome_time_to_rfc3339(last_access),
             "is_secure": is_secure.map(|value| value != 0),
             "is_httponly": is_httponly.map(|value| value != 0),
             "value_note": "encrypted cookie value not extracted",
@@ -7582,9 +8123,9 @@ fn collect_chromium_bookmarks(
             "folder": folder_display,
             "guid": guid,
             "date_added_chrome": date_added,
-            "date_added_utc": date_added.and_then(chrome_time_to_rfc3339),
+            "date_added_utc": optional_chrome_time_to_rfc3339(date_added),
             "date_last_used_chrome": date_last_used,
-            "date_last_used_utc": date_last_used.and_then(chrome_time_to_rfc3339),
+            "date_last_used_utc": optional_chrome_time_to_rfc3339(date_last_used),
             "search_text": format!("{name} {url} {} {folder_display}", host_from_url(url)),
         });
         merge_json_object(&mut metadata, source_metadata);
@@ -7798,6 +8339,19 @@ fn browser_history_metadata_json(
     source_metadata: &serde_json::Value,
 ) -> String {
     let transition = row.transition.unwrap_or_default();
+    let transition_type = chromium_transition_type(transition);
+    let transition_qualifiers = chromium_transition_qualifiers(transition);
+    let is_redirect = transition_qualifiers
+        .iter()
+        .any(|value| matches!(*value, "client_redirect" | "server_redirect"));
+    let typed_navigation = transition_type == "typed";
+    let user_initiated_hint = typed_navigation
+        || transition_type == "auto_bookmark"
+        || transition_qualifiers
+            .iter()
+            .any(|value| matches!(*value, "from_address_bar" | "forward_back"));
+    let visit_duration_seconds = row.visit_duration.map(|value| value as f64 / 1_000_000.0);
+    let visit_duration_human = row.visit_duration.map(duration_human_from_microseconds);
     let mut metadata = serde_json::json!({
         "artifact_kind": "browser_history_visit",
         "browser_family": "chromium",
@@ -7807,14 +8361,30 @@ fn browser_history_metadata_json(
         "title": row.title,
         "host": host_from_url(&row.url),
         "visit_time_chrome": row.visit_time,
-        "visit_time_utc": chrome_time_to_rfc3339(row.visit_time),
+        "visit_time_utc": optional_chrome_time_to_rfc3339(Some(row.visit_time)),
         "last_visit_time_chrome": row.last_visit_time,
-        "last_visit_time_utc": row.last_visit_time.and_then(chrome_time_to_rfc3339),
+        "last_visit_time_utc": optional_chrome_time_to_rfc3339(row.last_visit_time),
         "visit_count": row.visit_count,
         "typed_count": row.typed_count,
         "transition": transition,
-        "transition_type": chromium_transition_type(transition),
+        "transition_raw": row.transition,
+        "transition_type": transition_type,
+        "transition_qualifiers": transition_qualifiers,
+        "is_redirect": is_redirect,
+        "typed_navigation": typed_navigation,
+        "user_initiated_hint": user_initiated_hint,
         "visit_duration_microseconds": row.visit_duration,
+        "visit_duration_seconds": visit_duration_seconds,
+        "visit_duration_human": visit_duration_human,
+        "from_visit_id": row.from_visit_id,
+        "referrer_url": row.referrer_url,
+        "referrer_visit_time_chrome": row.referrer_visit_time,
+        "referrer_visit_time_utc": optional_chrome_time_to_rfc3339(row.referrer_visit_time),
+        "opener_visit_id": row.opener_visit_id,
+        "opener_url": row.opener_url,
+        "external_referrer_url": row.external_referrer_url,
+        "visit_source": row.visit_source,
+        "visit_source_label": chromium_visit_source_label(row.visit_source),
         "hidden": row.hidden.map(|value| value != 0),
         "search_text": format!("{} {} {}", row.url, row.title.as_deref().unwrap_or(""), host_from_url(&row.url)),
     });
@@ -8956,6 +9526,24 @@ fn classify_entry(
                 "Search term typed in the browser",
                 "high",
                 &["browser", "search", "keyword", "web"],
+            );
+        }
+        "browser_omnibox_shortcut" => {
+            return category(
+                "Web Activity",
+                "Omnibox typing",
+                "Exact text typed into the Chromium address bar",
+                "high",
+                &["browser", "omnibox", "typing", "web"],
+            );
+        }
+        "browser_autofill" => {
+            return category(
+                "Web Activity",
+                "Autofill",
+                "Plain-text form value retained by Chromium autofill",
+                "high",
+                &["browser", "autofill", "typing", "web"],
             );
         }
         "browser_download" => {
@@ -17270,10 +17858,7 @@ struct BrowserDerivedImportContext<'a> {
 }
 
 fn normalized_browser_source_path(value: &str) -> String {
-    value
-        .replace('\\', "/")
-        .trim_matches('/')
-        .to_ascii_lowercase()
+    value.replace('\\', "/").trim_matches('/').to_string()
 }
 
 fn join_browser_source_path(profile_path: &str, relative_path: &str) -> String {
@@ -17295,6 +17880,7 @@ fn load_indexed_browser_source_files(
     case_id: i64,
     evidence_id: i64,
     source_profile_path: &str,
+    volume_index_zero_based: Option<usize>,
 ) -> Result<HashMap<String, IndexedBrowserSourceFile>> {
     let profile_key = normalized_browser_source_path(source_profile_path);
     let mut stmt = conn.prepare(
@@ -17303,7 +17889,7 @@ fn load_indexed_browser_source_files(
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
            AND name IN ('History', 'History.db', 'places.sqlite', 'downloads.sqlite',
                         'formhistory.sqlite', 'cookies.sqlite', 'logins.json', 'Login Data', 'Cookies',
-                        'Bookmarks', 'Preferences')",
+                        'Bookmarks', 'Preferences', 'Shortcuts', 'Web Data')",
     )?;
     let rows = stmt.query_map(params![case_id, evidence_id], |row| {
         Ok((
@@ -17317,6 +17903,13 @@ fn load_indexed_browser_source_files(
         let (entry_id, size_bytes, metadata_json) = row?;
         let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
             .with_context(|| format!("parsing browser source metadata for entry {entry_id}"))?;
+        let source_volume = metadata
+            .get("volume_index_zero_based")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        if source_volume != volume_index_zero_based {
+            continue;
+        }
         let Some(exact_path) = source_path_exact_from_metadata(&metadata) else {
             continue;
         };
@@ -17394,6 +17987,16 @@ fn apply_browser_derived_provenance(
         return;
     };
     move_staging_source_metadata(object);
+    if object
+        .get("browser_family")
+        .and_then(|value| value.as_str())
+        == Some("chromium")
+    {
+        object.insert(
+            "browser_brand".to_string(),
+            serde_json::json!(chromium_browser_brand(context.source_profile_path)),
+        );
+    }
     object.insert(
         "browser_derivation_key".to_string(),
         serde_json::json!(context.derivation_key),
@@ -17524,6 +18127,8 @@ fn insert_browser_history_records_into_evidence(
         .chain(import_data.preference_records.iter())
         .chain(import_data.url_records.iter())
         .chain(import_data.search_records.iter())
+        .chain(import_data.omnibox_records.iter())
+        .chain(import_data.autofill_records.iter())
         .chain(import_data.download_records.iter())
         .chain(import_data.login_records.iter())
         .chain(import_data.cookie_records.iter())
@@ -17559,6 +18164,137 @@ fn insert_browser_history_records_into_evidence(
     Ok(inserted)
 }
 
+fn append_auto_browser_import_job_disclosure(
+    conn: &Connection,
+    job_id: i64,
+    disclosure: serde_json::Value,
+) -> Result<()> {
+    let parameters_json: String = conn
+        .query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("reading filesystem-index job {job_id}"))?;
+    let mut parameters: serde_json::Value = serde_json::from_str(&parameters_json)
+        .with_context(|| format!("parsing filesystem-index job {job_id} parameters"))?;
+    let object = parameters
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("filesystem-index job {job_id} parameters are not an object"))?;
+    let disclosures = object
+        .entry("auto_browser_imports".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !disclosures.is_array() {
+        *disclosures = serde_json::json!([]);
+    }
+    disclosures
+        .as_array_mut()
+        .expect("auto_browser_imports was initialized as an array")
+        .push(disclosure);
+    let parse_error_count = disclosures
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("parse_errors").and_then(|value| value.as_array()))
+        .map(Vec::len)
+        .sum::<usize>();
+    object.insert(
+        "browser_parse_error_count".to_string(),
+        serde_json::json!(parse_error_count),
+    );
+    conn.execute(
+        "UPDATE evidence_jobs SET parameters_json = ?1 WHERE id = ?2",
+        params![parameters.to_string(), job_id],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_auto_browser_profile_import(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    job_id: i64,
+    source_profile_path: &str,
+    volume_index_zero_based: Option<usize>,
+    staging_path: &Path,
+    import_data: &BrowserHistoryImportData,
+) -> Result<usize> {
+    let derivation_key =
+        browser_profile_derivation_key(source_profile_path, volume_index_zero_based);
+    let logical_prefix = browser_profile_logical_prefix(
+        source_profile_path,
+        volume_index_zero_based,
+        &derivation_key,
+    );
+    let source_files = load_indexed_browser_source_files(
+        conn,
+        case_id,
+        evidence_id,
+        source_profile_path,
+        volume_index_zero_based,
+    )?;
+
+    // A profile is a replaceable derived dataset even during the EXT walk.
+    // The source filesystem entries do not carry this key and are untouched.
+    conn.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
+        params![case_id, evidence_id, derivation_key],
+    )?;
+    let context = BrowserDerivedImportContext {
+        evidence_id,
+        derivation_key: &derivation_key,
+        logical_prefix: &logical_prefix,
+        source_profile_path,
+        volume_index_zero_based,
+        staging_path,
+        source_files: &source_files,
+    };
+    let inserted = insert_browser_history_records_into_evidence(
+        conn,
+        case_id,
+        evidence_id,
+        job_id,
+        import_data,
+        Some(&context),
+    )?;
+    append_auto_browser_import_job_disclosure(
+        conn,
+        job_id,
+        serde_json::json!({
+            "browser_derivation_key": derivation_key,
+            "browser_family": import_data.family.as_str(),
+            "source_profile_path": source_profile_path,
+            "volume_index_zero_based": volume_index_zero_based,
+            "staging_path": staging_path,
+            "entries_indexed": inserted,
+            "parse_errors": &import_data.parse_errors,
+            "status": if import_data.parse_errors.is_empty() {
+                "completed"
+            } else {
+                "completed_with_errors"
+            },
+        }),
+    )?;
+    Ok(inserted)
+}
+
+fn auto_browser_profile_staging_root(
+    imports_root: &Path,
+    evidence_id: i64,
+    profile_name: &str,
+    derivation_key: &str,
+) -> PathBuf {
+    let digest = sha256_hex(derivation_key.as_bytes());
+    imports_root.join(format!(
+        "evidence-{evidence_id}-{}-{}",
+        sanitize_logical_segment(profile_name),
+        &digest[..12]
+    ))
+}
+
 /// Checks one just-listed EXT directory for the top-level marker file of a
 /// Firefox (`places.sqlite`) or Chromium (`History`) browser profile, and if
 /// found, stages the profile's top-level files to a persistent local copy
@@ -17581,6 +18317,7 @@ fn maybe_auto_import_browser_profile(
     image_fs: &ext4::SuperBlock<Ext4ImageReader>,
     ext_dir_path: &str,
     children: &[ExtChild],
+    volume_index_zero_based: Option<usize>,
     indexed: &mut usize,
 ) -> Result<()> {
     let has_firefox_marker = children
@@ -17604,18 +18341,25 @@ fn maybe_auto_import_browser_profile(
         .parent()
         .map(|parent| parent.join(format!("{case_stem}-history-imports")))
         .unwrap_or_else(|| PathBuf::from(format!("{case_stem}-history-imports")));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
     let profile_name = ext_dir_path
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or("profile");
-    let staging_root = imports_root.join(format!(
-        "{}-{unique}",
-        sanitize_logical_segment(profile_name)
-    ));
+    let derivation_key = browser_profile_derivation_key(ext_dir_path, volume_index_zero_based);
+    let staging_root = auto_browser_profile_staging_root(
+        &imports_root,
+        evidence_id,
+        profile_name,
+        &derivation_key,
+    );
+    if staging_root.exists() {
+        fs::remove_dir_all(&staging_root).with_context(|| {
+            format!(
+                "replacing deterministic browser staging folder {}",
+                staging_root.display()
+            )
+        })?;
+    }
     fs::create_dir_all(&staging_root)
         .with_context(|| format!("creating staging folder {}", staging_root.display()))?;
     let mut staged_any = false;
@@ -17675,25 +18419,15 @@ fn maybe_auto_import_browser_profile(
         BrowserFamily::Firefox => collect_firefox_history_import(&staging_root, max_visits)?,
         BrowserFamily::Safari => collect_safari_history_import(&staging_root, max_visits)?,
     };
-    let derivation_key = browser_profile_derivation_key(ext_dir_path, None);
-    let logical_prefix = browser_profile_logical_prefix(ext_dir_path, None, &derivation_key);
-    let source_files = HashMap::new();
-    let context = BrowserDerivedImportContext {
-        evidence_id,
-        derivation_key: &derivation_key,
-        logical_prefix: &logical_prefix,
-        source_profile_path: ext_dir_path,
-        volume_index_zero_based: None,
-        staging_path: &staging_root,
-        source_files: &source_files,
-    };
-    let inserted = insert_browser_history_records_into_evidence(
+    let inserted = persist_auto_browser_profile_import(
         conn,
         case_id,
         evidence_id,
         job_id,
+        ext_dir_path,
+        volume_index_zero_based,
+        &staging_root,
         &import_data,
-        Some(&context),
     )?;
     *indexed += inserted;
     Ok(())
@@ -17763,36 +18497,18 @@ fn process_ext_partition_entries(
             Ok(children) => children,
             Err(_) => continue,
         };
-        if *indexed < max_entries && processing_profile().parse_browsers {
-            if let Err(err) = maybe_auto_import_browser_profile(
-                conn,
-                case_id,
-                evidence_id,
-                job_id,
-                &fs,
-                &ext_path,
-                &children,
-                indexed,
-            ) {
-                // Auto-import is a bonus on top of the regular filesystem
-                // walk, not a required step - a parse failure here (e.g. a
-                // corrupt or locked profile database) must not abort
-                // indexing the rest of the volume.
-                eprintln!("auto browser-history import skipped for {ext_path}: {err:#}");
-            }
-        }
         let mut used_paths = HashSet::new();
-        for child in children {
+        for child in &children {
             if *indexed >= max_entries {
                 truncated = true;
                 break;
             }
-            let name = child.name;
+            let name = child.name.as_str();
             let entry_kind = if child.is_dir { "directory" } else { "file" };
 
             let logical_path = unique_internal_child_path(
                 &parent_logical,
-                &name,
+                name,
                 &format!("ext-inode-{}", child.inode_number),
                 &mut used_paths,
             );
@@ -17830,7 +18546,7 @@ fn process_ext_partition_entries(
                 "modified_utc": child.mtime_utc,
                 "accessed_utc": child.atime_utc,
             });
-            add_entry_category(&mut entry_metadata, &logical_path, &name, entry_kind);
+            add_entry_category(&mut entry_metadata, &logical_path, name, entry_kind);
             let is_dir = child.is_dir;
             let size = i64::try_from(child.size).unwrap_or(i64::MAX);
             upsert_filesystem_entry(
@@ -17838,7 +18554,7 @@ fn process_ext_partition_entries(
                 case_id,
                 evidence_id,
                 &logical_path,
-                &name,
+                name,
                 entry_kind,
                 if is_dir { None } else { Some(size) },
                 &entry_metadata.to_string(),
@@ -17851,6 +18567,43 @@ fn process_ext_partition_entries(
         }
         if truncated {
             break;
+        }
+        if *indexed < max_entries && processing_profile().parse_browsers {
+            let volume_index_zero_based = Some(partition_index.saturating_sub(1));
+            if let Err(err) = maybe_auto_import_browser_profile(
+                conn,
+                case_id,
+                evidence_id,
+                job_id,
+                &fs,
+                &ext_path,
+                &children,
+                volume_index_zero_based,
+                indexed,
+            ) {
+                // Preserve the filesystem walk, but disclose the failed
+                // profile import in the persisted processing-job parameters.
+                let error = format!("auto browser-history import: {err:#}");
+                eprintln!("auto browser-history import skipped for {ext_path}: {err:#}");
+                let derivation_key =
+                    browser_profile_derivation_key(&ext_path, volume_index_zero_based);
+                if let Err(disclosure_error) = append_auto_browser_import_job_disclosure(
+                    conn,
+                    job_id,
+                    serde_json::json!({
+                        "browser_derivation_key": derivation_key,
+                        "source_profile_path": ext_path,
+                        "volume_index_zero_based": volume_index_zero_based,
+                        "entries_indexed": 0,
+                        "parse_errors": [error],
+                        "status": "failed",
+                    }),
+                ) {
+                    eprintln!(
+                        "recording auto browser-history failure for {ext_path} failed: {disclosure_error:#}"
+                    );
+                }
+            }
         }
     }
     Ok(truncated)
@@ -22115,6 +22868,8 @@ fn is_browser_activity_artifact_kind(kind: &str) -> bool {
         "browser_history_visit"
             | "browser_url"
             | "browser_search_term"
+            | "browser_omnibox_shortcut"
+            | "browser_autofill"
             | "browser_download"
             | "browser_bookmark"
             | "browser_login"
@@ -22143,11 +22898,15 @@ fn report_entry_preview(item_ref: &serde_json::Value) -> Option<String> {
     let preview_fields = [
         "visit_time_utc",
         "last_visit_time_utc",
+        "last_access_time_utc",
         "last_used_utc",
         "date_added_utc",
         "start_time_utc",
         "url",
         "search_term",
+        "text",
+        "value",
+        "outcome_summary",
         "target_path",
         "current_path",
         "username",
@@ -23486,6 +24245,28 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Visit Time", &["visit_time_utc"]);
             push_activity_detail(html, item_ref, "Last URL Visit", &["last_visit_time_utc"]);
             push_activity_detail(html, item_ref, "Transition", &["transition_type"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Transition Qualifiers",
+                &["transition_qualifiers"],
+            );
+            push_activity_detail(html, item_ref, "Referrer URL", &["referrer_url"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Referrer Visit Time",
+                &["referrer_visit_time_utc"],
+            );
+            push_activity_detail(html, item_ref, "Opener URL", &["opener_url"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "External Referrer",
+                &["external_referrer_url"],
+            );
+            push_activity_detail(html, item_ref, "Visit Duration", &["visit_duration_human"]);
+            push_activity_detail(html, item_ref, "Visit Source", &["visit_source_label"]);
             push_activity_detail(html, item_ref, "Visit Count", &["visit_count"]);
             push_activity_detail(html, item_ref, "Typed Count", &["typed_count"]);
             push_activity_detail(html, item_ref, "Visit ID", &["visit_id"]);
@@ -23542,12 +24323,39 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Form History ID", &["formhistory_id"]);
             push_browser_source_details(html, item_ref);
         }
+        "browser_omnibox_shortcut" => {
+            push_activity_detail(html, item_ref, "Typed Text", &["text"]);
+            push_activity_detail(html, item_ref, "Fill Into Edit", &["fill_into_edit"]);
+            push_activity_detail(html, item_ref, "URL", &["url"]);
+            push_activity_detail(html, item_ref, "Contents", &["contents"]);
+            push_activity_detail(html, item_ref, "Description", &["description"]);
+            push_activity_detail(html, item_ref, "Type", &["type"]);
+            push_activity_detail(html, item_ref, "Keyword", &["keyword"]);
+            push_activity_detail(html, item_ref, "Last Access", &["last_access_time_utc"]);
+            push_activity_detail(html, item_ref, "Hits", &["number_of_hits"]);
+            push_browser_source_details(html, item_ref);
+        }
+        "browser_autofill" => {
+            push_activity_detail(html, item_ref, "Form Field", &["name"]);
+            push_activity_detail(html, item_ref, "Typed Value", &["value"]);
+            push_activity_detail(html, item_ref, "Use Count", &["count"]);
+            push_activity_detail(html, item_ref, "Created", &["date_created_utc"]);
+            push_activity_detail(html, item_ref, "Last Used", &["date_last_used_utc"]);
+            push_browser_source_details(html, item_ref);
+        }
         "browser_download" => {
             push_activity_detail(html, item_ref, "File Name", &["file_name", "display_name"]);
             push_activity_detail(html, item_ref, "Target Path", &["target_path"]);
             push_activity_detail(html, item_ref, "Current Path", &["current_path"]);
-            push_activity_detail(html, item_ref, "Source URL", &["source_url", "tab_url"]);
+            push_activity_detail(html, item_ref, "Outcome", &["outcome_summary"]);
+            push_activity_detail(html, item_ref, "Download URL", &["download_url"]);
+            push_activity_detail(html, item_ref, "Original URL", &["original_url"]);
+            push_activity_detail(html, item_ref, "URL Chain", &["url_chain"]);
+            push_activity_detail(html, item_ref, "Source URL", &["source_url"]);
+            push_activity_detail(html, item_ref, "Site URL", &["site_url"]);
+            push_activity_detail(html, item_ref, "Tab URL", &["tab_url"]);
             push_activity_detail(html, item_ref, "Referrer", &["referrer"]);
+            push_activity_detail(html, item_ref, "Tab Referrer", &["tab_referrer_url"]);
             push_activity_detail(
                 html,
                 item_ref,
@@ -23557,10 +24365,32 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Ended", &["end_time_utc"]);
             push_activity_detail(html, item_ref, "Received Bytes", &["received_bytes"]);
             push_activity_detail(html, item_ref, "Total Bytes", &["total_bytes"]);
-            push_activity_detail(html, item_ref, "State", &["state"]);
-            push_activity_detail(html, item_ref, "Danger Type", &["danger_type"]);
-            push_activity_detail(html, item_ref, "Interrupt Reason", &["interrupt_reason"]);
+            push_activity_detail(html, item_ref, "Percent Complete", &["percent_complete"]);
+            push_activity_detail(html, item_ref, "Duration", &["duration_human"]);
+            push_activity_detail(html, item_ref, "State", &["state_label", "state"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Danger Type",
+                &["danger_type_label", "danger_type"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Interrupt Reason",
+                &["interrupt_reason_label", "interrupt_reason"],
+            );
             push_activity_detail(html, item_ref, "MIME Type", &["mime_type"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Original MIME Type",
+                &["original_mime_type"],
+            );
+            push_activity_detail(html, item_ref, "GUID", &["guid"]);
+            push_activity_detail(html, item_ref, "Opened", &["opened"]);
+            push_activity_detail(html, item_ref, "Last Access", &["last_access_time_utc"]);
+            push_activity_detail(html, item_ref, "Download Hash", &["hash_hex"]);
             push_activity_detail(html, item_ref, "Download ID", &["download_id"]);
             push_activity_detail(html, item_ref, "Annotation ID", &["annotation_id"]);
             push_activity_detail(html, item_ref, "Annotation Name", &["annotation_name"]);
@@ -23777,6 +24607,8 @@ fn browser_activity_label(kind: &str) -> &'static str {
         "browser_history_visit" => "Visit",
         "browser_url" => "URL",
         "browser_search_term" => "Search",
+        "browser_omnibox_shortcut" => "Omnibox Shortcut",
+        "browser_autofill" => "Autofill",
         "browser_download" => "Download",
         "browser_bookmark" => "Bookmark",
         "browser_login" => "Saved Login",
@@ -24133,6 +24965,8 @@ fn chromium_profile_paths(input_path: &Path) -> Result<ChromiumProfilePaths> {
     Ok(ChromiumProfilePaths {
         bookmarks_path: profile_dir.join("Bookmarks"),
         preferences_path: profile_dir.join("Preferences"),
+        shortcuts_path: profile_dir.join("Shortcuts"),
+        web_data_path: profile_dir.join("Web Data"),
         profile_dir,
         history_path,
     })
@@ -24332,6 +25166,67 @@ fn chrome_time_to_rfc3339(chrome_time: i64) -> Option<String> {
     let seconds = unix_micros.div_euclid(1_000_000);
     let nanos = unix_micros.rem_euclid(1_000_000) * 1_000;
     DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
+}
+
+fn nonzero_optional_i64(value: Option<i64>) -> Option<i64> {
+    value.filter(|value| *value != 0)
+}
+
+fn optional_chrome_time_to_rfc3339(value: Option<i64>) -> Option<String> {
+    nonzero_optional_i64(value).and_then(chrome_time_to_rfc3339)
+}
+
+fn chromium_download_time_is_unix_seconds(value: i64) -> bool {
+    value != 0 && value.unsigned_abs() < 10_000_000_000
+}
+
+fn chromium_download_time_to_rfc3339(value: Option<i64>) -> Option<String> {
+    let value = nonzero_optional_i64(value)?;
+    if chromium_download_time_is_unix_seconds(value) {
+        unix_seconds_to_rfc3339(value)
+    } else {
+        chrome_time_to_rfc3339(value)
+    }
+}
+
+fn chromium_download_duration_microseconds(
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+) -> Option<i64> {
+    let start = nonzero_optional_i64(start_time)?;
+    let end = nonzero_optional_i64(end_time)?;
+    let start_is_seconds = chromium_download_time_is_unix_seconds(start);
+    if start_is_seconds != chromium_download_time_is_unix_seconds(end) {
+        return None;
+    }
+    let duration = end.checked_sub(start)?;
+    if duration < 0 {
+        return None;
+    }
+    if start_is_seconds {
+        duration.checked_mul(1_000_000)
+    } else {
+        Some(duration)
+    }
+}
+
+fn duration_human_from_microseconds(microseconds: i64) -> String {
+    let negative = microseconds < 0;
+    let absolute = i128::from(microseconds).abs();
+    let total_tenths = (absolute + 50_000) / 100_000;
+    let hours = total_tenths / 36_000;
+    let minutes = (total_tenths % 36_000) / 600;
+    let seconds_tenths = total_tenths % 600;
+    let seconds = seconds_tenths / 10;
+    let tenths = seconds_tenths % 10;
+    let sign = if negative { "-" } else { "" };
+    if hours > 0 {
+        format!("{sign}{hours}h {minutes}m {seconds}.{tenths}s")
+    } else if minutes > 0 {
+        format!("{sign}{minutes}m {seconds}.{tenths}s")
+    } else {
+        format!("{sign}{seconds}.{tenths}s")
+    }
 }
 
 fn unix_micros_to_rfc3339(unix_micros: i64) -> Option<String> {
@@ -24592,6 +25487,186 @@ fn chromium_transition_type(transition: i64) -> &'static str {
         10 => "keyword_generated",
         _ => "unknown",
     }
+}
+
+fn chromium_transition_qualifiers(transition: i64) -> Vec<&'static str> {
+    const QUALIFIERS: &[(i64, &str)] = &[
+        (0x0080_0000, "blocked"),
+        (0x0100_0000, "forward_back"),
+        (0x0200_0000, "from_address_bar"),
+        (0x0400_0000, "home_page"),
+        (0x0800_0000, "from_api"),
+        (0x1000_0000, "chain_start"),
+        (0x2000_0000, "chain_end"),
+        (0x4000_0000, "client_redirect"),
+        (0x8000_0000, "server_redirect"),
+    ];
+    QUALIFIERS
+        .iter()
+        .filter_map(|(mask, label)| (transition & mask != 0).then_some(*label))
+        .collect()
+}
+
+fn chromium_visit_source_label(source: Option<i64>) -> String {
+    match source {
+        None => "local".to_string(),
+        Some(0) => "synced".to_string(),
+        Some(1) => "browsed(local)".to_string(),
+        Some(2) => "extension".to_string(),
+        Some(3) => "firefox_imported".to_string(),
+        Some(4) => "ie_imported".to_string(),
+        Some(5) => "safari_imported".to_string(),
+        Some(value) => format!("unknown ({value})"),
+    }
+}
+
+fn chromium_download_state_label(state: i64) -> String {
+    match state {
+        0 => "in_progress".to_string(),
+        1 => "complete".to_string(),
+        2 => "cancelled".to_string(),
+        3 => "obsolete_bug_140687".to_string(),
+        4 => "interrupted".to_string(),
+        value => format!("unknown ({value})"),
+    }
+}
+
+fn chromium_download_danger_type_label(danger_type: i64) -> String {
+    match danger_type {
+        0 => "not_dangerous".to_string(),
+        1 => "dangerous_file".to_string(),
+        2 => "dangerous_url".to_string(),
+        3 => "dangerous_content".to_string(),
+        4 => "maybe_dangerous_content".to_string(),
+        5 => "uncommon_content".to_string(),
+        6 => "user_validated".to_string(),
+        7 => "dangerous_host".to_string(),
+        8 => "potentially_unwanted".to_string(),
+        value => format!("unknown ({value})"),
+    }
+}
+
+fn chromium_download_interrupt_reason_label(reason: i64) -> String {
+    match reason {
+        0 => "none".to_string(),
+        1 => "file_failed".to_string(),
+        2 => "file_access_denied".to_string(),
+        3 => "file_no_space".to_string(),
+        5 => "file_name_too_long".to_string(),
+        6 => "file_too_large".to_string(),
+        7 => "file_virus_infected".to_string(),
+        10 => "file_transient_error".to_string(),
+        11 => "file_blocked".to_string(),
+        12 => "file_security_check_failed".to_string(),
+        13 => "file_too_short".to_string(),
+        14 => "file_hash_mismatch".to_string(),
+        15 => "file_same_as_source".to_string(),
+        20 => "network_failed".to_string(),
+        21 => "network_timeout".to_string(),
+        22 => "network_disconnected".to_string(),
+        23 => "network_server_down".to_string(),
+        24 => "network_invalid_request".to_string(),
+        30 => "server_failed".to_string(),
+        31 => "server_no_range".to_string(),
+        33 => "server_bad_content".to_string(),
+        34 => "server_unauthorized".to_string(),
+        35 => "server_cert_problem".to_string(),
+        36 => "server_forbidden".to_string(),
+        37 => "server_unreachable".to_string(),
+        38 => "server_content_length_mismatch".to_string(),
+        40 => "user_canceled".to_string(),
+        41 => "user_shutdown".to_string(),
+        50 => "crash".to_string(),
+        value => format!("unknown ({value})"),
+    }
+}
+
+fn format_i64_grouped(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if value < 0 {
+        grouped.push('-');
+    }
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+fn chromium_download_outcome_summary(
+    row: &ChromiumDownloadRow,
+    state_label: Option<&str>,
+    interrupt_reason_label: Option<&str>,
+    duration_human: Option<&str>,
+    percent_complete: Option<f64>,
+) -> Option<String> {
+    if state_label.is_none()
+        && row.received_bytes.is_none()
+        && row.total_bytes.is_none()
+        && duration_human.is_none()
+        && interrupt_reason_label.is_none()
+    {
+        return None;
+    }
+    let mut summary = state_label.unwrap_or("download").to_string();
+    match row.state {
+        Some(4) => {
+            match (row.received_bytes, row.total_bytes) {
+                (Some(received), Some(total)) => {
+                    summary.push_str(&format!(
+                        " at {} of {} bytes",
+                        format_i64_grouped(received),
+                        format_i64_grouped(total)
+                    ));
+                    if let Some(percent) = percent_complete {
+                        summary.push_str(&format!(" ({percent:.0}%)"));
+                    }
+                }
+                (Some(received), None) => summary.push_str(&format!(
+                    " after receiving {} bytes",
+                    format_i64_grouped(received)
+                )),
+                (None, Some(total)) => summary.push_str(&format!(
+                    " with {} bytes expected",
+                    format_i64_grouped(total)
+                )),
+                (None, None) => {}
+            }
+            if let Some(duration) = duration_human {
+                summary.push_str(&format!(" after {duration}"));
+            }
+            if let Some(reason) = interrupt_reason_label.filter(|value| *value != "none") {
+                summary.push_str(&format!(" - {reason}"));
+            }
+        }
+        Some(1) => {
+            if let Some(bytes) = row.received_bytes.or(row.total_bytes) {
+                summary.push_str(&format!(" - {} bytes", format_i64_grouped(bytes)));
+            }
+            if let Some(duration) = duration_human {
+                summary.push_str(&format!(" in {duration}"));
+            }
+        }
+        _ => {
+            if let (Some(received), Some(total)) = (row.received_bytes, row.total_bytes) {
+                summary.push_str(&format!(
+                    " - {} of {} bytes",
+                    format_i64_grouped(received),
+                    format_i64_grouped(total)
+                ));
+            }
+            if let Some(duration) = duration_human {
+                summary.push_str(&format!(" after {duration}"));
+            }
+            if let Some(reason) = interrupt_reason_label.filter(|value| *value != "none") {
+                summary.push_str(&format!(" - {reason}"));
+            }
+        }
+    }
+    Some(summary)
 }
 
 fn option_path_to_string(path: Option<&Path>) -> Option<String> {
@@ -30626,6 +31701,1289 @@ mod tests {
     }
 
     #[test]
+    fn chromium_modern_visits_resolve_referrers_sources_transitions_and_duration() -> Result<()> {
+        let case_path = unique_case_path("chromium-deep-visits");
+        create_test_case(&case_path)?;
+        let root = unique_temp_dir("chromium-deep-visits-source");
+        let profile_dir = root
+            .join("Google")
+            .join("Chrome")
+            .join("User Data")
+            .join("Default");
+        let history_path = profile_dir.join("History");
+        create_empty_chromium_history_core(&history_path)?;
+        let conn = Connection::open(&history_path)?;
+        conn.execute_batch(
+            "ALTER TABLE visits ADD COLUMN from_visit INTEGER;
+             ALTER TABLE visits ADD COLUMN opener_visit INTEGER;
+             ALTER TABLE visits ADD COLUMN external_referrer_url TEXT;
+             ALTER TABLE visits ADD COLUMN visit_duration INTEGER;
+             CREATE TABLE visit_source(id INTEGER PRIMARY KEY, source INTEGER);
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://a.example/start', 'A', 1, 0, 13300000000000000, 0),
+                    (2, 'https://b.example/redirect', 'B', 1, 0, 13300000001000000, 0),
+                    (3, 'https://c.example/typed', 'C', 1, 1, 13300000002000000, 0);
+             INSERT INTO visits(
+                id, url, visit_time, from_visit, transition, opener_visit,
+                external_referrer_url, visit_duration
+             ) VALUES
+                (1, 1, 13300000000000000, 0, 0, 0, NULL, NULL),
+                (2, 2, 13300000001000000, 1, 2684354560, 0,
+                    'https://outside.example/referrer', NULL),
+                (3, 3, 13300000002000000, 2, 33554433, 1, NULL, 785432101);
+             INSERT INTO visit_source(id, source) VALUES (2, 2), (3, 1);",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        assert_eq!(imported.visits_indexed, 3);
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let visit = |id| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.metadata_json["artifact_kind"].as_str() == Some("browser_history_visit")
+                        && entry.metadata_json["visit_id"].as_i64() == Some(id)
+                })
+                .expect("visit record")
+        };
+        let a = visit(1);
+        let b = visit(2);
+        let c = visit(3);
+        assert_eq!(
+            a.metadata_json["visit_source_label"].as_str(),
+            Some("local")
+        );
+        assert_eq!(b.metadata_json["from_visit_id"].as_i64(), Some(1));
+        assert_eq!(
+            b.metadata_json["referrer_url"].as_str(),
+            Some("https://a.example/start")
+        );
+        assert_eq!(
+            b.metadata_json["referrer_visit_time_utc"].as_str(),
+            chrome_time_to_rfc3339(13300000000000000).as_deref()
+        );
+        assert_eq!(
+            b.metadata_json["external_referrer_url"].as_str(),
+            Some("https://outside.example/referrer")
+        );
+        assert_eq!(
+            b.metadata_json["transition_qualifiers"],
+            serde_json::json!(["chain_end", "server_redirect"])
+        );
+        assert_eq!(
+            b.metadata_json["transition_raw"].as_i64(),
+            Some(2_684_354_560)
+        );
+        assert_eq!(b.metadata_json["is_redirect"].as_bool(), Some(true));
+        assert_eq!(
+            b.metadata_json["visit_source_label"].as_str(),
+            Some("extension")
+        );
+        assert_eq!(c.metadata_json["from_visit_id"].as_i64(), Some(2));
+        assert_eq!(
+            c.metadata_json["referrer_url"].as_str(),
+            Some("https://b.example/redirect")
+        );
+        assert_eq!(c.metadata_json["opener_visit_id"].as_i64(), Some(1));
+        assert_eq!(
+            c.metadata_json["opener_url"].as_str(),
+            Some("https://a.example/start")
+        );
+        assert_eq!(c.metadata_json["transition_type"].as_str(), Some("typed"));
+        assert_eq!(
+            c.metadata_json["transition_qualifiers"],
+            serde_json::json!(["from_address_bar"])
+        );
+        assert_eq!(c.metadata_json["typed_navigation"].as_bool(), Some(true));
+        assert_eq!(c.metadata_json["user_initiated_hint"].as_bool(), Some(true));
+        assert_eq!(
+            c.metadata_json["visit_duration_microseconds"].as_i64(),
+            Some(785432101)
+        );
+        assert_eq!(
+            c.metadata_json["visit_duration_seconds"].as_f64(),
+            Some(785.432101)
+        );
+        assert_eq!(
+            c.metadata_json["visit_duration_human"].as_str(),
+            Some("13m 5.4s")
+        );
+        assert_eq!(
+            c.metadata_json["visit_source_label"].as_str(),
+            Some("browsed(local)")
+        );
+        assert_eq!(c.metadata_json["browser_brand"].as_str(), Some("chrome"));
+        for key in [
+            "created_utc",
+            "modified_utc",
+            "accessed_utc",
+            "mft_modified_utc",
+        ] {
+            assert!(c.metadata_json[key].is_null());
+        }
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_old_history_and_lower_term_schema_import_without_errors() -> Result<()> {
+        let case_path = unique_case_path("chromium-old-era");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-old-era-source");
+        let history_path = profile_dir.join("History");
+        create_empty_chromium_history_core(&history_path)?;
+        let conn = Connection::open(&history_path)?;
+        conn.execute_batch(
+            "CREATE TABLE keyword_search_terms(
+                keyword_id INTEGER, url_id INTEGER, term TEXT, lower_term TEXT
+             );
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://old.example/?q=Vintage', 'Old Chromium', 1, 1,
+                     12900000000000000, 0);
+             INSERT INTO visits(id, url, visit_time, transition)
+             VALUES (1, 1, 12900000000000000, 1);
+             INSERT INTO keyword_search_terms(keyword_id, url_id, term, lower_term)
+             VALUES (1, 1, 'Vintage Search', 'vintage search');",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let visit = entry_with_artifact(&entries, "browser_history_visit");
+        assert!(visit.metadata_json["visit_duration_microseconds"].is_null());
+        assert!(visit.metadata_json["visit_duration_seconds"].is_null());
+        assert!(visit.metadata_json["visit_duration_human"].is_null());
+        assert!(visit.metadata_json["from_visit_id"].is_null());
+        assert!(visit.metadata_json["referrer_url"].is_null());
+        assert!(visit.metadata_json["opener_visit_id"].is_null());
+        assert!(visit.metadata_json["external_referrer_url"].is_null());
+        assert_eq!(
+            visit.metadata_json["visit_source_label"].as_str(),
+            Some("local")
+        );
+        let search = entry_with_artifact(&entries, "browser_search_term");
+        assert_eq!(search.metadata_json["keyword_id"].as_i64(), Some(1));
+        assert_eq!(
+            search.metadata_json["lower_term"].as_str(),
+            Some("vintage search")
+        );
+        assert!(search.metadata_json["normalized_term"].is_null());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_transition_decoder_covers_all_core_types_and_qualifiers() {
+        let core_types = [
+            "link",
+            "typed",
+            "auto_bookmark",
+            "auto_subframe",
+            "manual_subframe",
+            "generated",
+            "auto_toplevel",
+            "form_submit",
+            "reload",
+            "keyword",
+            "keyword_generated",
+        ];
+        for (raw, expected) in core_types.iter().enumerate() {
+            assert_eq!(chromium_transition_type(raw as i64), *expected);
+        }
+        assert_eq!(chromium_transition_type(11), "unknown");
+        assert_eq!(
+            chromium_transition_qualifiers(i64::from(i32::MIN)),
+            vec!["server_redirect"]
+        );
+        let all_qualifiers = 0x0080_0000_i64
+            | 0x0100_0000
+            | 0x0200_0000
+            | 0x0400_0000
+            | 0x0800_0000
+            | 0x1000_0000
+            | 0x2000_0000
+            | 0x4000_0000
+            | 0x8000_0000;
+        assert_eq!(
+            chromium_transition_qualifiers(all_qualifiers),
+            vec![
+                "blocked",
+                "forward_back",
+                "from_address_bar",
+                "home_page",
+                "from_api",
+                "chain_start",
+                "chain_end",
+                "client_redirect",
+                "server_redirect",
+            ]
+        );
+        for (mask, expected) in [
+            (0x0080_0000, "blocked"),
+            (0x0100_0000, "forward_back"),
+            (0x0200_0000, "from_address_bar"),
+            (0x0400_0000, "home_page"),
+            (0x0800_0000, "from_api"),
+            (0x1000_0000, "chain_start"),
+            (0x2000_0000, "chain_end"),
+            (0x4000_0000, "client_redirect"),
+            (0x8000_0000, "server_redirect"),
+        ] {
+            assert_eq!(chromium_transition_qualifiers(mask), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn chromium_brand_detection_is_case_insensitive_and_slash_agnostic() {
+        assert_eq!(
+            chromium_browser_brand(r"C:\Users\A\Google\Chrome\User Data\Default"),
+            Some("chrome")
+        );
+        assert_eq!(
+            chromium_browser_brand("/Users/a/MICROSOFT/EDGE/Default"),
+            Some("edge")
+        );
+        assert_eq!(
+            chromium_browser_brand("/home/a/.config/Chromium/Default"),
+            Some("chromium")
+        );
+        assert_eq!(
+            chromium_browser_brand("/home/a/.config/BraveSoftware/Brave-Browser/Default"),
+            Some("brave")
+        );
+        assert_eq!(
+            chromium_browser_brand("/Users/a/Library/Application Support/com.operasoftware.Opera"),
+            Some("opera")
+        );
+        assert_eq!(chromium_browser_brand("/evidence/unknown/Profile"), None);
+    }
+
+    #[test]
+    fn chromium_profile_derivation_keys_and_prefixes_are_distinct_and_deterministic() {
+        let default_path = "Users/A/AppData/Local/Google/Chrome/User Data/Default";
+        let profile_path = "Users/A/AppData/Local/Google/Chrome/User Data/Profile 1";
+        let default_key = browser_profile_derivation_key(default_path, Some(0));
+        assert_eq!(
+            default_key,
+            browser_profile_derivation_key(default_path, Some(0))
+        );
+        let profile_key = browser_profile_derivation_key(profile_path, Some(0));
+        assert_ne!(default_key, profile_key);
+        assert_ne!(
+            default_key,
+            browser_profile_derivation_key(default_path, Some(1))
+        );
+        assert_ne!(
+            browser_profile_derivation_key("home/alice/Default", Some(0)),
+            browser_profile_derivation_key("home/alice/default", Some(0)),
+            "case-sensitive filesystems may contain both profile paths"
+        );
+        assert_ne!(
+            browser_profile_logical_prefix(default_path, Some(0), &default_key),
+            browser_profile_logical_prefix(profile_path, Some(0), &profile_key)
+        );
+        let staging_a =
+            auto_browser_profile_staging_root(Path::new("imports"), 7, "Default", &default_key);
+        assert_eq!(
+            staging_a,
+            auto_browser_profile_staging_root(Path::new("imports"), 7, "Default", &default_key,)
+        );
+        assert_ne!(
+            staging_a,
+            auto_browser_profile_staging_root(Path::new("imports"), 8, "Default", &default_key,)
+        );
+    }
+
+    #[test]
+    fn chromium_modern_downloads_include_chains_labels_progress_and_outcomes() -> Result<()> {
+        let case_path = unique_case_path("chromium-modern-downloads");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-modern-downloads-source");
+        let history_path = profile_dir.join("History");
+        create_empty_chromium_history_core(&history_path)?;
+        let conn = Connection::open(&history_path)?;
+        conn.execute_batch(
+            "CREATE TABLE downloads(
+                id INTEGER PRIMARY KEY,
+                current_path TEXT,
+                target_path TEXT,
+                start_time INTEGER,
+                end_time INTEGER,
+                received_bytes INTEGER,
+                total_bytes INTEGER,
+                state INTEGER,
+                danger_type INTEGER,
+                interrupt_reason INTEGER,
+                referrer TEXT,
+                tab_url TEXT,
+                mime_type TEXT,
+                guid TEXT,
+                site_url TEXT,
+                tab_referrer_url TEXT,
+                original_mime_type TEXT,
+                last_access_time INTEGER,
+                opened INTEGER,
+                hash BLOB
+             );
+             CREATE TABLE downloads_url_chains(
+                id INTEGER, chain_index INTEGER, url TEXT
+             );
+             INSERT INTO downloads(
+                id, current_path, target_path, start_time, end_time,
+                received_bytes, total_bytes, state, danger_type, interrupt_reason,
+                referrer, tab_url, mime_type, guid, site_url, tab_referrer_url,
+                original_mime_type, last_access_time, opened, hash
+             ) VALUES
+                (1, 'C:\\Temp\\complete.bin', 'C:\\Downloads\\complete.bin',
+                 13300000000000000, 13300000001800000, 1495112, 1495112,
+                 1, 0, 0, 'https://ref.example/complete',
+                 'https://tab.example/complete', 'application/octet-stream',
+                 'guid-complete', 'https://site.example/',
+                 'https://tab-ref.example/', 'application/x-download',
+                 13300000002000000, 1, X'01020304'),
+                (2, 'C:\\Temp\\partial.iso.crdownload', 'C:\\Downloads\\partial.iso',
+                 13300000100000000, 13300000142300000, 1234567, 4500000,
+                 4, 8, 21, 'https://ref.example/interrupted',
+                 'https://tab.example/interrupted', 'application/octet-stream',
+                 'guid-interrupted', 'https://download.example/',
+                 'https://tab-ref.example/interrupted', 'application/x-iso9660-image',
+                 13300000150000000, 0, NULL);
+             INSERT INTO downloads_url_chains(id, chain_index, url) VALUES
+                (1, 1, 'https://cdn.example/complete.bin'),
+                (1, 0, 'https://origin.example/complete'),
+                (2, 2, 'https://cdn.example/partial.iso'),
+                (2, 0, 'https://origin.example/download'),
+                (2, 1, 'https://redirect.example/token');",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_download"), 2);
+        let download = |id| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.metadata_json["artifact_kind"].as_str() == Some("browser_download")
+                        && entry.metadata_json["download_id"].as_i64() == Some(id)
+                })
+                .expect("download record")
+        };
+        let complete = download(1);
+        assert_eq!(
+            complete.metadata_json["state_label"].as_str(),
+            Some("complete")
+        );
+        assert_eq!(
+            complete.metadata_json["danger_type_label"].as_str(),
+            Some("not_dangerous")
+        );
+        assert_eq!(
+            complete.metadata_json["url_chain"],
+            serde_json::json!([
+                "https://origin.example/complete",
+                "https://cdn.example/complete.bin"
+            ])
+        );
+        assert_eq!(
+            complete.metadata_json["original_url"].as_str(),
+            Some("https://origin.example/complete")
+        );
+        assert_eq!(
+            complete.metadata_json["download_url"].as_str(),
+            Some("https://cdn.example/complete.bin")
+        );
+        assert_eq!(complete.metadata_json["opened"].as_bool(), Some(true));
+        assert_eq!(complete.metadata_json["hash"].as_str(), Some("01020304"));
+        assert_eq!(
+            complete.metadata_json["guid"].as_str(),
+            Some("guid-complete")
+        );
+        assert_eq!(
+            complete.metadata_json["site_url"].as_str(),
+            Some("https://site.example/")
+        );
+        assert_eq!(
+            complete.metadata_json["tab_referrer_url"].as_str(),
+            Some("https://tab-ref.example/")
+        );
+        assert_eq!(
+            complete.metadata_json["original_mime_type"].as_str(),
+            Some("application/x-download")
+        );
+        assert_eq!(
+            complete.metadata_json["referrer"].as_str(),
+            Some("https://ref.example/complete")
+        );
+        assert_eq!(
+            complete.metadata_json["mime_type"].as_str(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            complete.metadata_json["percent_complete"].as_f64(),
+            Some(100.0)
+        );
+        assert_eq!(
+            complete.metadata_json["duration_seconds"].as_f64(),
+            Some(1.8)
+        );
+        assert_eq!(
+            complete.metadata_json["duration_human"].as_str(),
+            Some("1.8s")
+        );
+        assert_eq!(
+            complete.metadata_json["outcome_summary"].as_str(),
+            Some("complete - 1,495,112 bytes in 1.8s")
+        );
+
+        let interrupted = download(2);
+        assert_eq!(
+            interrupted.metadata_json["state_label"].as_str(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            interrupted.metadata_json["danger_type_label"].as_str(),
+            Some("potentially_unwanted")
+        );
+        assert_eq!(
+            interrupted.metadata_json["interrupt_reason_label"].as_str(),
+            Some("network_timeout")
+        );
+        let percent = interrupted.metadata_json["percent_complete"]
+            .as_f64()
+            .expect("percent complete");
+        assert!((percent - 27.43482222222222).abs() < 0.000001);
+        assert_eq!(
+            interrupted.metadata_json["url_chain"],
+            serde_json::json!([
+                "https://origin.example/download",
+                "https://redirect.example/token",
+                "https://cdn.example/partial.iso"
+            ])
+        );
+        assert_eq!(
+            interrupted.metadata_json["original_url"].as_str(),
+            Some("https://origin.example/download")
+        );
+        assert_eq!(
+            interrupted.metadata_json["download_url"].as_str(),
+            Some("https://cdn.example/partial.iso")
+        );
+        assert_eq!(
+            interrupted.metadata_json["duration_human"].as_str(),
+            Some("42.3s")
+        );
+        assert_eq!(
+            interrupted.metadata_json["outcome_summary"].as_str(),
+            Some("interrupted at 1,234,567 of 4,500,000 bytes (27%) after 42.3s - network_timeout")
+        );
+        assert_eq!(
+            interrupted.metadata_json["last_access_time_utc"].as_str(),
+            chrome_time_to_rfc3339(13300000150000000).as_deref()
+        );
+        assert_eq!(interrupted.metadata_json["opened"].as_bool(), Some(false));
+        for entry in [complete, interrupted] {
+            for key in [
+                "created_utc",
+                "modified_utc",
+                "accessed_utc",
+                "mft_modified_utc",
+            ] {
+                assert!(entry.metadata_json[key].is_null());
+            }
+        }
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_legacy_download_schema_uses_url_and_full_path_fallbacks() -> Result<()> {
+        let case_path = unique_case_path("chromium-legacy-downloads");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-legacy-downloads-source");
+        let history_path = profile_dir.join("History");
+        create_empty_chromium_history_core(&history_path)?;
+        let conn = Connection::open(&history_path)?;
+        conn.execute_batch(
+            "CREATE TABLE downloads(
+                id INTEGER PRIMARY KEY,
+                full_path TEXT,
+                url TEXT,
+                start_time INTEGER,
+                received_bytes INTEGER,
+                total_bytes INTEGER,
+                state INTEGER,
+                end_time INTEGER,
+                opened INTEGER
+             );
+             INSERT INTO downloads(
+                id, full_path, url, start_time, received_bytes, total_bytes,
+                state, end_time, opened
+             ) VALUES (
+                9, 'C:\\Users\\Old\\Downloads\\legacy.zip',
+                'https://legacy.example/files/legacy.zip',
+                1290000000, 4096, 4096, 1, 1290000002, 1
+             );",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let download = entry_with_artifact(&entries, "browser_download");
+        assert_eq!(
+            download.metadata_json["file_name"].as_str(),
+            Some("legacy.zip")
+        );
+        assert_eq!(
+            download.metadata_json["target_path"].as_str(),
+            Some("C:\\Users\\Old\\Downloads\\legacy.zip")
+        );
+        assert_eq!(
+            download.metadata_json["full_path"].as_str(),
+            Some("C:\\Users\\Old\\Downloads\\legacy.zip")
+        );
+        assert_eq!(
+            download.metadata_json["download_url"].as_str(),
+            Some("https://legacy.example/files/legacy.zip")
+        );
+        assert!(download.metadata_json["original_url"].is_null());
+        assert_eq!(download.metadata_json["url_chain"], serde_json::json!([]));
+        assert_eq!(
+            download.metadata_json["state_label"].as_str(),
+            Some("complete")
+        );
+        assert!(download.metadata_json["danger_type_label"].is_null());
+        assert!(download.metadata_json["interrupt_reason_label"].is_null());
+        assert_eq!(download.metadata_json["opened"].as_bool(), Some(true));
+        assert_eq!(
+            download.metadata_json["start_time_utc"].as_str(),
+            Some("2010-11-17T13:20:00+00:00")
+        );
+        assert_eq!(
+            download.metadata_json["end_time_utc"].as_str(),
+            Some("2010-11-17T13:20:02+00:00")
+        );
+        assert_eq!(
+            download.metadata_json["download_time_basis"].as_str(),
+            Some("unix_seconds_legacy")
+        );
+        assert!(download.metadata_json["start_time_chrome"].is_null());
+        assert_eq!(
+            download.metadata_json["start_time_unix_seconds"].as_i64(),
+            Some(1290000000)
+        );
+        assert_eq!(
+            download.metadata_json["duration_human"].as_str(),
+            Some("2.0s")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_zero_sentinel_times_and_empty_hashes_do_not_fabricate_events() -> Result<()> {
+        let case_path = unique_case_path("chromium-zero-times");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-zero-times-source");
+        let history_path = profile_dir.join("History");
+        create_empty_chromium_history_core(&history_path)?;
+        Connection::open(&history_path)?.execute_batch(
+            "CREATE TABLE downloads(
+                id INTEGER PRIMARY KEY,
+                target_path TEXT,
+                start_time INTEGER,
+                end_time INTEGER,
+                received_bytes INTEGER,
+                total_bytes INTEGER,
+                state INTEGER,
+                last_access_time INTEGER,
+                hash BLOB
+             );
+             INSERT INTO downloads(
+                id, target_path, start_time, end_time, received_bytes,
+                total_bytes, state, last_access_time, hash
+             ) VALUES (
+                1, 'C:\\Downloads\\pending.bin', 13300000000000000,
+                0, 0, 0, 0, 0, X''
+             );",
+        )?;
+        Connection::open(profile_dir.join("Shortcuts"))?.execute_batch(
+            "CREATE TABLE omni_box_shortcuts(
+                id TEXT PRIMARY KEY, text TEXT, last_access_time INTEGER
+             );
+             INSERT INTO omni_box_shortcuts(id, text, last_access_time)
+             VALUES ('zero-time', 'unfinished typing', 0);",
+        )?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let download = entry_with_artifact(&entries, "browser_download");
+        assert!(download.metadata_json["end_time_utc"].is_null());
+        assert!(download.metadata_json["last_access_time_utc"].is_null());
+        assert!(download.metadata_json["duration_seconds"].is_null());
+        assert!(download.metadata_json["duration_human"].is_null());
+        assert!(download.metadata_json["percent_complete"].is_null());
+        assert!(download.metadata_json["hash"].is_null());
+        let shortcut = entry_with_artifact(&entries, "browser_omnibox_shortcut");
+        assert!(shortcut.metadata_json["last_access_time_utc"].is_null());
+        assert!(shortcut.metadata_json["last_access_utc"].is_null());
+        assert!(!download.metadata_json.to_string().contains("1601-01-01"));
+        assert!(!shortcut.metadata_json.to_string().contains("1601-01-01"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_download_label_decoders_cover_known_and_unknown_values() {
+        assert_eq!(format_i64_grouped(42), "42");
+        assert_eq!(format_i64_grouped(12_345), "12,345");
+        assert_eq!(format_i64_grouped(12_345_678), "12,345,678");
+        assert_eq!(format_i64_grouped(i64::MIN), "-9,223,372,036,854,775,808");
+        for (raw, expected) in [
+            (0, "in_progress"),
+            (1, "complete"),
+            (2, "cancelled"),
+            (3, "obsolete_bug_140687"),
+            (4, "interrupted"),
+        ] {
+            assert_eq!(chromium_download_state_label(raw), expected);
+        }
+        assert_eq!(chromium_download_state_label(99), "unknown (99)");
+        for (raw, expected) in [
+            (0, "not_dangerous"),
+            (1, "dangerous_file"),
+            (2, "dangerous_url"),
+            (3, "dangerous_content"),
+            (4, "maybe_dangerous_content"),
+            (5, "uncommon_content"),
+            (6, "user_validated"),
+            (7, "dangerous_host"),
+            (8, "potentially_unwanted"),
+        ] {
+            assert_eq!(chromium_download_danger_type_label(raw), expected);
+        }
+        assert_eq!(chromium_download_danger_type_label(99), "unknown (99)");
+        for (raw, expected) in [
+            (0, "none"),
+            (1, "file_failed"),
+            (2, "file_access_denied"),
+            (3, "file_no_space"),
+            (5, "file_name_too_long"),
+            (6, "file_too_large"),
+            (7, "file_virus_infected"),
+            (10, "file_transient_error"),
+            (11, "file_blocked"),
+            (12, "file_security_check_failed"),
+            (13, "file_too_short"),
+            (14, "file_hash_mismatch"),
+            (15, "file_same_as_source"),
+            (20, "network_failed"),
+            (21, "network_timeout"),
+            (22, "network_disconnected"),
+            (23, "network_server_down"),
+            (24, "network_invalid_request"),
+            (30, "server_failed"),
+            (31, "server_no_range"),
+            (33, "server_bad_content"),
+            (34, "server_unauthorized"),
+            (35, "server_cert_problem"),
+            (36, "server_forbidden"),
+            (37, "server_unreachable"),
+            (38, "server_content_length_mismatch"),
+            (40, "user_canceled"),
+            (41, "user_shutdown"),
+            (50, "crash"),
+        ] {
+            assert_eq!(chromium_download_interrupt_reason_label(raw), expected);
+        }
+        assert_eq!(chromium_download_interrupt_reason_label(99), "unknown (99)");
+    }
+
+    #[test]
+    fn chromium_autofill_uses_unix_seconds_and_imports_plain_text_fields() -> Result<()> {
+        let case_path = unique_case_path("chromium-autofill");
+        create_test_case(&case_path)?;
+        let root = unique_temp_dir("chromium-autofill-source");
+        let profile_dir = root
+            .join("Google")
+            .join("Chrome")
+            .join("User Data")
+            .join("Default");
+        create_empty_chromium_history_core(&profile_dir.join("History"))?;
+        create_test_chromium_web_data(&profile_dir.join("Web Data"))?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_autofill"), 2);
+        let email = entries
+            .iter()
+            .find(|entry| entry.metadata_json["name"].as_str() == Some("email"))
+            .expect("email autofill row");
+        assert_eq!(
+            email.metadata_json["value"].as_str(),
+            Some("examiner@example.test")
+        );
+        assert_eq!(email.metadata_json["count"].as_i64(), Some(3));
+        assert_eq!(
+            email.metadata_json["date_created_utc"].as_str(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
+        assert_eq!(
+            email.metadata_json["date_last_used_utc"].as_str(),
+            Some("2023-11-14T23:13:20+00:00")
+        );
+        assert_eq!(
+            email.metadata_json["source_artifact"].as_str(),
+            Some("Web Data")
+        );
+        assert_eq!(
+            email.metadata_json["browser_brand"].as_str(),
+            Some("chrome")
+        );
+        assert_eq!(
+            email.metadata_json["category_sub"].as_str(),
+            Some("Autofill")
+        );
+        for key in [
+            "created_utc",
+            "modified_utc",
+            "accessed_utc",
+            "mft_modified_utc",
+        ] {
+            assert!(email.metadata_json[key].is_null());
+        }
+        let note = entries
+            .iter()
+            .find(|entry| entry.metadata_json["name"].as_str() == Some("case-note"))
+            .expect("case-note autofill row");
+        assert_eq!(
+            note.metadata_json["value"].as_str(),
+            Some("typed evidence note")
+        );
+        assert_eq!(note.metadata_json["count"].as_i64(), Some(2));
+        assert_eq!(
+            note.metadata_json["date_created_utc"].as_str(),
+            Some("2023-11-16T02:00:00+00:00")
+        );
+        assert_eq!(
+            note.metadata_json["date_last_used_utc"].as_str(),
+            Some("2023-11-16T04:00:00+00:00")
+        );
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![imported.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert!(parameters["shortcuts_file"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Shortcuts")));
+        assert!(parameters["web_data_file"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Web Data")));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_legacy_autofill_dates_are_aggregated_by_pair_id() -> Result<()> {
+        let case_path = unique_case_path("chromium-legacy-autofill");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-legacy-autofill-source");
+        create_empty_chromium_history_core(&profile_dir.join("History"))?;
+        let conn = Connection::open(profile_dir.join("Web Data"))?;
+        conn.execute_batch(
+            "CREATE TABLE autofill(
+                pair_id INTEGER PRIMARY KEY,
+                name TEXT,
+                value TEXT,
+                count INTEGER
+             );
+             CREATE TABLE autofill_dates(pair_id INTEGER, date_created INTEGER);
+             INSERT INTO autofill(pair_id, name, value, count)
+             VALUES (42, 'legacy-field', 'legacy typed value', 4);
+             INSERT INTO autofill_dates(pair_id, date_created)
+             VALUES (42, 0), (42, 1600003600), (42, 1600000000), (42, 1600001800);",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let autofill = entry_with_artifact(&entries, "browser_autofill");
+        assert_eq!(autofill.metadata_json["rowid"].as_i64(), Some(42));
+        assert_eq!(autofill.metadata_json["count"].as_i64(), Some(4));
+        assert_eq!(
+            autofill.metadata_json["date_created_utc"].as_str(),
+            Some("2020-09-13T12:26:40+00:00")
+        );
+        assert_eq!(
+            autofill.metadata_json["date_last_used_utc"].as_str(),
+            Some("2020-09-13T13:26:40+00:00")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_shortcuts_import_exact_omnibox_text_and_last_access_time() -> Result<()> {
+        let case_path = unique_case_path("chromium-shortcuts");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-shortcuts-source");
+        create_empty_chromium_history_core(&profile_dir.join("History"))?;
+        create_test_chromium_shortcuts(&profile_dir.join("Shortcuts"))?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let shortcut = entry_with_artifact(&entries, "browser_omnibox_shortcut");
+        assert_eq!(
+            shortcut.metadata_json["text"].as_str(),
+            Some("openai forensic search")
+        );
+        assert_eq!(
+            shortcut.metadata_json["url"].as_str(),
+            Some("https://www.google.com/search?q=openai+forensic+search")
+        );
+        assert_eq!(
+            shortcut.metadata_json["last_access_time_utc"].as_str(),
+            Some("2022-06-18T04:27:05+00:00")
+        );
+        assert_eq!(shortcut.metadata_json["number_of_hits"].as_i64(), Some(7));
+        assert_eq!(
+            shortcut.metadata_json["source_artifact"].as_str(),
+            Some("Shortcuts")
+        );
+        assert!(shortcut
+            .logical_path
+            .starts_with("/Browser Activities/Omnibox/shortcut-guid-1-openai_forensic_search"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_corrupt_web_data_and_shortcuts_failures_are_disclosed() -> Result<()> {
+        let case_path = unique_case_path("chromium-deep-reader-errors");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("chromium-deep-reader-errors-source");
+        create_empty_chromium_history_core(&profile_dir.join("History"))?;
+        fs::write(profile_dir.join("Web Data"), b"not a sqlite database")?;
+        fs::write(profile_dir.join("Shortcuts"), b"not a sqlite database")?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.entries_indexed, 0);
+        assert!(imported
+            .parse_errors
+            .iter()
+            .any(|error| error.starts_with("autofill:")));
+        assert!(imported
+            .parse_errors
+            .iter()
+            .any(|error| error.starts_with("omnibox shortcuts:")));
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![imported.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        let persisted_errors = parameters["parse_errors"]
+            .as_array()
+            .expect("persisted parse errors");
+        assert!(persisted_errors.iter().any(|error| error
+            .as_str()
+            .is_some_and(|error| error.starts_with("autofill:"))));
+        assert!(persisted_errors.iter().any(|error| error
+            .as_str()
+            .is_some_and(|error| error.starts_with("omnibox shortcuts:"))));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn ext_auto_chromium_import_keeps_source_macb_and_persists_reader_errors() -> Result<()> {
+        let case_path = unique_case_path("chromium-ext-auto-provenance");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("chromium-ext-auto-evidence");
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let staging_dir = unique_temp_dir("chromium-ext-auto-staging");
+        create_empty_chromium_history_core(&staging_dir.join("History"))?;
+        create_test_chromium_shortcuts(&staging_dir.join("Shortcuts"))?;
+        fs::write(staging_dir.join("Web Data"), b"not a sqlite database")?;
+
+        let source_profile = "/home/alice/.config/Google/Chrome/User Data/Default";
+        let source_created = "2020-01-02T03:04:05+00:00";
+        let source_modified = "2020-02-03T04:05:06+00:00";
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO evidence_jobs(
+                case_id, evidence_id, job_type, status, parameters_json, started_at
+             ) VALUES (?1, ?2, 'filesystem_index', 'running', ?3,
+                       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![
+                case_id,
+                evidence_id,
+                serde_json::json!({"parse_browsers": true}).to_string()
+            ],
+        )?;
+        let job_id = conn.last_insert_rowid();
+        for name in ["History", "Shortcuts", "Web Data"] {
+            let exact_path = format!("{source_profile}/{name}");
+            let logical_path = format!("/Image Analysis/Volumes/001-ext{exact_path}");
+            let size =
+                i64::try_from(fs::metadata(staging_dir.join(name))?.len()).unwrap_or(i64::MAX);
+            upsert_filesystem_entry(
+                &conn,
+                case_id,
+                evidence_id,
+                &logical_path,
+                name,
+                "file",
+                Some(size),
+                &serde_json::json!({
+                    "artifact_kind": "filesystem_entry",
+                    "filesystem_parser": "ext4",
+                    "partition_index": 1,
+                    "ext_path": exact_path,
+                    "created_utc": source_created,
+                    "modified_utc": source_modified,
+                })
+                .to_string(),
+                job_id,
+            )?;
+        }
+        let shortcut_source_id: i64 = conn.query_row(
+            "SELECT id FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND name = 'Shortcuts'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+
+        let import_data = collect_chromium_history_import(&staging_dir, usize::MAX)?;
+        assert!(import_data
+            .parse_errors
+            .iter()
+            .any(|error| error.starts_with("autofill:")));
+        assert_eq!(
+            persist_auto_browser_profile_import(
+                &conn,
+                case_id,
+                evidence_id,
+                job_id,
+                source_profile,
+                Some(0),
+                &staging_dir,
+                &import_data,
+            )?,
+            1
+        );
+
+        let shortcut_metadata: String = conn.query_row(
+            "SELECT metadata_json FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.artifact_kind') =
+                   'browser_omnibox_shortcut'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        let shortcut: serde_json::Value = serde_json::from_str(&shortcut_metadata)?;
+        assert_eq!(
+            shortcut["source_entry_id"].as_i64(),
+            Some(shortcut_source_id)
+        );
+        assert_eq!(
+            shortcut["source_file_time_basis"].as_str(),
+            Some("original_evidence_filesystem")
+        );
+        assert_eq!(
+            shortcut["source_file_created_utc"].as_str(),
+            Some(source_created)
+        );
+        assert_eq!(
+            shortcut["source_file_modified_utc"].as_str(),
+            Some(source_modified)
+        );
+        assert_eq!(
+            shortcut["source_profile_path_exact"].as_str(),
+            Some(source_profile)
+        );
+        assert_eq!(shortcut["volume_index_zero_based"].as_u64(), Some(0));
+        for key in [
+            "created_utc",
+            "modified_utc",
+            "accessed_utc",
+            "mft_modified_utc",
+        ] {
+            assert!(shortcut[key].is_null());
+        }
+
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(parameters["browser_parse_error_count"].as_u64(), Some(1));
+        let disclosure = &parameters["auto_browser_imports"][0];
+        assert_eq!(
+            disclosure["source_profile_path"].as_str(),
+            Some(source_profile)
+        );
+        assert_eq!(disclosure["status"].as_str(), Some("completed_with_errors"));
+        assert!(disclosure["parse_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.starts_with("autofill:")))));
+
+        drop(conn);
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        let _ = fs::remove_dir_all(staging_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chromium_new_record_kinds_are_idempotent_and_keep_original_source_provenance() -> Result<()>
+    {
+        let case_path = unique_case_path("chromium-deep-idempotent");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("chromium-deep-idempotent-source");
+        let profile_dir = evidence_dir
+            .join("Google")
+            .join("Chrome")
+            .join("User Data")
+            .join("Default");
+        create_empty_chromium_history_core(&profile_dir.join("History"))?;
+        create_test_chromium_shortcuts(&profile_dir.join("Shortcuts"))?;
+        create_test_chromium_web_data(&profile_dir.join("Web Data"))?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let base_entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let shortcuts_source = base_entries
+            .iter()
+            .find(|entry| entry.name == "Shortcuts")
+            .expect("indexed Shortcuts");
+        let shortcuts_source_id = shortcuts_source.id;
+        let shortcuts_created = shortcuts_source.metadata_json["created_utc"]
+            .as_str()
+            .expect("Shortcuts created time")
+            .to_string();
+        let shortcuts_modified = shortcuts_source.metadata_json["modified_utc"]
+            .as_str()
+            .expect("Shortcuts modified time")
+            .to_string();
+        let web_data_source = base_entries
+            .iter()
+            .find(|entry| entry.name == "Web Data")
+            .expect("indexed Web Data");
+        let web_data_source_id = web_data_source.id;
+        let web_data_created = web_data_source.metadata_json["created_utc"]
+            .as_str()
+            .expect("Web Data created time")
+            .to_string();
+        let web_data_modified = web_data_source.metadata_json["modified_utc"]
+            .as_str()
+            .expect("Web Data modified time")
+            .to_string();
+        let options = ImportBrowserArtifactsIntoEvidenceOptions {
+            evidence_id,
+            history_path: profile_dir.clone(),
+            max_visits: 0,
+            source_profile_path: "Google/Chrome/User Data/Default".to_string(),
+            volume_index_zero_based: None,
+            legacy_evidence_name: None,
+        };
+        let first = import_browser_artifacts_into_evidence(&case_path, options.clone())?;
+        let after_first = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let first_paths = after_first
+            .iter()
+            .filter(|entry| entry.metadata_json["browser_derivation_key"].is_string())
+            .map(|entry| entry.logical_path.clone())
+            .collect::<HashSet<_>>();
+        let second = import_browser_artifacts_into_evidence(&case_path, options)?;
+        let after_second = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let second_paths = after_second
+            .iter()
+            .filter(|entry| entry.metadata_json["browser_derivation_key"].is_string())
+            .map(|entry| entry.logical_path.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(first.entries_indexed, 3);
+        assert_eq!(second.entries_indexed, 3);
+        assert_eq!(first_paths, second_paths);
+        assert_eq!(second_paths.len(), 3);
+        assert_eq!(list_evidence(&case_path)?.len(), 1);
+        assert_eq!(after_second.len(), base_entries.len() + 3);
+        assert_eq!(artifact_count(&after_second, "browser_omnibox_shortcut"), 1);
+        assert_eq!(artifact_count(&after_second, "browser_autofill"), 2);
+        for entry in after_second.iter().filter(|entry| {
+            matches!(
+                entry.metadata_json["artifact_kind"].as_str(),
+                Some("browser_omnibox_shortcut" | "browser_autofill")
+            )
+        }) {
+            assert_eq!(
+                entry.metadata_json["source_file_time_basis"].as_str(),
+                Some("original_evidence_filesystem")
+            );
+            assert_eq!(
+                entry.metadata_json["browser_brand"].as_str(),
+                Some("chrome")
+            );
+            for key in [
+                "created_utc",
+                "modified_utc",
+                "accessed_utc",
+                "mft_modified_utc",
+            ] {
+                assert!(entry.metadata_json[key].is_null());
+            }
+        }
+        let shortcut = entry_with_artifact(&after_second, "browser_omnibox_shortcut");
+        assert_eq!(
+            shortcut.metadata_json["source_entry_id"].as_i64(),
+            Some(shortcuts_source_id)
+        );
+        assert_eq!(
+            shortcut.metadata_json["source_file_created_utc"].as_str(),
+            Some(shortcuts_created.as_str())
+        );
+        assert_eq!(
+            shortcut.metadata_json["source_file_modified_utc"].as_str(),
+            Some(shortcuts_modified.as_str())
+        );
+        let autofill = entry_with_artifact(&after_second, "browser_autofill");
+        assert_eq!(
+            autofill.metadata_json["source_entry_id"].as_i64(),
+            Some(web_data_source_id)
+        );
+        assert_eq!(
+            autofill.metadata_json["source_file_created_utc"].as_str(),
+            Some(web_data_created.as_str())
+        );
+        assert_eq!(
+            autofill.metadata_json["source_file_modified_utc"].as_str(),
+            Some(web_data_modified.as_str())
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn derived_browser_import_is_idempotent_retires_legacy_and_preserves_bookmark() -> Result<()> {
         let case_path = unique_case_path("derived-browser-idempotent");
         create_test_case(&case_path)?;
@@ -33433,15 +35791,48 @@ mod tests {
         add_browser_report_item(
             &case_path,
             bookmark_id,
+            "Omnibox: typed query",
+            "/Browser Activities/Omnibox/shortcut-typed_query.record",
+            serde_json::json!({
+                "activity_kind": "browser_omnibox_shortcut",
+                "text": "typed query",
+                "url": "https://search.example/?q=typed+query",
+                "last_access_time_utc": "2026-06-28T09:45:00Z",
+                "number_of_hits": 5,
+                "source_artifact": "Shortcuts"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
+            "Autofill: email",
+            "/Browser Activities/Autofill/1-email.record",
+            serde_json::json!({
+                "activity_kind": "browser_autofill",
+                "name": "email",
+                "value": "examiner@example.test",
+                "count": 3,
+                "date_created_utc": "2026-06-28T09:50:00Z",
+                "source_artifact": "Web Data"
+            }),
+        )?;
+        add_browser_report_item(
+            &case_path,
+            bookmark_id,
             "Download: tool.zip",
             "/Browser Activities/Downloads/7-tool.zip.record",
             serde_json::json!({
                 "activity_kind": "browser_download",
                 "file_name": "tool.zip",
                 "target_path": "C:\\Users\\me\\Downloads\\tool.zip",
+                "site_url": "https://site.example/download",
                 "tab_url": "https://example.com/download",
                 "start_time_utc": "2026-06-28T11:00:00Z",
-                "received_bytes": 2048
+                "received_bytes": 2048,
+                "download_url": "https://cdn.example/tool.zip",
+                "state_label": "complete",
+                "duration_human": "1.8s",
+                "outcome_summary": "complete - 2,048 bytes in 1.8s"
             }),
         )?;
         add_browser_report_item(
@@ -33508,8 +35899,15 @@ mod tests {
         assert!(html.contains("<dt>Last Visit</dt><dd>2026-06-28T09:00:00Z</dd>"));
         assert!(html.contains("<dd>Search</dd>"));
         assert!(html.contains("<dt>Search Term</dt><dd>keyword</dd>"));
+        assert!(html.contains("<dd>Omnibox Shortcut</dd>"));
+        assert!(html.contains("<dt>Typed Text</dt><dd>typed query</dd>"));
+        assert!(html.contains("<dd>Autofill</dd>"));
+        assert!(html.contains("<dt>Typed Value</dt><dd>examiner@example.test</dd>"));
         assert!(html.contains("<dd>Download</dd>"));
         assert!(html.contains("<dt>File Name</dt><dd>tool.zip</dd>"));
+        assert!(html.contains("<dt>Outcome</dt><dd>complete - 2,048 bytes in 1.8s</dd>"));
+        assert!(html.contains("<dt>Site URL</dt><dd>https://site.example/download</dd>"));
+        assert!(html.contains("<dt>Tab URL</dt><dd>https://example.com/download</dd>"));
         assert!(html.contains("<dd>Bookmark</dd>"));
         assert!(html.contains("<dt>Folder</dt><dd>Bookmarks Bar</dd>"));
         assert!(html.contains("<dd>Saved Login</dd>"));
@@ -33974,6 +36372,75 @@ mod tests {
             .iter()
             .find(|entry| entry.metadata_json["artifact_kind"].as_str() == Some(artifact_kind))
             .expect("expected artifact entry")
+    }
+
+    fn create_empty_chromium_history_core(history_path: &Path) -> Result<()> {
+        if let Some(parent) = history_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Connection::open(history_path)?.execute_batch(
+            "CREATE TABLE urls(
+                id INTEGER PRIMARY KEY,
+                url LONGVARCHAR,
+                title LONGVARCHAR,
+                visit_count INTEGER DEFAULT 0 NOT NULL,
+                typed_count INTEGER DEFAULT 0 NOT NULL,
+                last_visit_time INTEGER NOT NULL,
+                hidden INTEGER DEFAULT 0 NOT NULL
+             );
+             CREATE TABLE visits(
+                id INTEGER PRIMARY KEY,
+                url INTEGER NOT NULL,
+                visit_time INTEGER NOT NULL,
+                transition INTEGER DEFAULT 0 NOT NULL
+             );",
+        )?;
+        Ok(())
+    }
+
+    fn create_test_chromium_shortcuts(shortcuts_path: &Path) -> Result<()> {
+        let conn = Connection::open(shortcuts_path)?;
+        conn.execute_batch(
+            "CREATE TABLE omni_box_shortcuts(
+                id TEXT PRIMARY KEY,
+                text TEXT,
+                fill_into_edit TEXT,
+                url TEXT,
+                contents TEXT,
+                description TEXT,
+                type INTEGER,
+                keyword TEXT,
+                last_access_time INTEGER,
+                number_of_hits INTEGER
+             );
+             INSERT INTO omni_box_shortcuts(
+                id, text, fill_into_edit, url, contents, description, type,
+                keyword, last_access_time, number_of_hits
+             ) VALUES (
+                'shortcut-guid-1', 'openai forensic search', 'openai forensic search',
+                'https://www.google.com/search?q=openai+forensic+search',
+                'openai forensic search', 'Google Search', 0, 'google.com',
+                13300000025000000, 7
+             );",
+        )?;
+        Ok(())
+    }
+
+    fn create_test_chromium_web_data(web_data_path: &Path) -> Result<()> {
+        let conn = Connection::open(web_data_path)?;
+        conn.execute_batch(
+            "CREATE TABLE autofill(
+                name TEXT,
+                value TEXT,
+                count INTEGER,
+                date_created INTEGER,
+                date_last_used INTEGER
+             );
+             INSERT INTO autofill(name, value, count, date_created, date_last_used)
+             VALUES ('email', 'examiner@example.test', 3, 1700000000, 1700003600),
+                    ('case-note', 'typed evidence note', 2, 1700100000, 1700107200);",
+        )?;
+        Ok(())
     }
 
     fn create_test_chromium_history(history_path: &Path) -> Result<()> {
