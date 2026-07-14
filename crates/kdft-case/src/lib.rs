@@ -1,22 +1,79 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use chrome_cache_parser::block_file::{BlockCacheEntryState, LazyBlockFileCacheEntry};
+use chrome_cache_parser::ChromeCache;
+use chrono::{DateTime, SecondsFormat, Utc};
+use evtx::{EvtxParser, ParserSettings as EvtxParserSettings, SerializedEvtxRecord};
+use notatin::cell_key_value::CellKeyValueDataTypes as RegistryValueDataType;
+use notatin::cell_value::CellValue as RegistryCellValue;
+use notatin::parser::ParserIterator as RegistryParserIterator;
+use notatin::parser_builder::ParserBuilder as RegistryParserBuilder;
+use outlook_pst::ltp::prop_context::PropertyValue as PstPropertyValue;
+use outlook_pst::ltp::table_context::{
+    TableContext as PstTableContext, TableRowData as PstTableRowData,
+};
+use outlook_pst::messaging::{
+    folder::Folder as PstFolder, message::Message as PstMessage, store::Store as PstStore,
+};
+use outlook_pst::ndb::node_id::NodeId as PstNodeId;
+use rusqlite::{
+    named_params, params, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 const INITIAL_SCHEMA: &str = include_str!("../../../schemas/001_initial.sql");
 // Keyword-search preview window stored per file. Kept small so the case
 // database scales to very large evidence (a 64 KiB preview per file made a
 // 100k-file case ~1.7 GB, which is untenable for multi-terabyte disks). This
 // window catches file headers and the start of text; full-content search is a
-// separate on-demand read against the image.
-const CONTENT_INDEX_BYTES: usize = 4_096;
+// separate on-demand read against the image (see raw_disk_search).
+pub const CONTENT_INDEX_BYTES: usize = 4_096;
 const EMAIL_PARSE_MAX_BYTES: u64 = 1024 * 1024;
 const EMAIL_BODY_PREVIEW_CHARS: usize = 1200;
+const BITLOCKER_LOCKED_FILESYSTEM: &str = "BitLocker (locked)";
+const BITLOCKER_LOCKED_STATUS: &str =
+    "BitLocker volume detected via FVE signature; locked encrypted volume is not decrypted";
+const BITLOCKER_FVE_SIGNATURE: &[u8; 8] = b"-FVE-FS-";
+const REGISTRY_PARSER_NAME: &str = "notatin 1.0.1";
+const REGISTRY_VALUE_TEXT_PREVIEW_CHARS: usize = 4096;
+const REGISTRY_BINARY_PREVIEW_BYTES: usize = 256;
+const EVTX_PARSER_NAME: &str = "evtx 0.12.2";
+const EVTX_EVENT_SUMMARY_PREVIEW_CHARS: usize = 1200;
+const EVTX_PARSER_ERROR_LIMIT: usize = 16;
+const PST_PARSER_NAME: &str = "outlook-pst 1.2.0";
+const CHROME_CACHE_PARSER_NAME: &str = "chrome-cache-parser 0.2.5";
+const CHROME_CACHE_DEFAULT_MAX_ENTRIES: usize = 5_000;
+const CHROME_CACHE_HEADER_PARSE_BYTES: usize = 64 * 1024;
+const CHROME_CACHE_PARSER_ERROR_LIMIT: usize = 16;
+const PST_MESSAGE_PROP_IDS: &[u16] = &[
+    0x001A, // PidTagMessageClass
+    0x0037, // PidTagSubject
+    0x0039, // PidTagClientSubmitTime
+    0x0042, // PidTagSentRepresentingName
+    0x0050, // PidTagReplyRecipientNames
+    0x007D, // PidTagTransportMessageHeaders
+    0x0C1A, // PidTagSenderName
+    0x0C1F, // PidTagSenderEmailAddress
+    0x0E02, // PidTagDisplayBcc
+    0x0E03, // PidTagDisplayCc
+    0x0E04, // PidTagDisplayTo
+    0x0E06, // PidTagMessageDeliveryTime
+    0x0E07, // PidTagMessageFlags
+    0x0E08, // PidTagMessageSize
+    0x1000, // PidTagBody
+    0x1009, // PidTagRtfCompressed
+    0x1013, // PidTagHtml
+    0x1035, // PidTagInternetMessageId
+    0x3007, // PidTagCreationTime
+    0x3008, // PidTagLastModificationTime
+    0x300B, // PidTagSearchKey
+];
 const NTFS_BITMAP_PARSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const NTFS_UNALLOCATED_METADATA_EXTENTS_LIMIT: usize = 128;
 
@@ -92,18 +149,48 @@ pub struct EvidenceSource {
     /// Status of the most recent indexing/import job ("completed", "truncated", ...),
     /// so the UI can distinguish empty folders from not-yet-indexed ones.
     pub last_job_status: Option<String>,
+    /// Whether the most recent filesystem_index job captured file content
+    /// (`capture_content` processing option). `Some(false)` = metadata-only
+    /// index: Deep Search content matching is unavailable for this evidence
+    /// and the UI must say so. `None` = never indexed or a pre-option job.
+    pub content_indexed: Option<bool>,
     /// SHA-256 of the evidence source (decoded stream for disk images),
     /// computed by the examiner-driven hash job.
     pub sha256_hex: Option<String>,
     pub hashed_at: Option<String>,
+    /// Meaning of `sha256_hex`: `logical_media` for a decoded disk-image
+    /// stream or `file` for ordinary file evidence.
+    pub sha256_scope: Option<String>,
+    /// Per-file acquisition/container hashes. This remains separate from the
+    /// decoded logical-media digest so either representation can be verified.
+    pub acquisition_manifest_json: Option<AcquisitionManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquisitionSegmentManifest {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquisitionManifest {
+    pub scheme: String,
+    pub segments: Vec<AcquisitionSegmentManifest>,
+    pub total_size: u64,
+    pub segment_count: usize,
+    pub complete: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct HashEvidenceResult {
     pub evidence_id: i64,
     pub sha256_hex: String,
+    pub sha256_scope: String,
     pub bytes_hashed: u64,
     pub hashed_at: String,
+    pub acquisition_manifest_json: Option<AcquisitionManifest>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +235,12 @@ pub struct RemoveBookmarkItemResult {
     pub bookmark_id: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RemoveBookmarkFolderResult {
+    pub folder_id: i64,
+    pub name: String,
+}
+
 #[derive(Debug, Serialize, Default)]
 pub struct ClearStaleFindingsResult {
     pub removed_folders: i64,
@@ -159,6 +252,72 @@ pub struct ClearStaleFindingsResult {
 pub struct ProcessEvidenceOptions {
     pub evidence_id: i64,
     pub max_entries: usize,
+}
+
+/// Examiner-selectable sub-operations for one "read file system" processing
+/// run, modeled on the processing-options dialogs of the major commercial
+/// forensic suites: the base metadata walk is always performed, while each
+/// content-touching extra is opt-in/out. Turning `capture_content` off skips
+/// every per-file content read (the dominant cost on compressed containers),
+/// producing a fast metadata-only index; Deep Search content matching is then
+/// unavailable for that evidence until it is re-processed with content on,
+/// and the job record says so.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessingProfile {
+    /// Read each file's leading bytes into content_head for content search.
+    pub capture_content: bool,
+    /// Parse .eml / RFC-822 text messages into email metadata during the walk.
+    pub parse_emails: bool,
+    /// Parse browser profiles found on the evidence (history/downloads/etc.)
+    /// into browser artifact records.
+    pub parse_browsers: bool,
+}
+
+impl Default for ProcessingProfile {
+    fn default() -> Self {
+        Self {
+            capture_content: true,
+            parse_emails: true,
+            parse_browsers: true,
+        }
+    }
+}
+
+thread_local! {
+    /// Active profile for the processing run on THIS thread. Processing is
+    /// synchronous on the caller's thread; the guard restores the previous
+    /// value so nested/subsequent runs cannot inherit a stale profile.
+    static PROCESSING_PROFILE: std::cell::Cell<ProcessingProfile> =
+        const {
+            std::cell::Cell::new(ProcessingProfile {
+                capture_content: true,
+                parse_emails: true,
+                parse_browsers: true,
+            })
+        };
+}
+
+fn processing_profile() -> ProcessingProfile {
+    PROCESSING_PROFILE.with(std::cell::Cell::get)
+}
+
+struct ProcessingProfileGuard {
+    previous: ProcessingProfile,
+}
+
+impl Drop for ProcessingProfileGuard {
+    fn drop(&mut self) {
+        PROCESSING_PROFILE.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn set_processing_profile(profile: ProcessingProfile) -> ProcessingProfileGuard {
+    let previous = PROCESSING_PROFILE.with(|cell| {
+        let previous = cell.get();
+        cell.set(profile);
+        previous
+    });
+    ProcessingProfileGuard { previous }
 }
 
 #[derive(Debug, Serialize)]
@@ -192,7 +351,13 @@ pub struct DeepSearchOptions {
 pub struct DeepSearchResult {
     pub evidence_id: i64,
     pub entry_id: i64,
+    /// Collision-safe KDFT database/navigation key. Retained as
+    /// `logical_path` for compatibility, but never presented as the source
+    /// filesystem path.
     pub logical_path: String,
+    pub internal_path_key: String,
+    /// Parser-native path exactly as recorded on the source filesystem.
+    pub source_path_exact: Option<String>,
     pub display_name: String,
     pub entry_kind: String,
     pub match_kind: String,
@@ -208,6 +373,23 @@ pub struct ImportBrowserHistoryOptions {
     pub evidence_name: Option<String>,
 }
 
+/// Options for browser artifacts derived from an already-attached evidence
+/// source. Unlike a manual browser-history import, this keeps the parsed
+/// records under the parent evidence and replaces the same profile's previous
+/// derived records on every run.
+#[derive(Debug, Clone)]
+pub struct ImportBrowserArtifactsIntoEvidenceOptions {
+    pub evidence_id: i64,
+    pub history_path: PathBuf,
+    pub max_visits: usize,
+    /// Exact profile directory path as recorded by the source filesystem.
+    pub source_profile_path: String,
+    pub volume_index_zero_based: Option<usize>,
+    /// Auto-import label used by older builds. Matching standalone derived
+    /// evidence rows are retired after their bookmarks have been migrated.
+    pub legacy_evidence_name: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BrowserHistoryImportResult {
     pub evidence_id: i64,
@@ -219,6 +401,7 @@ pub struct BrowserHistoryImportResult {
     pub preferences_indexed: usize,
     pub truncated: bool,
     pub status: String,
+    pub parse_errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +411,8 @@ pub struct FilesystemEntry {
     pub evidence_id: i64,
     pub parent_id: Option<i64>,
     pub logical_path: String,
+    pub internal_path_key: String,
+    pub source_path_exact: Option<String>,
     pub name: String,
     pub entry_kind: String,
     pub size_bytes: Option<i64>,
@@ -260,6 +445,23 @@ pub struct EntryBytes {
     pub total_size: u64,
     pub eof: bool,
     pub bytes: Vec<u8>,
+}
+
+/// First authoritative decoded-media location for an indexed file. This is
+/// intentionally separate from file-relative byte reads: a filesystem view
+/// shows the underlying evidence stream and must never substitute a partition
+/// start merely because the file's own extent is unknown.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryDiskLocation {
+    pub entry_id: i64,
+    pub evidence_id: i64,
+    pub available: bool,
+    pub decoded_media_offset: Option<u64>,
+    pub file_relative_offset: Option<u64>,
+    pub contiguous_bytes: Option<u64>,
+    pub exact_start: bool,
+    pub basis: String,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +621,8 @@ pub struct BookmarkItem {
     pub item_order: i64,
     pub display_name: Option<String>,
     pub logical_path: Option<String>,
+    pub internal_path_key: Option<String>,
+    pub source_path_exact: Option<String>,
     pub selection_offset: Option<i64>,
     pub selection_length: Option<i64>,
     pub data_preview: Option<String>,
@@ -443,9 +647,20 @@ pub struct ReportEvidence {
     pub file_extension: Option<String>,
     pub size_bytes: Option<i64>,
     pub sha256: Option<String>,
+    pub sha256_scope: Option<String>,
+    pub acquisition_manifest_json: Option<AcquisitionManifest>,
     pub attached_at: String,
     pub indexed_at: Option<String>,
     pub entries_indexed: i64,
+    pub latest_process_job_id: Option<i64>,
+    pub latest_process_job_type: Option<String>,
+    pub latest_process_job_status: Option<String>,
+    /// Exact examiner request. `Some(0)` means unlimited; `None` means no
+    /// applicable processing job/limit was recorded.
+    pub requested_entry_limit: Option<i64>,
+    pub latest_process_entries_indexed: Option<i64>,
+    pub processing_truncation_reason: Option<String>,
+    pub processing_coverage: String,
     pub notes: Option<String>,
 }
 
@@ -469,7 +684,12 @@ pub struct ReportTreeLine {
 #[derive(Debug, Serialize)]
 pub struct RenderedReport {
     pub html: String,
-    pub sha256: String,
+    /// SHA-256 of every report byte preceding the integrity footer. This is
+    /// the digest embedded in the footer itself (a report cannot embed its
+    /// own whole-file hash), so it is deliberately NOT the hash of the final
+    /// file on disk - that one is computed after writing and recorded as
+    /// `report_file_sha256`.
+    pub content_prefix_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -771,6 +991,24 @@ pub fn add_evidence(case_path: &Path, options: AddEvidenceOptions) -> Result<i64
     Ok(evidence_id)
 }
 
+fn acquisition_manifest_from_row(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<AcquisitionManifest>> {
+    let value: Option<String> = row.get(column)?;
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
 pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
     let conn = open_existing_case(case_path)?;
     let mut stmt = conn.prepare(
@@ -779,10 +1017,18 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
                 e.indexed_at, e.notes,
                 (SELECT j.status FROM evidence_jobs j
                  WHERE j.case_id = e.case_id AND j.evidence_id = e.id
-                   AND j.job_type IN ('filesystem_index', 'browser_history_import')
+                   AND j.job_type = CASE WHEN e.source_kind = 'browser_history'
+                       THEN 'browser_history_import' ELSE 'filesystem_index' END
                  ORDER BY j.id DESC LIMIT 1),
-                e.sha256_hex, e.hashed_at
+                e.sha256_hex, e.hashed_at, e.sha256_scope, e.acquisition_manifest_json,
+                (SELECT json_extract(j.parameters_json, '$.capture_content')
+                 FROM evidence_jobs j
+                 WHERE j.case_id = e.case_id AND j.evidence_id = e.id
+                   AND j.job_type = 'filesystem_index'
+                   AND j.status IN ('completed', 'truncated')
+                 ORDER BY j.id DESC LIMIT 1)
          FROM evidence_sources e
+         WHERE e.attach_status <> 'superseded'
          ORDER BY e.id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -802,16 +1048,291 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
             last_job_status: row.get(12)?,
             sha256_hex: row.get(13)?,
             hashed_at: row.get(14)?,
+            sha256_scope: row.get(15)?,
+            acquisition_manifest_json: acquisition_manifest_from_row(row, 16)?,
+            content_indexed: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("listing evidence sources")
 }
 
-/// Examiner-driven hash job: computes SHA-256 over the evidence source and
-/// records it on the evidence row, in an evidence_jobs row, and in the audit
-/// trail. For disk images the DECODED stream is hashed (all EWF/split-raw
-/// segments as one disk), so the value matches what the parsers actually read.
+#[derive(Debug)]
+struct AcquisitionSegmentSet {
+    scheme: String,
+    paths: Vec<PathBuf>,
+    complete: bool,
+    note: String,
+}
+
+#[derive(Debug)]
+struct AcquisitionSourceState {
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+const EWF_NUMBERED_SEGMENT_LIMIT: usize = 775;
+
+fn ewf_segment_ordinal(extension: &str) -> Option<(String, usize, bool)> {
+    if !extension.is_ascii() || extension.len() < 3 {
+        return None;
+    }
+    let (prefix, suffix) = extension.split_at(extension.len() - 2);
+    if !matches!(
+        prefix.to_ascii_lowercase().as_str(),
+        "e" | "ex" | "l" | "lx" | "s" | "sx"
+    ) {
+        return None;
+    }
+    let suffix_bytes = suffix.as_bytes();
+    let ordinal = if suffix_bytes.iter().all(u8::is_ascii_digit) {
+        let value = suffix.parse::<usize>().ok()?;
+        (1..=99).contains(&value).then_some(value)?
+    } else if suffix_bytes.iter().all(u8::is_ascii_alphabetic) {
+        let upper = suffix.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        if bytes[0] < b'A' || bytes[1] < b'A' {
+            return None;
+        }
+        100 + usize::from(bytes[0] - b'A') * 26 + usize::from(bytes[1] - b'A')
+    } else {
+        return None;
+    };
+    (ordinal <= EWF_NUMBERED_SEGMENT_LIMIT).then_some((
+        prefix.to_string(),
+        ordinal,
+        extension.chars().any(|ch| ch.is_ascii_uppercase()),
+    ))
+}
+
+fn ewf_segment_extension(prefix: &str, ordinal: usize, uppercase: bool) -> String {
+    let suffix = if ordinal <= 99 {
+        format!("{ordinal:02}")
+    } else {
+        let value = ordinal - 100;
+        let first = char::from(b'A' + u8::try_from(value / 26).unwrap_or(25));
+        let second = char::from(b'A' + u8::try_from(value % 26).unwrap_or(25));
+        format!("{first}{second}")
+    };
+    if uppercase {
+        format!("{prefix}{suffix}")
+    } else {
+        format!("{prefix}{}", suffix.to_ascii_lowercase())
+    }
+}
+
+/// Enumerates the standard, finite EWF numbered namespace (E01-E99, EAA-EZZ,
+/// and the equivalent Ex/Lx/Sx prefixes). Candidate generation is bounded and
+/// deterministic; a sibling after a gap is included but marks the set partial.
+fn ewf_numbered_segments(path: &Path) -> Result<Option<AcquisitionSegmentSet>> {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let Some((prefix, source_ordinal, uppercase)) = ewf_segment_ordinal(extension) else {
+        return Ok(None);
+    };
+
+    let mut paths = Vec::new();
+    let mut ordinals = Vec::new();
+    for ordinal in 1..=EWF_NUMBERED_SEGMENT_LIMIT {
+        let candidate = if ordinal == source_ordinal {
+            path.to_path_buf()
+        } else {
+            path.with_extension(ewf_segment_extension(&prefix, ordinal, uppercase))
+        };
+        if candidate.is_file() {
+            paths.push(candidate);
+            ordinals.push(ordinal);
+        }
+    }
+    if paths.is_empty() {
+        bail!(
+            "EWF acquisition source is no longer a file: {}",
+            path.display()
+        );
+    }
+
+    let highest = ordinals.iter().copied().max().unwrap_or(source_ordinal);
+    let missing = (1..=highest)
+        .filter(|ordinal| !ordinals.contains(ordinal))
+        .collect::<Vec<_>>();
+    let gap_free = missing.is_empty();
+    // Filename enumeration can prove gaps, but (without an exposed EWF final-
+    // segment marker) it cannot prove that a gap-free, shorter set did not lose
+    // a terminal sibling. Only exhaustion of the bounded standard namespace is
+    // conclusive from filenames alone.
+    let complete = gap_free && highest == EWF_NUMBERED_SEGMENT_LIMIT;
+    let note = if complete {
+        format!(
+            "Sequential EWF segment files exhaust the bounded standard E01-EZZ namespace through ordinal {highest}; every enumerated file was hashed after the logical-media stream decoded successfully."
+        )
+    } else if !gap_free {
+        let missing = missing
+            .iter()
+            .take(8)
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "EWF segment enumeration found a gap before ordinal {highest} (missing ordinal(s): {missing}); the acquisition manifest is partial even though the decoder returned a logical-media stream."
+        )
+    } else {
+        format!(
+            "EWF segment files were sequential through ordinal {highest} and all were hashed, but filename enumeration alone cannot prove that a terminal sibling is not missing because the decoder does not expose the EWF final-segment marker; completeness is therefore recorded as partial."
+        )
+    };
+    Ok(Some(AcquisitionSegmentSet {
+        scheme: "ewf_numbered_segments".to_string(),
+        paths,
+        complete,
+        note,
+    }))
+}
+
+fn acquisition_segment_set(path: &Path) -> Result<AcquisitionSegmentSet> {
+    if let Some(segments) = split_raw_segments(path)? {
+        return Ok(AcquisitionSegmentSet {
+            scheme: "split_raw_segments".to_string(),
+            paths: segments.into_iter().map(|(path, _)| path).collect(),
+            complete: true,
+            note: "All sequential split-raw segments were enumerated from the first segment; the split-raw gap check passed and every segment file was hashed.".to_string(),
+        });
+    }
+    if let Some(segments) = ewf_numbered_segments(path)? {
+        return Ok(segments);
+    }
+    Ok(AcquisitionSegmentSet {
+        scheme: "single_container_file".to_string(),
+        paths: vec![path.to_path_buf()],
+        complete: true,
+        note: "The acquisition consists of one container file; every byte of that file was hashed."
+            .to_string(),
+    })
+}
+
+fn sha256_reader(reader: &mut dyn Read, description: &str) -> Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut bytes_hashed = 0_u64;
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("reading {description} for SHA-256"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes_hashed = bytes_hashed
+            .checked_add(read as u64)
+            .context("SHA-256 byte count exceeds u64")?;
+    }
+    let sha256_hex = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((sha256_hex, bytes_hashed))
+}
+
+fn hash_acquisition_segment(path: &Path) -> Result<AcquisitionSegmentManifest> {
+    let before = fs::metadata(path)
+        .with_context(|| format!("reading acquisition segment metadata {}", path.display()))?;
+    if !before.is_file() {
+        bail!("acquisition segment is not a file: {}", path.display());
+    }
+    let modified_before = before.modified().ok();
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening acquisition segment {}", path.display()))?;
+    let (sha256, size) = sha256_reader(
+        &mut file,
+        &format!("acquisition segment {}", path.display()),
+    )?;
+    let after = fs::metadata(path)
+        .with_context(|| format!("rechecking acquisition segment {}", path.display()))?;
+    if size != before.len()
+        || size != after.len()
+        || modified_before
+            .zip(after.modified().ok())
+            .is_some_and(|(before, after)| before != after)
+    {
+        bail!(
+            "acquisition segment changed while hashing; no manifest was stored: {}",
+            path.display()
+        );
+    }
+    Ok(AcquisitionSegmentManifest {
+        path: stable_path_string(path),
+        size,
+        sha256,
+    })
+}
+
+fn acquisition_source_snapshot(set: &AcquisitionSegmentSet) -> Result<Vec<AcquisitionSourceState>> {
+    set.paths
+        .iter()
+        .map(|path| {
+            let metadata = fs::metadata(path).with_context(|| {
+                format!("reading acquisition source metadata {}", path.display())
+            })?;
+            if !metadata.is_file() {
+                bail!("acquisition segment is not a file: {}", path.display());
+            }
+            Ok(AcquisitionSourceState {
+                path: path.clone(),
+                size: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        })
+        .collect()
+}
+
+fn verify_acquisition_source_snapshot(snapshot: &[AcquisitionSourceState]) -> Result<()> {
+    for expected in snapshot {
+        let current = fs::metadata(&expected.path).with_context(|| {
+            format!(
+                "rechecking acquisition source metadata {}",
+                expected.path.display()
+            )
+        })?;
+        let modified_changed = expected
+            .modified
+            .zip(current.modified().ok())
+            .is_some_and(|(before, after)| before != after);
+        if !current.is_file() || current.len() != expected.size || modified_changed {
+            bail!(
+                "acquisition source changed between decoded-media and container hashing; no mutually inconsistent hashes were stored: {}",
+                expected.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn acquisition_manifest(set: AcquisitionSegmentSet) -> Result<AcquisitionManifest> {
+    let mut segments = Vec::with_capacity(set.paths.len());
+    let mut total_size = 0_u64;
+    for path in set.paths {
+        let segment = hash_acquisition_segment(&path)?;
+        total_size = total_size
+            .checked_add(segment.size)
+            .context("acquisition segment total size exceeds u64")?;
+        segments.push(segment);
+    }
+    Ok(AcquisitionManifest {
+        scheme: set.scheme,
+        segment_count: segments.len(),
+        segments,
+        total_size,
+        complete: set.complete,
+        note: set.note,
+    })
+}
+
+/// Examiner-driven hash job. Image evidence records two independent identities:
+/// SHA-256 over the decoded logical-media stream used by parsers, plus a
+/// per-file acquisition/container manifest that a verifier can reproduce from
+/// the supplied files. Ordinary file evidence uses a `file`-scope digest.
 pub fn hash_evidence(case_path: &Path, evidence_id: i64) -> Result<HashEvidenceResult> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
@@ -823,81 +1344,92 @@ pub fn hash_evidence(case_path: &Path, evidence_id: i64) -> Result<HashEvidenceR
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
-    let mut hasher = Sha256::new();
-    let mut bytes_hashed = 0_u64;
-    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
-    if source_kind == "image" {
-        let mut opened = open_disk_image(Path::new(&source_path))?;
-        opened.reader.seek(SeekFrom::Start(0))?;
-        loop {
-            let read = opened
-                .reader
-                .read(&mut buffer)
-                .context("reading decoded image stream for hashing")?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            bytes_hashed += read as u64;
-        }
-    } else {
-        let metadata = fs::metadata(&source_path)
-            .with_context(|| format!("reading evidence metadata {source_path}"))?;
-        if !metadata.is_file() {
-            bail!(
+    let (sha256_hex, bytes_hashed, sha256_scope, acquisition_manifest_json) =
+        if source_kind == "image" {
+            let segment_set = acquisition_segment_set(Path::new(&source_path))?;
+            let source_snapshot = acquisition_source_snapshot(&segment_set)?;
+            let mut opened = open_disk_image(Path::new(&source_path))?;
+            opened.reader.seek(SeekFrom::Start(0))?;
+            let (sha256_hex, bytes_hashed) =
+                sha256_reader(&mut *opened.reader, "decoded logical-media stream")?;
+            let acquisition_manifest_json =
+                acquisition_manifest(segment_set).context("hashing acquisition files")?;
+            verify_acquisition_source_snapshot(&source_snapshot)?;
+            (
+                sha256_hex,
+                bytes_hashed,
+                "logical_media".to_string(),
+                Some(acquisition_manifest_json),
+            )
+        } else {
+            let metadata = fs::metadata(&source_path)
+                .with_context(|| format!("reading evidence metadata {source_path}"))?;
+            if !metadata.is_file() {
+                bail!(
                 "hashing supports file and image evidence; {source_kind} evidence is a directory"
             );
-        }
-        let mut file = fs::File::open(&source_path)
-            .with_context(|| format!("opening evidence {source_path}"))?;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .context("reading evidence file for hashing")?;
-            if read == 0 {
-                break;
             }
-            hasher.update(&buffer[..read]);
-            bytes_hashed += read as u64;
-        }
+            let mut file = fs::File::open(&source_path)
+                .with_context(|| format!("opening evidence {source_path}"))?;
+            let (sha256_hex, bytes_hashed) = sha256_reader(&mut file, "evidence file")?;
+            (sha256_hex, bytes_hashed, "file".to_string(), None)
+        };
+
+    let acquisition_manifest_text = acquisition_manifest_json
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serializing acquisition manifest")?;
+    let job_parameters = serde_json::json!({
+        "algorithm": "sha256",
+        "bytes_hashed": bytes_hashed,
+        "sha256_scope": sha256_scope.as_str(),
+        "acquisition_manifest_json": acquisition_manifest_json.as_ref(),
+    })
+    .to_string();
+    let mut audit_details = serde_json::json!({
+        "algorithm": "sha256",
+        "sha256": sha256_hex.as_str(),
+        "sha256_scope": sha256_scope.as_str(),
+        "bytes_hashed": bytes_hashed,
+        "acquisition_manifest_json": acquisition_manifest_json.as_ref(),
+    });
+    if sha256_scope == "logical_media" {
+        audit_details["logical_media_sha256"] = serde_json::json!(sha256_hex.as_str());
+    } else {
+        audit_details["file_sha256"] = serde_json::json!(sha256_hex.as_str());
     }
-    let sha256_hex: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
     tx.execute(
         "UPDATE evidence_sources
-         SET sha256_hex = ?3, hashed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         SET sha256_hex = ?3,
+             hashed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             sha256_scope = ?4,
+             acquisition_manifest_json = ?5
          WHERE case_id = ?1 AND id = ?2",
-        params![case_id, evidence_id, sha256_hex],
+        params![
+            case_id,
+            evidence_id,
+            sha256_hex,
+            sha256_scope,
+            acquisition_manifest_text
+        ],
     )?;
     tx.execute(
         "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json,
                                    started_at, finished_at)
          VALUES (?1, ?2, 'hash', 'completed',
-                 json_object('algorithm', 'sha256', 'bytes_hashed', ?3),
+                 ?3,
                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![
-            case_id,
-            evidence_id,
-            i64::try_from(bytes_hashed).unwrap_or(i64::MAX)
-        ],
+        params![case_id, evidence_id, job_parameters],
     )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.hash', ?2, 'evidence', ?3,
-                 json_object('algorithm', 'sha256', 'sha256', ?4, 'bytes_hashed', ?5))",
-        params![
-            case_id,
-            actor,
-            evidence_id,
-            sha256_hex,
-            i64::try_from(bytes_hashed).unwrap_or(i64::MAX)
-        ],
+                 ?4)",
+        params![case_id, actor, evidence_id, audit_details.to_string()],
     )?;
     let hashed_at: String = tx.query_row(
         "SELECT hashed_at FROM evidence_sources WHERE case_id = ?1 AND id = ?2",
@@ -908,9 +1440,296 @@ pub fn hash_evidence(case_path: &Path, evidence_id: i64) -> Result<HashEvidenceR
     Ok(HashEvidenceResult {
         evidence_id,
         sha256_hex,
+        sha256_scope,
         bytes_hashed,
         hashed_at,
+        acquisition_manifest_json,
     })
+}
+
+pub struct HashIndexedFilesOptions {
+    pub evidence_id: i64,
+    /// Stop after this many files were hashed or skipped; 0 = every file.
+    pub max_files: usize,
+    /// Files larger than this are skipped with a disclosed per-entry reason;
+    /// 0 = no size cap.
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HashIndexedFilesResult {
+    pub evidence_id: i64,
+    pub files_hashed: usize,
+    pub files_skipped: usize,
+    pub bytes_hashed: u64,
+    pub truncated: bool,
+}
+
+const FILE_HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Per-file SHA-256 over each indexed file's complete reconstructed content
+/// (the professional-suite "compute hash" processing option). Every hash is
+/// stamped into the entry's metadata as `file_sha256` (+ timestamp); files
+/// that cannot be fully reconstructed, exceed the size cap, or fail to read
+/// get a disclosed `file_sha256_skipped` reason instead - a partial-content
+/// digest is never presented as the file's hash.
+pub fn hash_indexed_files(
+    case_path: &Path,
+    options: HashIndexedFilesOptions,
+) -> Result<HashIndexedFilesResult> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, options.evidence_id)?;
+    conn.execute(
+        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
+         VALUES (?1, ?2, 'file_hash', 'running',
+                 json_object('algorithm', 'sha256', 'max_files', ?3, 'max_file_bytes', ?4),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![
+            case_id,
+            options.evidence_id,
+            i64::try_from(options.max_files).unwrap_or(i64::MAX),
+            i64::try_from(options.max_file_bytes).unwrap_or(i64::MAX)
+        ],
+    )?;
+    let job_id = conn.last_insert_rowid();
+
+    let candidates: Vec<(i64, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, size_bytes FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+               AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
+                   NOT IN ('unallocated_space')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![case_id, options.evidence_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("listing files to hash")?
+    };
+
+    let mut files_hashed = 0_usize;
+    let mut files_skipped = 0_usize;
+    let mut total_bytes_hashed = 0_u64;
+    let mut truncated = false;
+    let stamp_skip = |conn: &Connection, entry_id: i64, reason: &str| -> Result<()> {
+        conn.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(metadata_json,
+                     '$.file_sha256_skipped', ?2,
+                     '$.file_sha256_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             WHERE id = ?1",
+            params![entry_id, reason],
+        )?;
+        Ok(())
+    };
+    for (entry_id, size_bytes) in candidates {
+        if options.max_files != 0 && files_hashed + files_skipped >= options.max_files {
+            truncated = true;
+            break;
+        }
+        if options.max_file_bytes != 0
+            && size_bytes.unwrap_or(0).max(0) as u64 > options.max_file_bytes
+        {
+            stamp_skip(
+                &conn,
+                entry_id,
+                &format!(
+                    "file exceeds the examiner-set per-file hash size cap of {} bytes",
+                    options.max_file_bytes
+                ),
+            )?;
+            files_skipped += 1;
+            continue;
+        }
+        // Stream the reconstructed content exactly the way recovery does.
+        let mut hasher = Sha256::new();
+        let mut offset = 0_u64;
+        let mut total_size = 0_u64;
+        let mut read_error: Option<String> = None;
+        loop {
+            match read_filesystem_entry_bytes(
+                case_path,
+                ReadEntryBytesOptions {
+                    entry_id,
+                    offset,
+                    length: FILE_HASH_CHUNK_BYTES,
+                },
+            ) {
+                Ok(chunk) => {
+                    total_size = chunk.total_size;
+                    if !chunk.bytes.is_empty() {
+                        hasher.update(&chunk.bytes);
+                        offset = offset.saturating_add(chunk.bytes_read as u64);
+                    }
+                    if chunk.eof || chunk.bytes_read == 0 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    read_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(error) = read_error {
+            stamp_skip(
+                &conn,
+                entry_id,
+                &format!("file content could not be read for hashing: {error}"),
+            )?;
+            files_skipped += 1;
+            continue;
+        }
+        if offset != total_size {
+            stamp_skip(
+                &conn,
+                entry_id,
+                &format!(
+                    "file content is not fully reconstructable ({offset} of {total_size} bytes readable); no hash recorded for partial content"
+                ),
+            )?;
+            files_skipped += 1;
+            continue;
+        }
+        let digest: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        conn.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(metadata_json,
+                     '$.file_sha256', ?2,
+                     '$.file_sha256_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     '$.file_sha256_input', 'complete reconstructed file content')
+             WHERE id = ?1",
+            params![entry_id, digest],
+        )?;
+        files_hashed += 1;
+        total_bytes_hashed = total_bytes_hashed.saturating_add(offset);
+    }
+
+    let status = if truncated { "truncated" } else { "completed" };
+    conn.execute(
+        "UPDATE evidence_jobs
+         SET status = ?2,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             parameters_json = json_set(parameters_json,
+                 '$.files_hashed', ?3, '$.files_skipped', ?4, '$.bytes_hashed', ?5)
+         WHERE id = ?1",
+        params![
+            job_id,
+            status,
+            i64::try_from(files_hashed).unwrap_or(i64::MAX),
+            i64::try_from(files_skipped).unwrap_or(i64::MAX),
+            i64::try_from(total_bytes_hashed).unwrap_or(i64::MAX)
+        ],
+    )?;
+    let actor = audit_actor(&conn, case_id)?;
+    conn.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.file_hash', ?2, 'evidence', ?3,
+                 json_object('files_hashed', ?4, 'files_skipped', ?5, 'bytes_hashed', ?6,
+                             'status', ?7))",
+        params![
+            case_id,
+            actor,
+            options.evidence_id,
+            i64::try_from(files_hashed).unwrap_or(i64::MAX),
+            i64::try_from(files_skipped).unwrap_or(i64::MAX),
+            i64::try_from(total_bytes_hashed).unwrap_or(i64::MAX),
+            status
+        ],
+    )?;
+    Ok(HashIndexedFilesResult {
+        evidence_id: options.evidence_id,
+        files_hashed,
+        files_skipped,
+        bytes_hashed: total_bytes_hashed,
+        truncated,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserProfileCandidate {
+    pub entry_id: i64,
+    pub volume_index_zero_based: Option<usize>,
+    /// Exact in-volume path of the profile FOLDER (parent of the detected
+    /// history database), suitable for live export/import.
+    pub profile_path: String,
+    pub db_name: String,
+    pub filesystem_parser: Option<String>,
+}
+
+/// Detects browser profiles among an evidence's INDEXED entries by their
+/// history databases: Firefox `places.sqlite`, Safari `History.db`, and
+/// Chromium `History` under a `User Data` profile tree. Used by the
+/// post-index browser-parsing pass (ext volumes are handled during the walk
+/// itself; see maybe_auto_import_browser_profile). Deleted entries are
+/// skipped - a half-recovered profile database is import material only when
+/// the examiner recovers it deliberately.
+pub fn find_browser_profile_candidates(
+    case_path: &Path,
+    evidence_id: i64,
+) -> Result<Vec<BrowserProfileCandidate>> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, evidence_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name,
+                COALESCE(
+                    NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ext_path'), '')
+                ),
+                json_extract(metadata_json, '$.volume_index_zero_based'),
+                json_extract(metadata_json, '$.filesystem_parser')
+         FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+           AND is_deleted = 0
+           AND (name IN ('places.sqlite', 'History.db')
+                OR (name = 'History'
+                    AND (logical_path LIKE '%User_Data%' OR logical_path LIKE '%User Data%')))
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut seen: HashSet<(Option<usize>, String)> = HashSet::new();
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (entry_id, db_name, exact_path, volume, parser) =
+            row.context("reading browser profile candidate")?;
+        let Some(exact_path) = exact_path else {
+            continue; // no exact source path = cannot map into the live volume
+        };
+        let normalized = exact_path.replace('\\', "/");
+        let profile_path = match normalized.rsplit_once('/') {
+            Some((parent, _)) => parent.to_string(),
+            None => String::new(), // profile DB at volume root
+        };
+        let volume = volume.and_then(|value| usize::try_from(value).ok());
+        if !seen.insert((volume, profile_path.to_ascii_lowercase())) {
+            continue;
+        }
+        candidates.push(BrowserProfileCandidate {
+            entry_id,
+            volume_index_zero_based: volume,
+            profile_path,
+            db_name,
+            filesystem_parser: parser,
+        });
+    }
+    Ok(candidates)
 }
 
 const CARVE_DEFAULT_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
@@ -997,9 +1816,12 @@ pub fn carve_evidence(
     } else {
         options.max_scan_bytes.min(opened.decoded_size)
     };
-    let max_files = options
-        .max_files
-        .min(CARVE_DEFAULT_MAX_FILES.max(options.max_files));
+    // NO ARBITRARY LIMITS: 0 means carve everything found in the scan scope.
+    let max_files = if options.max_files == 0 {
+        usize::MAX
+    } else {
+        options.max_files
+    };
     let overlap = CARVE_SIGNATURES
         .iter()
         .map(|sig| sig.header.len())
@@ -1056,7 +1878,9 @@ pub fn carve_evidence(
                 index += 1;
                 continue;
             };
-            let length = carve_length(&mut *opened.reader, absolute, sig, CARVE_MAX_FILE_BYTES)?;
+            let carved_length =
+                carve_length(&mut *opened.reader, absolute, sig, CARVE_MAX_FILE_BYTES)?;
+            let length = carved_length.length;
             opened.reader.seek(SeekFrom::Start(scan_cursor))?;
             if length < sig.header.len() as u64 {
                 index += 1;
@@ -1069,7 +1893,11 @@ pub fn carve_evidence(
             let mut metadata = serde_json::json!({
                 "artifact_kind": "carved_file",
                 "recovery_source": "signature_carving",
-                "recovery_status": "carved from image by file signature",
+                "recovery_status": if carved_length.definitive {
+                    "carved from image by file signature"
+                } else {
+                    "carved from image by file signature (length not verified - see carve_length_basis)"
+                },
                 "recovery_read": "physical_extent",
                 "storage_area": "carved",
                 "carve_format": sig.label,
@@ -1079,6 +1907,8 @@ pub fn carve_evidence(
                     .map(|byte| format!("{byte:02X}"))
                     .collect::<Vec<_>>()
                     .join(" "),
+                "carve_length_basis": carved_length.basis,
+                "carve_length_definitive": carved_length.definitive,
                 "file_data_physical_offset": absolute,
                 "file_data_logical_offset": absolute,
                 "size_bytes": length,
@@ -1151,14 +1981,26 @@ pub fn carve_evidence(
     })
 }
 
+/// How a carved file's recorded length was established. An examiner must be
+/// able to tell a measured length (structure footer, valid declared size)
+/// from a fallback cap - a capped length means "the real end was never
+/// found", and exporting such a carve yields window-sized bytes, not a
+/// verified file.
+struct CarvedLength {
+    length: u64,
+    basis: &'static str,
+    definitive: bool,
+}
+
 /// Determines a carved file's length by locating its footer within a bounded
-/// window, falling back to the window cap when no footer is found.
+/// window, falling back to the window cap when no footer is found. The basis
+/// of the determination is always reported alongside the length.
 fn carve_length(
     reader: &mut dyn disk_forensic::container::ReadSeek,
     start: u64,
     sig: &CarveSignature,
     max_len: u64,
-) -> Result<u64> {
+) -> Result<CarvedLength> {
     let cap = usize::try_from(max_len).unwrap_or(usize::MAX);
     let mut buf = vec![0_u8; cap];
     reader.seek(SeekFrom::Start(start))?;
@@ -1170,29 +2012,60 @@ fn carve_length(
         }
         filled += read;
     }
+    let hit_window_cap = filled == cap;
     buf.truncate(filled);
     if buf.is_empty() {
-        return Ok(0);
+        return Ok(CarvedLength {
+            length: 0,
+            basis: "no data readable at carve offset",
+            definitive: false,
+        });
     }
     // Each arm returns the carved length: footer position + trailing bytes that
     // belong to the file (e.g. PNG's IEND is followed by a 4-byte CRC).
-    let length = match sig.extension {
+    let footer = match sig.extension {
         "jpg" => find_footer(&buf, &[0xFF, 0xD9], 0),
         "png" => find_footer(&buf, &[0x49, 0x45, 0x4E, 0x44], 4),
         "gif" => find_footer(&buf, &[0x00, 0x3B], 0),
         "pdf" => rfind_footer(&buf, b"%%EOF", 0),
-        "bmp" => {
-            if buf.len() >= 6 {
-                let declared = u32::from_le_bytes(buf[2..6].try_into().unwrap()) as usize;
-                Some(declared.clamp(sig.header.len(), buf.len()))
-            } else {
-                None
-            }
-        }
+        "bmp" => None,
         _ => None,
+    };
+    if let Some(length) = footer {
+        return Ok(CarvedLength {
+            length: length as u64,
+            basis: "format footer signature located",
+            definitive: true,
+        });
     }
-    .unwrap_or(buf.len());
-    Ok(length as u64)
+    if sig.extension == "bmp" && buf.len() >= 6 {
+        let declared = u32::from_le_bytes(buf[2..6].try_into().unwrap()) as usize;
+        let clamped = declared.clamp(sig.header.len(), buf.len());
+        return Ok(if clamped == declared {
+            CarvedLength {
+                length: clamped as u64,
+                basis: "BMP header declared file size",
+                definitive: true,
+            }
+        } else {
+            CarvedLength {
+                length: clamped as u64,
+                basis: "BMP header declared size exceeded the carve window; length clamped, end not verified",
+                definitive: false,
+            }
+        });
+    }
+    // No footer / no sizing rule for this format: the recorded length is a
+    // bound, not a measurement.
+    Ok(CarvedLength {
+        length: buf.len() as u64,
+        basis: if hit_window_cap {
+            "no footer found within the carve window; length capped, end not verified"
+        } else {
+            "no footer found before end of scanned data; end not verified"
+        },
+        definitive: false,
+    })
 }
 
 /// Length up to and including the first `footer` plus `trailing` bytes.
@@ -1383,14 +2256,32 @@ pub fn process_evidence(
     case_path: &Path,
     options: ProcessEvidenceOptions,
 ) -> Result<ProcessEvidenceResult> {
+    process_evidence_with_profile(case_path, options, ProcessingProfile::default())
+}
+
+pub fn process_evidence_with_profile(
+    case_path: &Path,
+    options: ProcessEvidenceOptions,
+    profile: ProcessingProfile,
+) -> Result<ProcessEvidenceResult> {
     // 0 means "index everything"; there is no examiner-facing entry cap.
     let max_entries = unlimited_if_zero(options.max_entries);
+    let _profile_guard = set_processing_profile(profile);
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let evidence = read_evidence_for_processing(&conn, case_id, options.evidence_id)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
-    let parameters_json = serde_json::json!({ "max_entries": max_entries }).to_string();
+    let requested_entry_limit = options.max_entries;
+    let effective_entry_limit = (requested_entry_limit != 0).then_some(requested_entry_limit);
+    let parameters_json = serde_json::json!({
+        "max_entries": requested_entry_limit,
+        "effective_max_entries": effective_entry_limit,
+        "capture_content": profile.capture_content,
+        "parse_emails": profile.parse_emails,
+        "parse_browsers": profile.parse_browsers,
+    })
+    .to_string();
     tx.execute(
         "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
          VALUES (?1, ?2, 'filesystem_index', 'running', ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -1398,35 +2289,103 @@ pub fn process_evidence(
     )?;
     let job_id = tx.last_insert_rowid();
 
-    let (entries_indexed, truncated) = match evidence.source_kind.as_str() {
-        "file" => process_file_evidence(&tx, case_id, &evidence, job_id, max_entries)?,
-        "folder" => process_folder_evidence(&tx, case_id, &evidence, job_id, max_entries)?,
-        "image" => process_image_evidence(&tx, case_id, &evidence, job_id, max_entries)?,
-        other => bail!("unsupported evidence source kind for processing: {other}"),
+    let processing_result = match evidence.source_kind.as_str() {
+        "file" => process_file_evidence(&tx, case_id, &evidence, job_id, max_entries),
+        "folder" => process_folder_evidence(&tx, case_id, &evidence, job_id, max_entries),
+        "image" => process_image_evidence(&tx, case_id, &evidence, job_id, max_entries),
+        other => Err(anyhow!(
+            "unsupported evidence source kind for processing: {other}"
+        )),
+    };
+    let (entries_indexed, truncated) = match processing_result {
+        Ok(result) => result,
+        Err(error) => {
+            // Roll back every entry and the provisional running job, then
+            // record a separate failed job. This preserves the atomic indexing
+            // guarantee while making the failed attempt visible to examiners.
+            let error_message = error.to_string().chars().take(2_000).collect::<String>();
+            drop(tx);
+            let failed_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let failed_parameters = serde_json::json!({
+                "max_entries": requested_entry_limit,
+                "effective_max_entries": effective_entry_limit,
+                "entries_indexed": 0,
+            })
+            .to_string();
+            failed_tx.execute(
+                "INSERT INTO evidence_jobs(
+                     case_id, evidence_id, job_type, status, parameters_json,
+                     started_at, finished_at, error
+                 ) VALUES (
+                     ?1, ?2, 'filesystem_index', 'failed', ?3,
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4
+                 )",
+                params![case_id, evidence.id, failed_parameters, error_message],
+            )?;
+            let failed_job_id = failed_tx.last_insert_rowid();
+            failed_tx.execute(
+                "INSERT INTO audit_events(
+                     case_id, event_type, actor, object_type, object_id, details_json
+                 ) VALUES (
+                     ?1, 'evidence.process.failed', ?2, 'evidence', ?3,
+                     json_object('job_id', ?4, 'entries_indexed', 0,
+                                 'status', 'failed', 'error', ?5,
+                                 'requested_entry_limit', ?6)
+                 )",
+                params![
+                    case_id,
+                    actor,
+                    evidence.id,
+                    failed_job_id,
+                    error_message,
+                    i64::try_from(requested_entry_limit).unwrap_or(i64::MAX),
+                ],
+            )?;
+            failed_tx.commit()?;
+            return Err(error);
+        }
     };
     let bookmark_items_relinked = relink_bookmark_items_tx(&tx, case_id, evidence.id)?;
     let status = if truncated { "truncated" } else { "completed" };
+    let truncation_reason = truncated.then(|| {
+        if requested_entry_limit != 0 && entries_indexed >= requested_entry_limit {
+            format!(
+                "entry limit reached (examiner requested at most {requested_entry_limit} entries)"
+            )
+        } else {
+            "parser reported partial processing before the end of the source".to_string()
+        }
+    });
     tx.execute(
         "UPDATE evidence_jobs
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             error = CASE WHEN ?2 THEN 'entry limit reached' ELSE NULL END
-         WHERE id = ?3",
-        params![status, if truncated { 1 } else { 0 }, job_id],
+             error = ?2,
+             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
+         WHERE id = ?4",
+        params![
+            status,
+            truncation_reason,
+            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+            job_id
+        ],
     )?;
-    if !truncated {
-        tx.execute(
-            "UPDATE evidence_sources
-             SET indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?1 AND case_id = ?2",
-            params![evidence.id, case_id],
-        )?;
-    }
+    tx.execute(
+        "UPDATE evidence_sources
+         SET indexed_at = CASE WHEN ?3 = 0
+             THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             ELSE NULL
+         END
+         WHERE id = ?1 AND case_id = ?2",
+        params![evidence.id, case_id, if truncated { 1 } else { 0 }],
+    )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.process', ?2, 'evidence', ?3,
                  json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
-                             'bookmark_items_relinked', ?7))",
+                             'status', ?7, 'requested_entry_limit', ?8,
+                             'truncation_reason', ?9, 'bookmark_items_relinked', ?10))",
         params![
             case_id,
             actor,
@@ -1434,6 +2393,9 @@ pub fn process_evidence(
             job_id,
             entries_indexed as i64,
             if truncated { 1 } else { 0 },
+            status,
+            i64::try_from(requested_entry_limit).unwrap_or(i64::MAX),
+            truncation_reason,
             bookmark_items_relinked as i64,
         ],
     )?;
@@ -1649,18 +2611,22 @@ pub fn import_browser_history(
     case_path: &Path,
     options: ImportBrowserHistoryOptions,
 ) -> Result<BrowserHistoryImportResult> {
-    let max_visits = unlimited_if_zero(options.max_visits);
-    let family = detect_browser_family(&options.history_path)?;
-    let import_data = match family {
-        BrowserFamily::Chromium => {
-            collect_chromium_history_import(&options.history_path, max_visits)?
-        }
-        BrowserFamily::Firefox => {
-            collect_firefox_history_import(&options.history_path, max_visits)?
-        }
-        BrowserFamily::Safari => collect_safari_history_import(&options.history_path, max_visits)?,
-    };
+    let import_data = collect_browser_history_import(&options.history_path, options.max_visits)?;
     persist_browser_history_import(case_path, options.evidence_name, import_data)
+}
+
+fn collect_browser_history_import(
+    history_path: &Path,
+    max_visits: usize,
+) -> Result<BrowserHistoryImportData> {
+    let max_visits = unlimited_if_zero(max_visits);
+    let family = detect_browser_family(history_path)?;
+    let import_data = match family {
+        BrowserFamily::Chromium => collect_chromium_history_import(history_path, max_visits)?,
+        BrowserFamily::Firefox => collect_firefox_history_import(history_path, max_visits)?,
+        BrowserFamily::Safari => collect_safari_history_import(history_path, max_visits)?,
+    };
+    Ok(import_data)
 }
 
 fn persist_browser_history_import(
@@ -1688,6 +2654,7 @@ fn persist_browser_history_import(
     let visits_indexed = import_data.visit_records.len();
     let bookmarks_indexed = import_data.bookmark_records.len();
     let preferences_indexed = import_data.preference_records.len();
+    let parse_error_count = i64::try_from(import_data.parse_errors.len()).unwrap_or(i64::MAX);
 
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
@@ -1723,6 +2690,9 @@ fn persist_browser_history_import(
         .chain(import_data.login_records.iter())
         .chain(import_data.cookie_records.iter())
     {
+        let metadata_json: serde_json::Value = serde_json::from_str(&record.metadata_json)
+            .with_context(|| format!("parsing browser metadata for {}", record.logical_path))?;
+        let metadata_json = metadata_json.to_string();
         upsert_filesystem_entry(
             &tx,
             case_id,
@@ -1731,7 +2701,7 @@ fn persist_browser_history_import(
             &record.display_name,
             "record",
             None,
-            &record.metadata_json,
+            &metadata_json,
             job_id,
         )?;
     }
@@ -1741,27 +2711,46 @@ fn persist_browser_history_import(
         "UPDATE evidence_jobs
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             error = CASE WHEN ?2 THEN 'visit limit reached' ELSE NULL END
-         WHERE id = ?3",
-        params![status, if truncated { 1 } else { 0 }, job_id],
+             error = CASE WHEN ?2 THEN 'visit limit reached' ELSE NULL END,
+             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
+         WHERE id = ?4",
+        params![
+            status,
+            if truncated { 1 } else { 0 },
+            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+            job_id
+        ],
     )?;
     tx.execute(
         "UPDATE evidence_sources
-         SET indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         SET indexed_at = CASE WHEN ?3 = 0
+             THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             ELSE NULL
+         END
          WHERE id = ?1 AND case_id = ?2",
-        params![evidence_id, case_id],
+        params![evidence_id, case_id, if truncated { 1 } else { 0 }],
     )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'browser_history.import', ?2, 'evidence', ?3,
-                 json_object('entries_indexed', ?4, 'truncated', ?5, 'source_path', ?6))",
+                 json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
+                             'status', ?7, 'truncation_reason', ?8, 'source_path', ?9,
+                             'parse_errors', ?10))",
         params![
             case_id,
             actor,
             evidence_id,
+            job_id,
             entries_indexed as i64,
             if truncated { 1 } else { 0 },
+            status,
+            if truncated {
+                Some("visit limit reached")
+            } else {
+                None
+            },
             import_data.source_path,
+            parse_error_count,
         ],
     )?;
     tx.commit()?;
@@ -1776,7 +2765,307 @@ fn persist_browser_history_import(
         preferences_indexed,
         truncated,
         status: status.to_string(),
+        parse_errors: import_data.parse_errors,
     })
+}
+
+pub fn import_browser_artifacts_into_evidence(
+    case_path: &Path,
+    options: ImportBrowserArtifactsIntoEvidenceOptions,
+) -> Result<BrowserHistoryImportResult> {
+    let import_data = collect_browser_history_import(&options.history_path, options.max_visits)?;
+    persist_browser_artifacts_into_evidence(case_path, options, import_data)
+}
+
+fn persist_browser_artifacts_into_evidence(
+    case_path: &Path,
+    options: ImportBrowserArtifactsIntoEvidenceOptions,
+    import_data: BrowserHistoryImportData,
+) -> Result<BrowserHistoryImportResult> {
+    let truncated = import_data.total_visits > import_data.visit_records.len();
+    let visits_indexed = import_data.visit_records.len();
+    let bookmarks_indexed = import_data.bookmark_records.len();
+    let preferences_indexed = import_data.preference_records.len();
+    let parse_error_count = i64::try_from(import_data.parse_errors.len()).unwrap_or(i64::MAX);
+    let derivation_key = browser_profile_derivation_key(
+        &options.source_profile_path,
+        options.volume_index_zero_based,
+    );
+    let logical_prefix = browser_profile_logical_prefix(
+        &options.source_profile_path,
+        options.volume_index_zero_based,
+        &derivation_key,
+    );
+
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, options.evidence_id)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let source_files = load_indexed_browser_source_files(
+        &tx,
+        case_id,
+        options.evidence_id,
+        &options.source_profile_path,
+    )?;
+    let mut parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)
+        .context("parsing browser import job parameters")?;
+    if let Some(object) = parameters.as_object_mut() {
+        object.insert(
+            "derived_into_evidence_id".to_string(),
+            serde_json::json!(options.evidence_id),
+        );
+        object.insert(
+            "browser_derivation_key".to_string(),
+            serde_json::json!(derivation_key),
+        );
+        object.insert(
+            "source_profile_path".to_string(),
+            serde_json::json!(options.source_profile_path),
+        );
+        object.insert(
+            "volume_index_zero_based".to_string(),
+            serde_json::json!(options.volume_index_zero_based),
+        );
+    }
+    tx.execute(
+        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
+         VALUES (?1, ?2, 'browser_history_import', 'running', ?3,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![case_id, options.evidence_id, parameters.to_string()],
+    )?;
+    let job_id = tx.last_insert_rowid();
+
+    // One profile is one replaceable derived dataset. This makes both a
+    // repeated parser run and a full evidence reprocess idempotent.
+    tx.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
+        params![case_id, options.evidence_id, derivation_key],
+    )?;
+    let context = BrowserDerivedImportContext {
+        evidence_id: options.evidence_id,
+        derivation_key: &derivation_key,
+        logical_prefix: &logical_prefix,
+        source_profile_path: &options.source_profile_path,
+        volume_index_zero_based: options.volume_index_zero_based,
+        staging_path: &options.history_path,
+        source_files: &source_files,
+    };
+    let entries_indexed = insert_browser_history_records_into_evidence(
+        &tx,
+        case_id,
+        options.evidence_id,
+        job_id,
+        &import_data,
+        Some(&context),
+    )?;
+    let retired_staging_paths = if let Some(legacy_name) = options
+        .legacy_evidence_name
+        .as_deref()
+        .filter(|name| name.contains("(auto-parsed from "))
+    {
+        retire_legacy_browser_evidence(
+            &tx,
+            case_id,
+            options.evidence_id,
+            legacy_name,
+            &logical_prefix,
+        )?
+    } else {
+        Vec::new()
+    };
+    relink_bookmark_items_tx(&tx, case_id, options.evidence_id)?;
+
+    let status = if truncated { "truncated" } else { "completed" };
+    tx.execute(
+        "UPDATE evidence_jobs
+         SET status = ?1,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             error = CASE WHEN ?2 THEN 'visit limit reached' ELSE NULL END,
+             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
+         WHERE id = ?4",
+        params![
+            status,
+            if truncated { 1 } else { 0 },
+            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+            job_id,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'browser_history.derive', ?2, 'evidence', ?3,
+                 json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
+                             'status', ?7, 'source_profile_path', ?8,
+                             'browser_derivation_key', ?9, 'parse_errors', ?10))",
+        params![
+            case_id,
+            actor,
+            options.evidence_id,
+            job_id,
+            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+            if truncated { 1 } else { 0 },
+            status,
+            options.source_profile_path,
+            derivation_key,
+            parse_error_count,
+        ],
+    )?;
+    tx.commit()?;
+    cleanup_retired_browser_staging(case_path, &options.history_path, &retired_staging_paths);
+
+    Ok(BrowserHistoryImportResult {
+        evidence_id: options.evidence_id,
+        job_id,
+        source_path: options.source_profile_path,
+        entries_indexed,
+        visits_indexed,
+        bookmarks_indexed,
+        preferences_indexed,
+        truncated,
+        status: status.to_string(),
+        parse_errors: import_data.parse_errors,
+    })
+}
+
+fn browser_profile_derivation_key(
+    source_profile_path: &str,
+    volume_index_zero_based: Option<usize>,
+) -> String {
+    let normalized = source_profile_path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    format!(
+        "browser-profile:v1:{}:{normalized}",
+        volume_index_zero_based
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "local".to_string())
+    )
+}
+
+fn browser_profile_logical_prefix(
+    source_profile_path: &str,
+    volume_index_zero_based: Option<usize>,
+    derivation_key: &str,
+) -> String {
+    let profile_name = source_profile_path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("profile");
+    let digest = sha256_hex(derivation_key.as_bytes());
+    let volume = volume_index_zero_based
+        .map(|value| format!("vol-{value}-"))
+        .unwrap_or_default();
+    format!(
+        "/Parsed Artifacts/Browser/{volume}{}-{}",
+        sanitize_logical_segment(profile_name),
+        &digest[..12]
+    )
+}
+
+fn retire_legacy_browser_evidence(
+    conn: &Connection,
+    case_id: i64,
+    parent_evidence_id: i64,
+    legacy_display_name: &str,
+    logical_prefix: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_path FROM evidence_sources
+         WHERE case_id = ?1 AND id <> ?2 AND source_kind = 'browser_history'
+           AND display_name = ?3 AND attach_status <> 'superseded'
+         ORDER BY id",
+    )?;
+    let legacy_ids = stmt
+        .query_map(
+            params![case_id, parent_evidence_id, legacy_display_name],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (legacy_id, _) in &legacy_ids {
+        let prefix_expression = "CASE
+            WHEN logical_path LIKE '/Browser Activities/%'
+            THEN ?3 || logical_path
+            ELSE logical_path END";
+        conn.execute(
+            &format!(
+                "UPDATE bookmark_items
+                 SET evidence_id = ?1,
+                     entry_id = NULL,
+                     logical_path = {prefix_expression},
+                     item_ref_json = CASE WHEN json_valid(item_ref_json)
+                         THEN json_set(item_ref_json,
+                              '$.evidence_id', ?1,
+                              '$.entry_id', NULL,
+                              '$.logical_path', {prefix_expression})
+                         ELSE item_ref_json END
+                 WHERE evidence_id = ?2"
+            ),
+            params![parent_evidence_id, legacy_id, logical_prefix],
+        )?;
+        conn.execute(
+            "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+            params![case_id, legacy_id],
+        )?;
+        conn.execute(
+            "UPDATE evidence_sources
+             SET source_kind = 'derived_browser_history_superseded',
+                 attach_status = 'superseded',
+                 notes = trim(COALESCE(notes || '; ', '') ||
+                     'Superseded by idempotent browser artifacts attached to parent evidence ' || ?3)
+             WHERE case_id = ?1 AND id = ?2",
+            params![case_id, legacy_id, parent_evidence_id],
+        )?;
+    }
+    Ok(legacy_ids.into_iter().map(|(_, path)| path).collect())
+}
+
+fn cleanup_retired_browser_staging(
+    case_path: &Path,
+    current_staging_path: &Path,
+    retired_paths: &[PathBuf],
+) {
+    let case_stem = case_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "case".to_string());
+    let imports_root = case_path
+        .parent()
+        .map(|parent| parent.join(format!("{case_stem}-history-imports")))
+        .unwrap_or_else(|| PathBuf::from(format!("{case_stem}-history-imports")));
+    let Ok(root) = imports_root.canonicalize() else {
+        return;
+    };
+    let current = current_staging_path.canonicalize().ok();
+    for retired in retired_paths {
+        let Ok(candidate) = retired.canonicalize() else {
+            continue;
+        };
+        if candidate == root
+            || !candidate.starts_with(&root)
+            || current
+                .as_ref()
+                .is_some_and(|current| *current == candidate)
+            || !candidate.is_dir()
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&candidate) {
+            eprintln!(
+                "could not remove superseded browser staging folder {}: {error}",
+                candidate.display()
+            );
+        }
+    }
 }
 
 pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<DeepSearchResult>> {
@@ -1785,7 +3074,14 @@ pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<D
         bail!("search query cannot be empty");
     }
     let max_results = options.max_results.clamp(1, 1_000);
-    let max_file_bytes = options.max_file_bytes.clamp(1, 10 * 1024 * 1024);
+    // File content search only ever has CONTENT_INDEX_BYTES available per file
+    // (content_head, captured once at "Read File System" time) - clamping here
+    // to the real ceiling instead of a much larger one keeps the "Max file
+    // bytes" field honest about what it can actually do, instead of silently
+    // accepting a bigger number that can never matter. For matches beyond a
+    // file's first CONTENT_INDEX_BYTES, anywhere on disk including unallocated
+    // space and slack, use raw_disk_search instead.
+    let max_file_bytes = options.max_file_bytes.clamp(1, CONTENT_INDEX_BYTES as u64);
     let query_lower = query.to_ascii_lowercase();
     let scope = SearchScope::new(options.category.as_deref(), options.file_types.as_deref())?;
 
@@ -1931,6 +3227,509 @@ fn hex_match_preview(bytes: &[u8], offset: usize, length: usize) -> String {
         .join(" ")
 }
 
+fn ascii_match_preview(bytes: &[u8], offset: usize, length: usize) -> String {
+    let start = offset.saturating_sub(8);
+    let end = offset
+        .saturating_add(length)
+        .saturating_add(8)
+        .min(bytes.len());
+    bytes[start..end]
+        .iter()
+        .map(|byte| match byte {
+            0x20..=0x7E => char::from(*byte),
+            _ => '.',
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct RawDiskSearchOptions {
+    pub evidence_id: i64,
+    pub query: String,
+    pub max_results: usize,
+    /// Bytes to scan before stopping, starting from the beginning of the
+    /// evidence source. 0 means unlimited (scan the whole evidence) - same
+    /// "0 = no cap" convention used by Timeline/recursive-bookmark limits
+    /// elsewhere, so the examiner has to explicitly opt into a full scan.
+    pub max_scan_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawSearchHit {
+    pub offset: u64,
+    pub length: usize,
+    pub encoding: String,
+    pub data_preview: String,
+    pub ascii_preview: String,
+    pub sector: u64,
+    /// Deprecated zero-based compatibility alias.
+    pub partition_index: Option<usize>,
+    pub volume_index_zero_based: Option<usize>,
+    pub partition_number_one_based: Option<usize>,
+    pub volume_name: Option<String>,
+    pub partition_start_offset: Option<u64>,
+    pub filesystem: Option<String>,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawSearchResult {
+    pub evidence_id: i64,
+    pub evidence_display_name: String,
+    pub source_path: String,
+    pub evidence_sha256_hex: Option<String>,
+    pub evidence_hashed_at: Option<String>,
+    pub sector_size: u64,
+    pub searched_at: String,
+    pub actor: String,
+    pub query: String,
+    pub encodings: Vec<String>,
+    pub scan_start: u64,
+    pub max_scan_bytes: u64,
+    pub max_results: usize,
+    pub total_size: u64,
+    pub bytes_scanned: u64,
+    pub stop_reason: RawSearchStopReason,
+    pub read_error: Option<String>,
+    /// Compatibility derivative: false only for a complete EOF scan.
+    pub truncated: bool,
+    pub hits: Vec<RawSearchHit>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RawSearchStopReason {
+    Eof,
+    ByteLimit,
+    ResultLimit,
+    Cancelled,
+    ReadError,
+}
+
+impl RawSearchStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eof => "eof",
+            Self::ByteLimit => "byte_limit",
+            Self::ResultLimit => "result_limit",
+            Self::Cancelled => "cancelled",
+            Self::ReadError => "read_error",
+        }
+    }
+
+    fn is_partial(self) -> bool {
+        self != Self::Eof
+    }
+}
+
+const RAW_SEARCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const RAW_SEARCH_SECTOR_SIZE: u64 = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawHitLocation {
+    partition_index: Option<usize>,
+    volume_index_zero_based: Option<usize>,
+    partition_number_one_based: Option<usize>,
+    volume_name: Option<String>,
+    partition_start_offset: Option<u64>,
+    filesystem: Option<String>,
+    region: String,
+}
+
+fn raw_search_sector(offset: u64, sector_size: u64) -> u64 {
+    offset / sector_size
+}
+
+fn classify_raw_hit_location(
+    source_kind: &str,
+    offset: u64,
+    volumes: &[LiveVolume],
+) -> RawHitLocation {
+    if source_kind == "file" {
+        return RawHitLocation {
+            partition_index: None,
+            volume_index_zero_based: None,
+            partition_number_one_based: None,
+            volume_name: None,
+            partition_start_offset: None,
+            filesystem: None,
+            region: "not-applicable (file evidence)".to_string(),
+        };
+    }
+
+    for volume in volumes {
+        let volume_end = volume.start_offset.saturating_add(volume.size_bytes);
+        if offset >= volume.start_offset && offset < volume_end {
+            return RawHitLocation {
+                partition_index: Some(volume.volume_index_zero_based),
+                volume_index_zero_based: Some(volume.volume_index_zero_based),
+                partition_number_one_based: volume.partition_number_one_based,
+                volume_name: Some(volume.name.clone()),
+                partition_start_offset: Some(volume.start_offset),
+                filesystem: Some(volume.filesystem.clone()),
+                region: "in-partition".to_string(),
+            };
+        }
+    }
+
+    RawHitLocation {
+        partition_index: None,
+        volume_index_zero_based: None,
+        partition_number_one_based: None,
+        volume_name: None,
+        partition_start_offset: None,
+        filesystem: None,
+        region: "partition-gap/unpartitioned".to_string(),
+    }
+}
+
+fn raw_search_encodings(query: &str) -> Vec<String> {
+    if strip_hex_query_prefix(query).is_some() {
+        vec!["hex".to_string()]
+    } else {
+        vec![
+            "ascii".to_string(),
+            "utf16le".to_string(),
+            "utf16be".to_string(),
+        ]
+    }
+}
+
+/// Scans an evidence source's raw bytes directly, independent of any parsed
+/// file system - the same read path `hash_evidence` already uses to stream
+/// the whole decoded image/file for hashing, reused here for keyword/hex
+/// scanning instead. Because this walks bytes rather than filesystem_entries
+/// rows, it naturally covers unallocated space and file slack along with
+/// allocated files - there is no "kind" of on-disk region it skips, unlike
+/// `deep_search`'s content_head index which deliberately excludes those (see
+/// `should_index_content_head`). Bounded by `max_scan_bytes` by default,
+/// since this is real evidence I/O against a potentially huge image, not an
+/// already-indexed database read.
+pub fn raw_disk_search(case_path: &Path, options: RawDiskSearchOptions) -> Result<RawSearchResult> {
+    let query = options.query.trim();
+    if query.is_empty() {
+        bail!("search query cannot be empty");
+    }
+    let max_results = options.max_results.clamp(1, 1_000);
+    let max_scan_bytes = if options.max_scan_bytes == 0 {
+        u64::MAX
+    } else {
+        options.max_scan_bytes
+    };
+
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let (
+        source_kind,
+        source_path,
+        evidence_display_name,
+        evidence_sha256_hex,
+        evidence_hashed_at,
+    ): (String, String, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT source_kind, source_path, display_name, sha256_hex, hashed_at
+             FROM evidence_sources
+             WHERE case_id = ?1 AND id = ?2",
+            params![case_id, options.evidence_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .context("evidence source not found")?;
+    let actor = audit_actor(&conn, case_id)?;
+    let encodings = raw_search_encodings(query);
+    let volumes = if source_kind == "image" {
+        list_image_volumes(Path::new(&source_path))
+            .context("mapping image volumes for raw search")?
+    } else {
+        Vec::new()
+    };
+
+    let (mut reader, total_size): (Box<dyn disk_forensic::container::ReadSeek>, u64) =
+        match source_kind.as_str() {
+            "image" => {
+                let opened = open_disk_image(Path::new(&source_path))?;
+                (opened.reader, opened.decoded_size)
+            }
+            "file" => {
+                let metadata = fs::metadata(&source_path)
+                    .with_context(|| format!("reading evidence metadata {source_path}"))?;
+                if !metadata.is_file() {
+                    bail!("raw disk search supports image and file evidence; this evidence path is not a file");
+                }
+                let file = fs::File::open(&source_path)
+                    .with_context(|| format!("opening evidence {source_path}"))?;
+                (Box::new(file), metadata.len())
+            }
+            _ => bail!(
+                "raw disk search supports image and file evidence; {source_kind} evidence has no single raw byte stream to scan"
+            ),
+        };
+
+    let hex_needle = strip_hex_query_prefix(query)
+        .map(parse_hex_pattern)
+        .transpose()?;
+    let utf16_units: Vec<u16> = if hex_needle.is_some() {
+        Vec::new()
+    } else {
+        query.encode_utf16().collect()
+    };
+    let ascii_needle: &[u8] = if hex_needle.is_some() {
+        &[]
+    } else {
+        query.as_bytes()
+    };
+    let max_needle_len = hex_needle
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(0)
+        .max(ascii_needle.len())
+        .max(utf16_units.len().saturating_mul(2));
+    if max_needle_len == 0 {
+        bail!("search query has no matchable bytes");
+    }
+    let overlap = max_needle_len.saturating_sub(1);
+
+    let mut hits: Vec<RawSearchHit> = Vec::new();
+    let mut bytes_scanned = 0_u64;
+    // EA-009: track WHY the scan stopped (not just a truncated bool) so the
+    // examiner is told whether more matches may exist (result cap or byte
+    // budget) versus a complete scan to end-of-evidence.
+    let mut stop_reason = RawSearchStopReason::Eof;
+    let mut window: Vec<u8> = Vec::new();
+    let mut window_start = 0_u64;
+    let mut buffer = vec![0_u8; RAW_SEARCH_CHUNK_BYTES];
+
+    loop {
+        if hits.len() >= max_results {
+            stop_reason = RawSearchStopReason::ResultLimit;
+            break;
+        }
+        if bytes_scanned >= max_scan_bytes {
+            stop_reason = RawSearchStopReason::ByteLimit;
+            break;
+        }
+        let want = usize::try_from(max_scan_bytes.saturating_sub(bytes_scanned))
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = reader
+            .read(&mut buffer[..want.max(1)])
+            .context("reading evidence for raw search")?;
+        let eof = read == 0;
+        if !eof {
+            bytes_scanned += read as u64;
+            window.extend_from_slice(&buffer[..read]);
+        }
+        let safe_len = if eof {
+            window.len()
+        } else {
+            window.len().saturating_sub(overlap)
+        };
+        if safe_len > 0 {
+            scan_raw_matches(
+                &window,
+                window_start,
+                safe_len,
+                hex_needle.as_deref(),
+                ascii_needle,
+                &utf16_units,
+                max_results,
+                &mut hits,
+            );
+        }
+        if eof {
+            // Reached end of evidence. If the final window filled the result
+            // cap, additional matches in the scanned data may be unrecorded, so
+            // report the cap as the controlling limit; otherwise the scan is
+            // complete to end-of-evidence.
+            stop_reason = if hits.len() >= max_results {
+                RawSearchStopReason::ResultLimit
+            } else {
+                RawSearchStopReason::Eof
+            };
+            break;
+        }
+        window_start += safe_len as u64;
+        window.drain(0..safe_len);
+    }
+    let truncated = stop_reason.is_partial();
+    for hit in &mut hits {
+        let location = classify_raw_hit_location(&source_kind, hit.offset, &volumes);
+        hit.sector = raw_search_sector(hit.offset, RAW_SEARCH_SECTOR_SIZE);
+        hit.partition_index = location.partition_index;
+        hit.volume_index_zero_based = location.volume_index_zero_based;
+        hit.partition_number_one_based = location.partition_number_one_based;
+        hit.volume_name = location.volume_name;
+        hit.partition_start_offset = location.partition_start_offset;
+        hit.filesystem = location.filesystem;
+        hit.region = location.region;
+    }
+
+    let searched_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let encodings_json =
+        serde_json::to_string(&encodings).context("serializing raw search encodings")?;
+    conn.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'raw_search.run', ?2, 'evidence', ?3,
+                 json_object('query', ?4,
+                             'encodings', json(?5),
+                             'bytes_scanned', ?6,
+                             'total_size', ?7,
+                             'hit_count', ?8,
+                             'truncated', CASE WHEN ?9 != 0 THEN json('true') ELSE json('false') END,
+                             'max_scan_bytes', ?10,
+                             'sector_size', ?11,
+                             'evidence_sha256_hex', ?12,
+                             'stop_reason', ?13))",
+        params![
+            case_id,
+            actor.as_str(),
+            options.evidence_id,
+            query,
+            encodings_json,
+            i64::try_from(bytes_scanned).unwrap_or(i64::MAX),
+            i64::try_from(total_size).unwrap_or(i64::MAX),
+            i64::try_from(hits.len()).unwrap_or(i64::MAX),
+            if truncated { 1 } else { 0 },
+            i64::try_from(options.max_scan_bytes).unwrap_or(i64::MAX),
+            i64::try_from(RAW_SEARCH_SECTOR_SIZE).unwrap_or(i64::MAX),
+            evidence_sha256_hex.as_deref(),
+            stop_reason.as_str(),
+        ],
+    )?;
+
+    Ok(RawSearchResult {
+        evidence_id: options.evidence_id,
+        evidence_display_name,
+        source_path,
+        evidence_sha256_hex,
+        evidence_hashed_at,
+        sector_size: RAW_SEARCH_SECTOR_SIZE,
+        searched_at,
+        actor,
+        query: query.to_string(),
+        encodings,
+        scan_start: 0,
+        max_scan_bytes: options.max_scan_bytes,
+        max_results,
+        total_size,
+        bytes_scanned,
+        stop_reason,
+        read_error: None,
+        truncated,
+        hits,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_raw_matches(
+    window: &[u8],
+    window_start: u64,
+    start_limit: usize,
+    hex_needle: Option<&[u8]>,
+    ascii_needle: &[u8],
+    utf16_units: &[u16],
+    max_results: usize,
+    hits: &mut Vec<RawSearchHit>,
+) {
+    if let Some(needle) = hex_needle {
+        scan_one_raw_encoding(
+            window,
+            window_start,
+            start_limit,
+            needle.len(),
+            "hex",
+            max_results,
+            hits,
+            |hay| find_bytes(hay, needle),
+        );
+        return;
+    }
+    if !ascii_needle.is_empty() {
+        scan_one_raw_encoding(
+            window,
+            window_start,
+            start_limit,
+            ascii_needle.len(),
+            "ascii",
+            max_results,
+            hits,
+            |hay| find_ascii_case_insensitive_bytes(hay, ascii_needle),
+        );
+    }
+    if !utf16_units.is_empty() {
+        let byte_len = utf16_units.len().saturating_mul(2);
+        scan_one_raw_encoding(
+            window,
+            window_start,
+            start_limit,
+            byte_len,
+            "utf16le",
+            max_results,
+            hits,
+            |hay| find_utf16_ascii_case_insensitive_bytes(hay, utf16_units, true),
+        );
+        scan_one_raw_encoding(
+            window,
+            window_start,
+            start_limit,
+            byte_len,
+            "utf16be",
+            max_results,
+            hits,
+            |hay| find_utf16_ascii_case_insensitive_bytes(hay, utf16_units, false),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_one_raw_encoding(
+    window: &[u8],
+    window_start: u64,
+    start_limit: usize,
+    needle_len: usize,
+    encoding: &'static str,
+    max_results: usize,
+    hits: &mut Vec<RawSearchHit>,
+    finder: impl Fn(&[u8]) -> Option<usize>,
+) {
+    if needle_len == 0 {
+        return;
+    }
+    let mut pos = 0_usize;
+    while pos < start_limit && pos + needle_len <= window.len() && hits.len() < max_results {
+        let Some(relative) = finder(&window[pos..]) else {
+            break;
+        };
+        let match_start = pos + relative;
+        if match_start >= start_limit {
+            break;
+        }
+        hits.push(RawSearchHit {
+            offset: window_start + match_start as u64,
+            length: needle_len,
+            encoding: encoding.to_string(),
+            data_preview: hex_match_preview(window, match_start, needle_len),
+            ascii_preview: ascii_match_preview(window, match_start, needle_len),
+            sector: raw_search_sector(window_start + match_start as u64, RAW_SEARCH_SECTOR_SIZE),
+            partition_index: None,
+            volume_index_zero_based: None,
+            partition_number_one_based: None,
+            volume_name: None,
+            partition_start_offset: None,
+            filesystem: None,
+            region: String::new(),
+        });
+        pos = match_start + 1;
+    }
+}
+
 pub fn list_filesystem_entries(
     case_path: &Path,
     evidence_id: Option<i64>,
@@ -1948,6 +3747,7 @@ pub struct IndexedChild {
     pub entry_id: Option<i64>,
     pub name: String,
     pub logical_path: String,
+    pub entry_kind: Option<String>,
     pub is_dir: bool,
     pub has_children: bool,
     pub size_bytes: Option<i64>,
@@ -2042,84 +3842,97 @@ fn list_indexed_directory_inner(
     };
     let like = format!("{}%", escape_like(&prefix));
 
-    // Subtree scan WITHOUT the heavy metadata_json column (that column is the
-    // bulk of each row; reading it for a whole big subtree is what made
-    // top-level folders slow). Metadata is fetched only for the direct children
-    // below.
+    // Direct children are aggregated in SQL: one GROUP BY over the subtree
+    // instead of marshalling every subtree row into Rust (listing a big
+    // case's root used to materialize all ~119k rows just to derive ~9
+    // children). metadata_json stays out of the scan entirely; it is fetched
+    // only for the direct children below. substr() counts characters in
+    // SQLite, so the prefix offset is in chars, not bytes.
+    let prefix_chars = i64::try_from(prefix.chars().count() + 1).unwrap_or(i64::MAX);
     let mut stmt = conn.prepare(
-        "SELECT id, logical_path, name, entry_kind, size_bytes, is_deleted
-         FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2 AND logical_path LIKE ?3 ESCAPE '\\'
-         ORDER BY logical_path
-         LIMIT ?4",
+        "SELECT segment,
+                MAX(CASE WHEN deeper = 0 THEN id END) AS exact_id,
+                MAX(CASE WHEN deeper = 0 THEN name END) AS exact_name,
+                MAX(CASE WHEN deeper = 0 THEN entry_kind END) AS exact_kind,
+                MAX(CASE WHEN deeper = 0 THEN size_bytes END) AS exact_size,
+                MAX(CASE WHEN deeper = 0 THEN is_deleted END) AS exact_deleted,
+                SUM(deeper) AS deeper_rows,
+                COUNT(*) AS scanned_rows
+         FROM (
+             SELECT id, name, entry_kind, size_bytes, is_deleted,
+                    CASE WHEN instr(substr(logical_path, ?4), '/') > 0
+                         THEN substr(substr(logical_path, ?4), 1,
+                                     instr(substr(logical_path, ?4), '/') - 1)
+                         ELSE substr(logical_path, ?4) END AS segment,
+                    (instr(substr(logical_path, ?4), '/') > 0) AS deeper
+             FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND logical_path LIKE ?3 ESCAPE '\\'
+             ORDER BY logical_path
+             LIMIT ?5
+         )
+         WHERE segment <> ''
+         GROUP BY segment
+         ORDER BY segment",
     )?;
     let rows = stmt.query_map(
         params![
             case_id,
             evidence_id,
             like,
+            prefix_chars,
             i64::try_from(INDEXED_DIR_SCAN_LIMIT + 1).unwrap_or(i64::MAX)
         ],
         |row| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
-                row.get::<_, i64>(5)? != 0,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         },
     )?;
 
-    let mut children: BTreeMap<String, IndexedChild> = BTreeMap::new();
-    let mut scanned = 0_usize;
+    let mut children: Vec<IndexedChild> = Vec::new();
+    let mut scanned = 0_i64;
     let mut truncated = false;
     for row in rows {
-        if scanned >= INDEXED_DIR_SCAN_LIMIT {
-            truncated = true;
-            break;
-        }
-        scanned += 1;
-        let (id, logical_path, name, entry_kind, size_bytes, is_deleted) =
-            row.context("reading indexed directory row")?;
-        let rest = &logical_path[prefix.len().min(logical_path.len())..];
-        let (segment, deeper) = match rest.find('/') {
-            Some(index) => (&rest[..index], true),
-            None => (rest, false),
-        };
-        if segment.is_empty() {
-            continue;
-        }
+        let (
+            segment,
+            exact_id,
+            exact_name,
+            exact_kind,
+            exact_size,
+            exact_deleted,
+            deeper,
+            group_scanned,
+        ) = row.context("reading indexed directory group")?;
+        scanned += group_scanned;
         let child_path = format!("{prefix}{segment}");
-        let entry = children
-            .entry(segment.to_string())
-            .or_insert_with(|| IndexedChild {
-                entry_id: None,
-                name: segment.to_string(),
-                logical_path: child_path.clone(),
-                is_dir: false,
-                has_children: false,
-                size_bytes: None,
-                is_deleted: false,
-                metadata_json: serde_json::Value::Null,
-            });
-        if deeper {
-            entry.is_dir = true;
-            entry.has_children = true;
-        } else {
-            entry.entry_id = Some(id);
-            entry.name = name;
-            entry.is_dir = entry_kind == "directory";
-            entry.size_bytes = size_bytes;
-            entry.is_deleted = is_deleted;
-            if entry.is_dir {
-                entry.has_children = true;
-            }
-        }
+        let exact_is_dir = exact_kind.as_deref() == Some("directory");
+        let has_exact = exact_id.is_some();
+        children.push(IndexedChild {
+            entry_id: exact_id,
+            name: exact_name.unwrap_or_else(|| segment.clone()),
+            logical_path: child_path,
+            entry_kind: exact_kind,
+            // No exact row means the segment only exists as a path prefix of
+            // deeper entries - an implicit directory, same as before.
+            is_dir: if has_exact { exact_is_dir } else { deeper > 0 },
+            has_children: deeper > 0 || exact_is_dir,
+            size_bytes: if has_exact { exact_size } else { None },
+            is_deleted: exact_deleted.unwrap_or(0) != 0,
+            metadata_json: serde_json::Value::Null,
+        });
+    }
+    if scanned > i64::try_from(INDEXED_DIR_SCAN_LIMIT).unwrap_or(i64::MAX) {
+        truncated = true;
     }
 
-    let mut children: Vec<IndexedChild> = children.into_values().collect();
     sort_indexed_children(&mut children);
     if children.len() > limit {
         children.truncate(limit);
@@ -2240,6 +4053,366 @@ pub fn list_filesystem_entries_limited(
         .collect()
 }
 
+/// Timestamp field names considered by the Timeline view (kept in sync with
+/// TIMELINE_METADATA_TIME_FIELDS in kdft-ui's JS) - entries store their
+/// various timestamps under different metadata_json keys depending on
+/// artifact kind (browser visit vs NTFS $STANDARD_INFORMATION vs EVTX log
+/// entry, etc.), so a date-range filter has to check all of them.
+const TIMELINE_TIME_FIELD_KEYS: &[&str] = &[
+    "email_date",
+    "visit_time_utc",
+    "last_visit_time_utc",
+    "first_used_utc",
+    "last_used_utc",
+    "date_added_utc",
+    "date_last_used_utc",
+    "start_time_utc",
+    "end_time_utc",
+    "date_created_utc",
+    "time_created_utc",
+    "time_last_used_utc",
+    "time_password_changed_utc",
+    "creation_utc",
+    "last_access_utc",
+    "last_accessed_utc",
+    "expires_utc",
+    "expiry_utc",
+    "last_modified_utc",
+    "created_utc",
+    "accessed_utc",
+    "modified_utc",
+    "mft_modified_utc",
+    "file_name_created_utc",
+    "file_name_accessed_utc",
+    "file_name_modified_utc",
+    "file_name_mft_modified_utc",
+    "standard_information_created_utc",
+    "standard_information_accessed_utc",
+    "standard_information_modified_utc",
+    "standard_information_mft_modified_utc",
+    "registry_key_last_write_utc",
+    "evtx_logged_utc",
+    // NTFS parser keys (what image processing actually stores for every NTFS
+    // entry) - without these a date-range Timeline build silently returned
+    // ~zero entries on NTFS evidence even though the grid showed timestamps.
+    "ntfs_creation_time_utc",
+    "ntfs_modification_time_utc",
+    "ntfs_access_time_utc",
+    "ntfs_mft_record_modification_time_utc",
+    "ntfs_standard_creation_time_utc",
+    "ntfs_standard_modification_time_utc",
+    "ntfs_standard_access_time_utc",
+    "ntfs_standard_mft_record_modification_time_utc",
+    // FAT parser keys (RFC3339 since the fat_* serialization fix; legacy
+    // debug-format values simply fail datetime() and never match, same as
+    // before).
+    "fat_created",
+    "fat_modified",
+    "fat_accessed",
+];
+
+/// KDFT's own bookkeeping records (container/partition/volume/report rows)
+/// carry tool-side timestamps such as `source_file_accessed_utc` = when KDFT
+/// itself read the image file. Those are provenance metadata, not evidence
+/// activity, and must never appear as Timeline events (a examiner picking a
+/// present-day range used to get the image container's own access time back
+/// as a "result").
+const TIMELINE_EXCLUDED_ARTIFACT_KINDS_SQL: &str =
+    "COALESCE(json_extract(metadata_json, '$.artifact_kind'), 'filesystem_entry')
+         NOT IN ('disk_image_container', 'disk_partition', 'filesystem_volume',
+                 'disk_partition_report', 'partition_report', 'unallocated_space')";
+
+fn timeline_time_range_sql_clause() -> String {
+    // Stored timestamps mix RFC3339 offset styles ("+00:00" from chrono's
+    // default formatting vs "Z" from some parsers) - a raw string BETWEEN
+    // would misorder exact-boundary matches (e.g. "...T00:00:00+00:00"
+    // sorts before "...T00:00:00Z" byte-for-byte, even though they're the
+    // same instant), silently excluding entries right at a range edge.
+    // datetime() normalizes both sides to a comparable UTC form first.
+    //
+    // json_each parses each row's metadata_json ONCE and walks its top-level
+    // keys; the previous per-key `datetime(json_extract(...)) OR ...` chain
+    // re-parsed the JSON once per key per row (~48 parses/row = ~11s on a
+    // 119k-entry case). Top-level-only iteration matches the old
+    // json_extract('$.<key>') semantics exactly.
+    let key_list = TIMELINE_TIME_FIELD_KEYS
+        .iter()
+        .map(|key| format!("'{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "EXISTS (SELECT 1 FROM json_each(metadata_json)
+                 WHERE json_each.key IN ({key_list})
+                   AND datetime(json_each.value) BETWEEN datetime(:from) AND datetime(:to))"
+    )
+}
+
+/// Like `list_filesystem_entries_limited`, but for the Timeline view: when
+/// `time_range` is given (inclusive RFC3339 bounds), only entries with at
+/// least one timestamp field in that range are returned. Filtering happens in
+/// SQL (via json_extract over every known timestamp field) so large cases
+/// don't have to ship every entry to the browser just to throw most of them
+/// away client-side - fetching + client-side-scanning the full entry set is
+/// what made the Timeline tab freeze the page on cases with tens of thousands
+/// of entries. Unlike a plain row-count cap, this never silently drops an
+/// entry that belongs in the requested window: the SQL predicate is
+/// authoritative over the whole table, not a "first N rows" preview.
+pub fn list_filesystem_entries_for_timeline(
+    case_path: &Path,
+    limit: Option<usize>,
+    time_range: Option<(&str, &str)>,
+) -> Result<Vec<FilesystemEntry>> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let limit_value: i64 = limit
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or(-1);
+    let (from, to) = match time_range {
+        Some((from, to)) => (Some(from.to_string()), Some(to.to_string())),
+        None => (None, None),
+    };
+    let sql = format!(
+        "SELECT id, case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, discovered_by_job_id
+         FROM filesystem_entries
+         WHERE case_id = :case_id
+           AND {excluded}
+           AND (:from IS NULL OR (
+           {range}
+           ))
+         ORDER BY evidence_id, logical_path, id
+         LIMIT :limit",
+        excluded = TIMELINE_EXCLUDED_ARTIFACT_KINDS_SQL,
+        range = timeline_time_range_sql_clause()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        named_params! {
+            ":case_id": case_id,
+            ":from": from,
+            ":to": to,
+            ":limit": limit_value,
+        },
+        |row| {
+            Ok(RawFilesystemEntry {
+                id: row.get(0)?,
+                case_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                logical_path: row.get(4)?,
+                name: row.get(5)?,
+                entry_kind: row.get(6)?,
+                size_bytes: row.get(7)?,
+                is_deleted: row.get::<_, i64>(8)? != 0,
+                metadata_json: row.get(9)?,
+                discovered_by_job_id: row.get(10)?,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing filesystem entries for timeline")?
+        .into_iter()
+        .map(filesystem_entry_from_raw)
+        .collect()
+}
+
+/// Count of entries matching the same date-range predicate as
+/// `list_filesystem_entries_for_timeline`, for reporting "N of case total"
+/// without fetching the full filtered row set.
+pub fn count_filesystem_entries_for_timeline(
+    case_path: &Path,
+    time_range: Option<(&str, &str)>,
+) -> Result<i64> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let (from, to) = match time_range {
+        Some((from, to)) => (Some(from.to_string()), Some(to.to_string())),
+        None => (None, None),
+    };
+    let sql = format!(
+        "SELECT COUNT(*)
+         FROM filesystem_entries
+         WHERE case_id = :case_id
+           AND {excluded}
+           AND (:from IS NULL OR (
+           {range}
+           ))",
+        excluded = TIMELINE_EXCLUDED_ARTIFACT_KINDS_SQL,
+        range = timeline_time_range_sql_clause()
+    );
+    conn.query_row(
+        &sql,
+        named_params! {
+            ":case_id": case_id,
+            ":from": from,
+            ":to": to,
+        },
+        |row| row.get(0),
+    )
+    .context("counting filesystem entries for timeline")
+}
+
+/// Fetches a single filesystem entry by id regardless of whether it has ever
+/// been paged into any client-side browse/category cache - used to resolve
+/// Deep Search hits back to a real tree location. Deep Search queries the
+/// database directly and can return entries anywhere in a large, lazily
+/// browsed case, not just ones the examiner has already navigated to, so the
+/// UI can't rely on its own in-memory entry cache to look them up. Returns
+/// `Ok(None)` (not an error) when the id doesn't exist in this case.
+pub fn filesystem_entry_by_id(case_path: &Path, entry_id: i64) -> Result<Option<FilesystemEntry>> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, discovered_by_job_id
+         FROM filesystem_entries
+         WHERE case_id = ?1 AND id = ?2",
+    )?;
+    let raw = stmt
+        .query_row(params![case_id, entry_id], |row| {
+            Ok(RawFilesystemEntry {
+                id: row.get(0)?,
+                case_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                logical_path: row.get(4)?,
+                name: row.get(5)?,
+                entry_kind: row.get(6)?,
+                size_bytes: row.get(7)?,
+                is_deleted: row.get::<_, i64>(8)? != 0,
+                metadata_json: row.get(9)?,
+                discovered_by_job_id: row.get(10)?,
+            })
+        })
+        .optional()
+        .context("looking up filesystem entry by id")?;
+    raw.map(filesystem_entry_from_raw).transpose()
+}
+
+/// Maps a browser-history record's (family, artifact_kind) to the specific
+/// companion filename inside the profile folder that actually holds it -
+/// browser profiles are made of several distinct database files (history,
+/// logins, cookies, form history are NOT all in one file), so "the source
+/// file" is not a single answer for a given profile, only for a given
+/// artifact kind within it.
+fn browser_history_source_filename(family: &str, artifact_kind: &str) -> Option<&'static str> {
+    match (family, artifact_kind) {
+        ("firefox", "browser_history_visit")
+        | ("firefox", "browser_url")
+        | ("firefox", "browser_download")
+        | ("firefox", "browser_bookmark") => Some("places.sqlite"),
+        ("firefox", "browser_login") => Some("logins.json"),
+        ("firefox", "browser_cookie") => Some("cookies.sqlite"),
+        ("firefox", "browser_search_term") => Some("formhistory.sqlite"),
+        ("firefox", "browser_preference") => Some("prefs.js"),
+        ("chromium", "browser_history_visit")
+        | ("chromium", "browser_url")
+        | ("chromium", "browser_download")
+        | ("chromium", "browser_search_term") => Some("History"),
+        ("chromium", "browser_bookmark") => Some("Bookmarks"),
+        ("chromium", "browser_login") => Some("Login Data"),
+        ("chromium", "browser_cookie") => Some("Cookies"),
+        ("chromium", "browser_preference") => Some("Preferences"),
+        ("safari", _) => Some("History.db"),
+        _ => None,
+    }
+}
+
+/// For a browser-history "record" entry, resolves and reads real bytes from
+/// the actual source database file on disk (rather than the record's own
+/// JSON metadata - see the fallback in read_filesystem_entry_bytes). Returns
+/// `Ok(None)` (not an error) whenever the source can't be identified or
+/// reached, so the caller can fall back to the JSON rendering instead of
+/// failing the whole request - e.g. a single-file import (examiner pointed
+/// the importer at exactly one History/places.sqlite file, not a whole
+/// profile folder) never had companion files like logins/cookies available,
+/// so those specific artifact kinds have nothing to resolve to here.
+fn read_browser_history_record_source_bytes(
+    entry: &EntryForBytes,
+    offset: u64,
+    length: usize,
+) -> Result<Option<EntryBytes>> {
+    let family = entry.metadata_json["browser_family"].as_str().unwrap_or("");
+    let artifact_kind = entry.metadata_json["artifact_kind"].as_str().unwrap_or("");
+    // Two ways a "record" entry can be a browser-history record: (1) a
+    // standalone/manual import, which gets its own dedicated evidence source
+    // with source_kind "browser_history" and source_path pointing at the
+    // profile; (2) auto-detected mid-walk on a disk image (see
+    // maybe_auto_import_browser_profile) and folded into the SAME evidence_id
+    // as the image itself, so entry.source_kind is "image"/whatever the
+    // image's kind is, not "browser_history" - those records instead carry
+    // their own per-record staging path in metadata_json, since the image's
+    // own source_path is the raw image file, not a browsable local folder.
+    let staged_override = entry.metadata_json["browser_profile_staging_path"]
+        .as_str()
+        .map(PathBuf::from);
+    let source_path_owned;
+    let source_path: &Path = if let Some(ref staged) = staged_override {
+        staged.as_path()
+    } else if entry.source_kind == "browser_history" {
+        source_path_owned = PathBuf::from(&entry.source_path);
+        &source_path_owned
+    } else {
+        return Ok(None);
+    };
+    let source_artifact = entry.metadata_json["source_artifact"].as_str();
+    let source_filename_override = (family == "firefox"
+        && artifact_kind == "browser_download"
+        && source_artifact.is_some_and(|value| value.eq_ignore_ascii_case("downloads.sqlite")))
+    .then_some("downloads.sqlite");
+    let Some(filename) =
+        source_filename_override.or_else(|| browser_history_source_filename(family, artifact_kind))
+    else {
+        return Ok(None);
+    };
+    let candidates: Vec<PathBuf> = if source_path.is_dir() {
+        if family == "chromium" && filename == "Cookies" {
+            // Modern Chrome/Chromium moved Cookies under Network/; older
+            // profiles still keep it at the profile root.
+            vec![
+                source_path.join("Network").join("Cookies"),
+                source_path.join("Cookies"),
+            ]
+        } else {
+            vec![source_path.join(filename)]
+        }
+    } else if source_path
+        .file_name()
+        .map(|name| name.eq_ignore_ascii_case(filename))
+        .unwrap_or(false)
+    {
+        vec![source_path.to_path_buf()]
+    } else {
+        return Ok(None);
+    };
+    let Some(path) = candidates.into_iter().find(|candidate| candidate.is_file()) else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("reading browser history source {}", path.display()))?;
+    let total_size = metadata.len();
+    let mut file = fs::File::open(&path)
+        .with_context(|| format!("opening browser history source {}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking browser history source {}", path.display()))?;
+    let mut bytes = vec![0_u8; length];
+    let bytes_read = file
+        .read(&mut bytes)
+        .with_context(|| format!("reading browser history source {}", path.display()))?;
+    bytes.truncate(bytes_read);
+    Ok(Some(EntryBytes {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        logical_path: entry.logical_path.clone(),
+        offset,
+        requested_length: length,
+        bytes_read,
+        total_size,
+        eof: offset.saturating_add(bytes_read as u64) >= total_size,
+        bytes,
+    }))
+}
+
 pub fn read_filesystem_entry_bytes(
     case_path: &Path,
     options: ReadEntryBytesOptions,
@@ -2253,10 +4426,20 @@ pub fn read_filesystem_entry_bytes(
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let entry = read_entry_for_bytes(&conn, case_id, options.entry_id)?;
+    if let Some(bytes) = read_chrome_cache_entry_body_bytes(&entry, options.offset, length)? {
+        return Ok(bytes);
+    }
     if entry.entry_kind == "record" {
-        // Imported records (browser visits, bookmarks, cookies, preferences)
-        // have no backing file; their content is the stored record metadata,
-        // so the viewer gets that rendered as text.
+        if let Some(bytes) =
+            read_browser_history_record_source_bytes(&entry, options.offset, length)?
+        {
+            return Ok(bytes);
+        }
+        // Records without a resolvable source file (registry values, EVTX
+        // events, email messages, or a browser-history record whose source
+        // database can no longer be found) have no backing file to show
+        // instead; their content is the stored record metadata, so the
+        // viewer gets that rendered as text.
         let rendered = serde_json::to_string_pretty(&entry.metadata_json)
             .context("rendering record metadata")?;
         let data = rendered.as_bytes();
@@ -2327,6 +4510,160 @@ pub fn read_filesystem_entry_bytes(
         total_size,
         eof: options.offset.saturating_add(bytes_read as u64) >= total_size,
         bytes,
+    })
+}
+
+fn unavailable_entry_disk_location(
+    entry: &EntryForBytes,
+    reason: impl Into<String>,
+) -> EntryDiskLocation {
+    EntryDiskLocation {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        available: false,
+        decoded_media_offset: None,
+        file_relative_offset: None,
+        contiguous_bytes: None,
+        exact_start: false,
+        basis: "unavailable".to_string(),
+        warning: Some(reason.into()),
+    }
+}
+
+/// Resolves where the selected file begins in the decoded evidence stream.
+/// The result describes only the first authoritative range. It does not claim
+/// that bytes following that range reconstruct a fragmented, sparse, or
+/// compressed file; callers use `read_filesystem_entry_bytes` for the logical
+/// file view and raw evidence reads for the filesystem/media view.
+pub fn filesystem_entry_disk_location(
+    case_path: &Path,
+    entry_id: i64,
+) -> Result<EntryDiskLocation> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let entry = read_entry_for_bytes(&conn, case_id, entry_id)?;
+    if entry.entry_kind != "file" {
+        return Ok(unavailable_entry_disk_location(
+            &entry,
+            "only file entries have a file-data location",
+        ));
+    }
+    if entry.source_kind != "image" {
+        return Ok(unavailable_entry_disk_location(
+            &entry,
+            "this evidence source is not a decoded disk image",
+        ));
+    }
+
+    if entry.metadata_json["filesystem_parser"].as_str() == Some("ext4") {
+        let Some(partition_start) = entry.metadata_json["partition_start_offset"].as_u64() else {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "ext entry has no partition start offset",
+            ));
+        };
+        let Some(inode_number) = entry.metadata_json["ext_inode_number"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "ext entry has no usable inode number",
+            ));
+        };
+        let resolved = (|| -> Result<Option<ext4::DataLocation>> {
+            let filesystem = open_ext4_superblock(Path::new(&entry.source_path), partition_start)?;
+            let inode = filesystem
+                .load_inode(inode_number)
+                .map_err(|err| anyhow!("loading ext inode {inode_number}: {err}"))?;
+            filesystem
+                .first_data_location(&inode)
+                .map_err(|err| anyhow!("resolving ext inode {inode_number} data: {err}"))
+        })();
+        return match resolved {
+            Ok(Some(location)) => {
+                let storage = match location.storage {
+                    ext4::DataLocationStorage::Extent => "ext first allocated extent",
+                    ext4::DataLocationStorage::InlineSymlink => {
+                        "ext inline symlink target in inode record"
+                    }
+                };
+                let remaining = entry
+                    .size_bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(location.contiguous_bytes)
+                    .saturating_sub(location.file_offset);
+                let contiguous_bytes = location.contiguous_bytes.min(remaining);
+                Ok(EntryDiskLocation {
+                    entry_id: entry.entry_id,
+                    evidence_id: entry.evidence_id,
+                    available: true,
+                    decoded_media_offset: Some(
+                        partition_start.saturating_add(location.filesystem_offset),
+                    ),
+                    file_relative_offset: Some(location.file_offset),
+                    contiguous_bytes: Some(contiguous_bytes),
+                    exact_start: true,
+                    basis: storage.to_string(),
+                    warning: (location.storage == ext4::DataLocationStorage::Extent).then(|| {
+                        "The start is exact. Bytes beyond the reported contiguous range are raw adjacent media, not reconstructed file fragments."
+                            .to_string()
+                    }),
+                })
+            }
+            Ok(None) => Ok(unavailable_entry_disk_location(
+                &entry,
+                "the ext inode has no allocated or inline data bytes",
+            )),
+            Err(err) => Ok(unavailable_entry_disk_location(
+                &entry,
+                format!("could not resolve ext inode location: {err}"),
+            )),
+        };
+    }
+
+    let Some(decoded_media_offset) =
+        metadata_u64_or_i64(&entry.metadata_json, "file_data_physical_offset")
+    else {
+        let reason = if entry.metadata_json["mft_record_physical_offset"].is_number() {
+            "only the filesystem metadata-record offset is known; the file-data offset is unavailable"
+        } else {
+            "the parser did not record an authoritative file-data offset"
+        };
+        return Ok(unavailable_entry_disk_location(&entry, reason));
+    };
+    let file_relative_offset =
+        metadata_u64_or_i64(&entry.metadata_json, "file_data_file_offset").unwrap_or(0);
+    let contiguous_bytes = metadata_u64_or_i64(&entry.metadata_json, "file_data_contiguous_bytes")
+        .or_else(|| {
+            (entry.metadata_json["recovery_read"].as_str() == Some("physical_extent"))
+                .then(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
+                .flatten()
+        });
+    let parser = entry.metadata_json["filesystem_parser"]
+        .as_str()
+        .unwrap_or("");
+    let basis = entry.metadata_json["physical_offset_basis"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| match parser {
+            "ntfs" => "NTFS first data run or resident data value".to_string(),
+            "fatfs" => "FAT first data cluster".to_string(),
+            _ => "parser-recorded first file-data offset".to_string(),
+        });
+    Ok(EntryDiskLocation {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        available: true,
+        decoded_media_offset: Some(decoded_media_offset),
+        file_relative_offset: Some(file_relative_offset),
+        contiguous_bytes,
+        exact_start: true,
+        basis,
+        warning: contiguous_bytes.is_none().then(|| {
+            "The start is exact; contiguous length is unknown, so later raw bytes may belong to another fragment or allocation."
+                .to_string()
+        }),
     })
 }
 
@@ -2445,6 +4782,58 @@ pub fn create_bookmark_folder(
     Ok(folder_id)
 }
 
+/// Removes an EMPTY bookmark folder. Folders still holding bookmarks or child
+/// folders are refused so an evidence-bearing report structure can never be
+/// dropped in one call - the examiner empties it deliberately first (the old
+/// Ecase 6.11 flavor deletes folders with contents only after its own
+/// confirmation flow; KDFT keeps the destructive scope minimal until that
+/// flow exists). The removal is recorded in the audit trail with the folder's
+/// name.
+pub fn remove_bookmark_folder(
+    case_path: &Path,
+    folder_id: i64,
+) -> Result<RemoveBookmarkFolderResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    ensure_bookmark_folder(&tx, case_id, folder_id)?;
+    let name: String = tx.query_row(
+        "SELECT name FROM bookmark_folders WHERE case_id = ?1 AND id = ?2",
+        params![case_id, folder_id],
+        |row| row.get(0),
+    )?;
+    let bookmark_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM bookmarks WHERE case_id = ?1 AND folder_id = ?2",
+        params![case_id, folder_id],
+        |row| row.get(0),
+    )?;
+    if bookmark_count > 0 {
+        bail!(
+            "folder \"{name}\" still contains {bookmark_count} bookmark(s); remove or move them first"
+        );
+    }
+    let child_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM bookmark_folders WHERE case_id = ?1 AND parent_id = ?2",
+        params![case_id, folder_id],
+        |row| row.get(0),
+    )?;
+    if child_count > 0 {
+        bail!("folder \"{name}\" still contains {child_count} child folder(s); remove them first");
+    }
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.folder.delete', ?2, 'bookmark_folder', ?3, json_object('name', ?4))",
+        params![case_id, actor, folder_id, name],
+    )?;
+    tx.execute(
+        "DELETE FROM bookmark_folders WHERE case_id = ?1 AND id = ?2",
+        params![case_id, folder_id],
+    )?;
+    tx.commit()?;
+    Ok(RemoveBookmarkFolderResult { folder_id, name })
+}
+
 pub fn list_bookmark_folders(case_path: &Path) -> Result<Vec<BookmarkFolder>> {
     let conn = open_existing_case(case_path)?;
     let mut stmt = conn.prepare(
@@ -2471,14 +4860,26 @@ pub fn list_bookmark_folders(case_path: &Path) -> Result<Vec<BookmarkFolder>> {
 }
 
 pub fn create_bookmark(case_path: &Path, options: CreateBookmarkOptions) -> Result<i64> {
-    validate_json_object(&options.source_ref_json, "source_ref_json")?;
-    validate_json_object(&options.content_ref_json, "content_ref_json")?;
-
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
-    ensure_bookmark_folder(&tx, case_id, options.folder_id)?;
+    let bookmark_id = create_bookmark_tx(&tx, case_id, &actor, options)?;
+    tx.commit()?;
+    Ok(bookmark_id)
+}
+
+/// Transaction-scoped body of `create_bookmark`, so composed operations (see
+/// `create_bookmark_with_items`) can run folder+bookmark+items atomically.
+fn create_bookmark_tx(
+    tx: &Connection,
+    case_id: i64,
+    actor: &str,
+    options: CreateBookmarkOptions,
+) -> Result<i64> {
+    validate_json_object(&options.source_ref_json, "source_ref_json")?;
+    validate_json_object(&options.content_ref_json, "content_ref_json")?;
+    ensure_bookmark_folder(tx, case_id, options.folder_id)?;
 
     let bookmark_type = options.bookmark_type.as_str();
     let data_type = trim_optional_string(options.data_type);
@@ -2517,7 +4918,6 @@ pub fn create_bookmark(case_path: &Path, options: CreateBookmarkOptions) -> Resu
             bookmark_type
         ],
     )?;
-    tx.commit()?;
     Ok(bookmark_id)
 }
 
@@ -2580,16 +4980,28 @@ pub fn add_bookmark_item(
     case_path: &Path,
     options: CreateBookmarkItemOptions,
 ) -> Result<BookmarkItem> {
-    validate_json_object(&options.item_ref_json, "item_ref_json")?;
-    validate_non_negative(options.item_order, "item_order")?;
-    validate_non_negative(options.selection_offset, "selection_offset")?;
-    validate_non_negative(options.selection_length, "selection_length")?;
-
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
-    ensure_bookmark(&tx, case_id, options.bookmark_id)?;
+    let item = add_bookmark_item_tx(&tx, case_id, &actor, options)?;
+    tx.commit()?;
+    Ok(item)
+}
+
+/// Transaction-scoped body of `add_bookmark_item` (see
+/// `create_bookmark_with_items` for why the split exists).
+fn add_bookmark_item_tx(
+    tx: &Connection,
+    case_id: i64,
+    actor: &str,
+    options: CreateBookmarkItemOptions,
+) -> Result<BookmarkItem> {
+    validate_json_object(&options.item_ref_json, "item_ref_json")?;
+    validate_non_negative(options.item_order, "item_order")?;
+    validate_non_negative(options.selection_offset, "selection_offset")?;
+    validate_non_negative(options.selection_length, "selection_length")?;
+    ensure_bookmark(tx, case_id, options.bookmark_id)?;
     let mut evidence_id = options.evidence_id;
     if let Some(evidence_id) = evidence_id {
         ensure_evidence_source(&tx, case_id, evidence_id)?;
@@ -2641,7 +5053,16 @@ pub fn add_bookmark_item(
                 data_preview = report_entry_preview(&item_ref_value);
             }
         }
+        enrich_entry_path_identity(entry, &mut item_ref_value);
+        enrich_index_job_provenance(&tx, entry, &mut item_ref_value)?;
     }
+    enrich_bookmark_partition_numbering(&tx, case_id, evidence_id, &mut item_ref_value)?;
+    let audit_volume_index = item_ref_value
+        .get("volume_index_zero_based")
+        .and_then(|value| value.as_i64());
+    let audit_partition_number = item_ref_value
+        .get("partition_number_one_based")
+        .and_then(|value| value.as_i64());
     let item_ref_json = item_ref_value.to_string();
 
     tx.execute(
@@ -2666,7 +5087,9 @@ pub fn add_bookmark_item(
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'bookmark.item.add', ?2, 'bookmark_item', ?3,
-                 json_object('bookmark_id', ?4, 'evidence_id', ?5, 'entry_id', ?6))",
+                 json_object('bookmark_id', ?4, 'evidence_id', ?5, 'entry_id', ?6,
+                             'volume_index_zero_based', ?7,
+                             'partition_number_one_based', ?8))",
         params![
             case_id,
             actor,
@@ -2674,11 +5097,11 @@ pub fn add_bookmark_item(
             options.bookmark_id,
             evidence_id,
             options.entry_id,
+            audit_volume_index,
+            audit_partition_number,
         ],
     )?;
-    let item = read_bookmark_item(&tx, case_id, item_id)?;
-    tx.commit()?;
-    Ok(item)
+    read_bookmark_item(tx, case_id, item_id)
 }
 
 /// Adds many entries to one bookmark in a single transaction. Exists because the
@@ -2696,7 +5119,21 @@ pub fn bulk_add_bookmark_items(
     let case_id = active_case_id(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
-    ensure_bookmark(&tx, case_id, bookmark_id)?;
+    let result = bulk_add_bookmark_items_tx(&tx, case_id, &actor, bookmark_id, entry_ids)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Transaction-scoped body of `bulk_add_bookmark_items` (see
+/// `create_bookmark_with_bulk_entries` for the composed atomic flow).
+fn bulk_add_bookmark_items_tx(
+    tx: &Connection,
+    case_id: i64,
+    actor: &str,
+    bookmark_id: i64,
+    entry_ids: &[i64],
+) -> Result<BulkBookmarkItemsResult> {
+    ensure_bookmark(tx, case_id, bookmark_id)?;
 
     let mut next_order: i64 = tx.query_row(
         "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
@@ -2715,7 +5152,8 @@ pub fn bulk_add_bookmark_items(
         };
         next_order = next_order.saturating_add(10);
         let display_name = report_entry_display_name(&entry);
-        let item_ref_value = report_entry_item_ref_json(&entry);
+        let mut item_ref_value = report_entry_item_ref_json(&entry);
+        enrich_index_job_provenance(&tx, &entry, &mut item_ref_value)?;
         let data_preview = report_entry_preview(&item_ref_value);
         let item_ref_json = item_ref_value.to_string();
         tx.execute(
@@ -2748,12 +5186,117 @@ pub fn bulk_add_bookmark_items(
             skipped_entry_ids.len() as i64
         ],
     )?;
-    tx.commit()?;
     Ok(BulkBookmarkItemsResult {
         bookmark_id,
         items_added,
         skipped_entry_ids,
     })
+}
+
+#[derive(Debug, Serialize)]
+pub struct BookmarkWithItemsResult {
+    pub folder_id: i64,
+    pub bookmark_id: i64,
+    pub items: Vec<BookmarkItem>,
+}
+
+/// Finds a root-level report folder by exact name, creating it (audited) when
+/// absent. Runs inside the caller's transaction.
+fn ensure_root_report_folder_tx(
+    tx: &Connection,
+    case_id: i64,
+    actor: &str,
+    name: &str,
+) -> Result<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("bookmark folder name cannot be empty");
+    }
+    if let Some(folder_id) = tx
+        .query_row(
+            "SELECT id FROM bookmark_folders
+             WHERE case_id = ?1 AND parent_id IS NULL AND name = ?2
+             ORDER BY id LIMIT 1",
+            params![case_id, name],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(folder_id);
+    }
+    let next_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(report_order), 0) + 10
+         FROM bookmark_folders
+         WHERE case_id = ?1 AND parent_id IS NULL",
+        params![case_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO bookmark_folders(
+             case_id, parent_id, name, folder_comment, show_in_report, report_order
+         ) VALUES (?1, NULL, ?2, NULL, 1, ?3)",
+        params![case_id, name, next_order],
+    )?;
+    let folder_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.folder.create', ?2, 'bookmark_folder', ?3, json_object('name', ?4))",
+        params![case_id, actor, folder_id, name],
+    )?;
+    Ok(folder_id)
+}
+
+/// Ensures the destination folder, creates the bookmark, and adds every item
+/// in ONE transaction. The workbench quick-bookmark flow used to chain three
+/// independent transactions (folder, bookmark, item), so a failure partway -
+/// or a rejected item - permanently left a folder and/or an item-less
+/// bookmark in the case. Any error here rolls the whole flow back.
+/// `bookmark.folder_id` and each item's `bookmark_id` are assigned by this
+/// function; caller-supplied values are ignored.
+pub fn create_bookmark_with_items(
+    case_path: &Path,
+    folder_name: &str,
+    mut bookmark: CreateBookmarkOptions,
+    items: Vec<CreateBookmarkItemOptions>,
+) -> Result<BookmarkWithItemsResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let folder_id = ensure_root_report_folder_tx(&tx, case_id, &actor, folder_name)?;
+    bookmark.folder_id = folder_id;
+    let bookmark_id = create_bookmark_tx(&tx, case_id, &actor, bookmark)?;
+    let mut created_items = Vec::with_capacity(items.len());
+    for mut item in items {
+        item.bookmark_id = bookmark_id;
+        created_items.push(add_bookmark_item_tx(&tx, case_id, &actor, item)?);
+    }
+    tx.commit()?;
+    Ok(BookmarkWithItemsResult {
+        folder_id,
+        bookmark_id,
+        items: created_items,
+    })
+}
+
+/// Bulk variant of `create_bookmark_with_items`: folder + bookmark + the fast
+/// entry-id bulk item loop, all in one transaction.
+pub fn create_bookmark_with_bulk_entries(
+    case_path: &Path,
+    folder_name: &str,
+    mut bookmark: CreateBookmarkOptions,
+    entry_ids: &[i64],
+) -> Result<(i64, BulkBookmarkItemsResult)> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let folder_id = ensure_root_report_folder_tx(&tx, case_id, &actor, folder_name)?;
+    bookmark.folder_id = folder_id;
+    let bookmark_id = create_bookmark_tx(&tx, case_id, &actor, bookmark)?;
+    let result = bulk_add_bookmark_items_tx(&tx, case_id, &actor, bookmark_id, entry_ids)?;
+    tx.commit()?;
+    Ok((folder_id, result))
 }
 
 pub fn list_bookmark_items(
@@ -2837,15 +5380,112 @@ pub fn report_data(case_path: &Path) -> Result<ReportData> {
     })
 }
 
+fn processing_status_is_incomplete(status: Option<&str>) -> bool {
+    matches!(status, Some("truncated" | "failed" | "running"))
+}
+
+fn processing_requested_limit_label(limit: Option<i64>) -> String {
+    match limit {
+        Some(0) => "unlimited (examiner requested 0)".to_string(),
+        Some(limit) => limit.to_string(),
+        None => "not recorded".to_string(),
+    }
+}
+
+fn processing_coverage_text(
+    job_type: Option<&str>,
+    status: Option<&str>,
+    requested_limit: Option<i64>,
+    entries_indexed: Option<i64>,
+    reason: Option<&str>,
+) -> String {
+    let job_type = job_type.unwrap_or("indexing");
+    let entries = entries_indexed
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "an unknown number of".to_string());
+    let limit = processing_requested_limit_label(requested_limit);
+    match status {
+        None => "Not processed: no filesystem-index or browser-import job is recorded.".to_string(),
+        Some("completed") => format!(
+            "Complete indexing job: latest {job_type} completed with {entries} indexed entries and did not report truncation or failure. Requested limit: {limit}."
+        ),
+        Some("truncated") => format!(
+            "PARTIAL INDEXING ONLY: latest {job_type} stopped after {entries} indexed entries. Requested limit: {limit}. Reason: {}. Findings from this index do not represent full source coverage.",
+            reason.unwrap_or("processing reported truncation without a stored reason")
+        ),
+        Some("failed") => format!(
+            "FAILED INDEXING: latest {job_type} failed; {entries} entries from that attempt were committed. Requested limit: {limit}. Reason: {}. Findings must not be treated as complete source coverage.",
+            reason.unwrap_or("processing failed without a stored reason")
+        ),
+        Some("running") => format!(
+            "PROCESSING INCOMPLETE: latest {job_type} is still marked running. Requested limit: {limit}. Current recorded entry count: {entries}. Findings must not be treated as complete source coverage."
+        ),
+        Some(other) => format!(
+            "Processing coverage is unknown: latest {job_type} has unrecognized status '{other}', with {entries} recorded entries and requested limit {limit}."
+        ),
+    }
+}
+
+fn bookmark_item_processing_warning(
+    item: &BookmarkItem,
+    evidence: Option<&ReportEvidence>,
+) -> Option<String> {
+    if item.entry_id.is_none() {
+        return None;
+    }
+    let captured_status = item
+        .item_ref_json
+        .get("index_job_status")
+        .and_then(|value| value.as_str());
+    if let Some(status) = captured_status {
+        return processing_status_is_incomplete(Some(status)).then(|| {
+            item.item_ref_json
+                .get("index_processing_coverage")
+                .and_then(|value| value.as_str())
+                .unwrap_or("This finding was derived from an incomplete indexing job and does not represent full source coverage.")
+                .to_string()
+        });
+    }
+    evidence
+        .filter(|evidence| {
+            processing_status_is_incomplete(evidence.latest_process_job_status.as_deref())
+        })
+        .map(|evidence| evidence.processing_coverage.clone())
+}
+
 fn report_evidence_rows(conn: &Connection, case_id: i64) -> Result<Vec<ReportEvidence>> {
     let mut stmt = conn.prepare(
         "SELECT e.id, e.display_name, e.source_kind, e.source_path, e.size_bytes,
                 e.attached_at, e.indexed_at, e.notes,
                 (SELECT COUNT(*) FROM filesystem_entries f
                  WHERE f.case_id = e.case_id AND f.evidence_id = e.id),
-                e.sha256_hex
+                e.sha256_hex, e.sha256_scope, e.acquisition_manifest_json,
+                j.id, j.job_type, j.status,
+                CAST(COALESCE(
+                    json_extract(j.parameters_json, '$.max_entries'),
+                    json_extract(j.parameters_json, '$.max_visits')
+                ) AS INTEGER),
+                COALESCE(
+                    CAST(json_extract(j.parameters_json, '$.entries_indexed') AS INTEGER),
+                    CASE WHEN j.id IS NOT NULL THEN (
+                        SELECT COUNT(*) FROM filesystem_entries jf
+                        WHERE jf.case_id = e.case_id
+                          AND jf.evidence_id = e.id
+                          AND jf.discovered_by_job_id = j.id
+                    ) END
+                ),
+                j.error
          FROM evidence_sources e
-         WHERE e.case_id = ?1
+         LEFT JOIN evidence_jobs j ON j.id = (
+             SELECT latest.id FROM evidence_jobs latest
+             WHERE latest.case_id = e.case_id
+               AND latest.evidence_id = e.id
+               AND latest.job_type = CASE WHEN e.source_kind = 'browser_history'
+                   THEN 'browser_history_import' ELSE 'filesystem_index' END
+             ORDER BY latest.id DESC
+             LIMIT 1
+         )
+         WHERE e.case_id = ?1 AND e.attach_status <> 'superseded'
          ORDER BY e.id",
     )?;
     let rows = stmt.query_map(params![case_id], |row| {
@@ -2853,6 +5493,18 @@ fn report_evidence_rows(conn: &Connection, case_id: i64) -> Result<Vec<ReportEvi
         let file_extension = Path::new(&source_path)
             .extension()
             .map(|ext| ext.to_string_lossy().to_lowercase());
+        let latest_process_job_type: Option<String> = row.get(13)?;
+        let latest_process_job_status: Option<String> = row.get(14)?;
+        let requested_entry_limit: Option<i64> = row.get(15)?;
+        let latest_process_entries_indexed: Option<i64> = row.get(16)?;
+        let processing_truncation_reason: Option<String> = row.get(17)?;
+        let processing_coverage = processing_coverage_text(
+            latest_process_job_type.as_deref(),
+            latest_process_job_status.as_deref(),
+            requested_entry_limit,
+            latest_process_entries_indexed,
+            processing_truncation_reason.as_deref(),
+        );
         Ok(ReportEvidence {
             id: row.get(0)?,
             display_name: row.get(1)?,
@@ -2861,14 +5513,53 @@ fn report_evidence_rows(conn: &Connection, case_id: i64) -> Result<Vec<ReportEvi
             file_extension,
             size_bytes: row.get(4)?,
             sha256: row.get(9)?,
+            sha256_scope: row.get(10)?,
+            acquisition_manifest_json: acquisition_manifest_from_row(row, 11)?,
             attached_at: row.get(5)?,
             indexed_at: row.get(6)?,
             entries_indexed: row.get(8)?,
+            latest_process_job_id: row.get(12)?,
+            latest_process_job_type,
+            latest_process_job_status,
+            requested_entry_limit,
+            latest_process_entries_indexed,
+            processing_truncation_reason,
+            processing_coverage,
             notes: row.get(7)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("listing report evidence sources")
+}
+
+fn render_acquisition_manifest_html(html: &mut String, manifest: &AcquisitionManifest) {
+    html.push_str("<dl class=\"activity-details\"><dt>Scheme</dt><dd>");
+    html.push_str(&escape_html(&manifest.scheme));
+    html.push_str("</dd><dt>Completeness</dt><dd>");
+    html.push_str(if manifest.complete {
+        "complete"
+    } else {
+        "partial"
+    });
+    html.push_str("</dd><dt>Segments</dt><dd>");
+    html.push_str(&manifest.segment_count.to_string());
+    html.push_str(" (total acquisition-file bytes: ");
+    html.push_str(&manifest.total_size.to_string());
+    html.push_str(")</dd>");
+    for (index, segment) in manifest.segments.iter().enumerate() {
+        html.push_str("<dt>Acquisition/container file ");
+        html.push_str(&(index + 1).to_string());
+        html.push_str("</dt><dd>");
+        html.push_str(&escape_html(&segment.path));
+        html.push_str(" &mdash; ");
+        html.push_str(&segment.size.to_string());
+        html.push_str(" bytes &mdash; SHA-256: <code>");
+        html.push_str(&escape_html(&segment.sha256));
+        html.push_str("</code></dd>");
+    }
+    html.push_str("<dt>Manifest note</dt><dd>");
+    html.push_str(&escape_html(&manifest.note));
+    html.push_str("</dd></dl>");
 }
 
 /// Report variant that also carries the full indexed directory structure of
@@ -2882,10 +5573,30 @@ pub fn report_data_with_directory_structure(
     let case_id = active_case_id(&conn)?;
     let mut trees = Vec::new();
     for evidence in &report.evidence {
+        // Only the exact-source-path string is needed per row, so extract it
+        // in SQL (mirroring source_path_exact_from_metadata's key priority)
+        // instead of shipping and serde-parsing every row's full
+        // metadata_json - that per-row parse dominated report export time on
+        // six-figure-entry cases.
+        // The report's Directory Structure shows the GENUINE source
+        // filesystem hierarchy only. KDFT's own bookkeeping and derived rows
+        // (partition/volume/container records, partition reports, carved
+        // staging, unallocated pseudo-files) are tool output, not the disk's
+        // directory structure, and used to leak synthetic roots like
+        // "Carved/" into a court-facing tree.
         let mut stmt = conn.prepare(
-            "SELECT logical_path, name, entry_kind, size_bytes
+            "SELECT logical_path, name, entry_kind, size_bytes,
+                    COALESCE(
+                        NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+                        NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+                        NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+                        NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+                        NULLIF(json_extract(metadata_json, '$.local_relative_path'), '')
+                    )
              FROM filesystem_entries
-             WHERE case_id = ?1 AND evidence_id = ?2",
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), 'filesystem_entry')
+                   IN ('filesystem_entry', 'deleted_file_record')",
         )?;
         let rows = stmt.query_map(params![case_id, evidence.id], |row| {
             Ok((
@@ -2893,6 +5604,7 @@ pub fn report_data_with_directory_structure(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         let rows = rows
@@ -2906,7 +5618,7 @@ pub fn report_data_with_directory_structure(
         // row of their own) appear in the tree.
         let mut nodes: BTreeMap<Vec<String>, (String, Option<i64>)> = BTreeMap::new();
         let total_entries = rows.len() as i64;
-        for (logical_path, name, entry_kind, size_bytes) in rows {
+        for (logical_path, name, entry_kind, size_bytes, exact_path) in rows {
             let mut parts: Vec<String> = logical_path
                 .split('/')
                 .filter(|part| !part.is_empty())
@@ -2925,6 +5637,23 @@ pub fn report_data_with_directory_structure(
                 // The container folders themselves collapse away entirely.
                 if parts.is_empty() {
                     continue;
+                }
+            }
+            let exact_parts = exact_path
+                .as_deref()
+                .map(|path| {
+                    path.split(['/', '\\'])
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|parts| !parts.is_empty());
+            if let Some(exact_parts) = exact_parts {
+                if logical_path.starts_with("/Image Analysis/Volumes/") && !parts.is_empty() {
+                    let volume = parts[0].clone();
+                    parts = std::iter::once(volume).chain(exact_parts).collect();
+                } else {
+                    parts = exact_parts;
                 }
             }
             if parts.is_empty() {
@@ -2968,9 +5697,19 @@ pub fn report_data_with_directory_structure(
     Ok(report)
 }
 
-/// Records a report export (path + content hash) in the case audit trail so a
-/// produced report can later be re-verified against the case database.
-pub fn record_report_export(case_path: &Path, output_path: &str, sha256: &str) -> Result<()> {
+/// Records a report export in the case audit trail so a produced report can
+/// later be re-verified against the case database. Two digests are stored
+/// under explicit names (KDFT-EA-008): `content_prefix_sha256` is the digest
+/// embedded in the report's integrity footer and covers only the bytes
+/// preceding that footer; `report_file_sha256` is a standard SHA-256 over the
+/// complete written report file, so ordinary `sha256sum`/`certutil`
+/// verification matches it directly.
+pub fn record_report_export(
+    case_path: &Path,
+    output_path: &str,
+    content_prefix_sha256: &str,
+    report_file_sha256: &str,
+) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2978,8 +5717,16 @@ pub fn record_report_export(case_path: &Path, output_path: &str, sha256: &str) -
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'report.export', ?2, 'report', ?1,
-                 json_object('output_path', ?3, 'sha256', ?4))",
-        params![case_id, actor, output_path, sha256],
+                 json_object('output_path', ?3,
+                             'content_prefix_sha256', ?4,
+                             'report_file_sha256', ?5))",
+        params![
+            case_id,
+            actor,
+            output_path,
+            content_prefix_sha256,
+            report_file_sha256
+        ],
     )?;
     tx.commit()?;
     Ok(())
@@ -2991,11 +5738,19 @@ pub fn render_report_html(report: &ReportData) -> String {
 
 pub fn render_report(report: &ReportData) -> RenderedReport {
     let mut html = String::new();
+    let evidence_by_id: HashMap<i64, &ReportEvidence> = report
+        .evidence
+        .iter()
+        .map(|evidence| (evidence.id, evidence))
+        .collect();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>");
     html.push_str(&escape_html(&report.case.name));
     html.push_str("</title><style>");
     html.push_str("body{font-family:Segoe UI,Arial,sans-serif;margin:32px;line-height:1.4;color:#1f2933}h1{margin-bottom:0}h2{border-bottom:1px solid #cfd7df;padding-bottom:4px;margin-top:28px}article{margin:16px 0;padding:12px 0;border-bottom:1px solid #e6ebf0}.meta{color:#5b6773;font-size:0.9em}.comment{white-space:pre-wrap}.items{border-collapse:collapse;width:100%;margin-top:8px}.items th,.items td{border:1px solid #d9e1e8;padding:6px;text-align:left;vertical-align:top}.items th{background:#f3f6f8}.activity-details{margin:0}.activity-details dt{font-weight:600}.activity-details dd{margin:0 0 4px 0;overflow-wrap:anywhere}pre{white-space:pre-wrap;background:#f6f8fa;padding:8px;border:1px solid #d9e1e8}");
     html.push_str(".kdft-band{display:flex;justify-content:space-between;align-items:center;background:#0f3d3e;color:#eaf4f4;padding:10px 14px;border-radius:6px;font-size:0.9em}.kdft-band .kdft-logo{font-weight:800;letter-spacing:2px;font-size:1.2em}.dirtree{font-family:Consolas,monospace;font-size:0.85em;line-height:1.5;overflow-x:auto}.kdft-integrity{margin-top:32px;border-top:2px solid #0f3d3e;padding-top:8px;color:#5b6773;font-size:0.8em;overflow-wrap:anywhere}body::after{content:'KDFT';position:fixed;top:40%;left:20%;font-size:18vw;font-weight:900;color:rgba(15,61,62,0.05);transform:rotate(-28deg);pointer-events:none;z-index:0}");
+    html.push_str(".processing-warning{border:2px solid #9f1239;background:#fff1f2;color:#881337;padding:12px 14px;margin:16px 0;font-weight:650;position:relative;z-index:1}.processing-partial{color:#9f1239;font-weight:700}");
+    html.push_str(".kdft-toc{background:#f3f6f8;border:1px solid #d9e1e8;border-radius:6px;padding:10px 14px;margin-top:16px;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;position:relative;z-index:1}.kdft-toc a{color:#0f3d3e;text-decoration:none;font-weight:600}.kdft-toc a:hover{text-decoration:underline}.kdft-back-to-top{display:inline-block;margin-top:6px;font-size:0.85em}");
+    html.push_str(".bookmark-items{table-layout:fixed}.bookmark-items td{overflow-wrap:anywhere}.bookmark-items th:nth-child(1),.bookmark-items td:nth-child(1){width:4%}.bookmark-items th:nth-child(2),.bookmark-items td:nth-child(2){width:10%}.bookmark-items th:nth-child(3),.bookmark-items td:nth-child(3){width:13%}.bookmark-items th:nth-child(4),.bookmark-items td:nth-child(4){width:8%}.bookmark-items th:nth-child(5),.bookmark-items td:nth-child(5){width:39%}.bookmark-items th:nth-child(6),.bookmark-items td:nth-child(6){width:26%}");
     html.push_str("</style></head><body>");
     html.push_str("<div class=\"kdft-band\"><span class=\"kdft-logo\">KDFT</span><span>Kristiee's Digital Forensic Tool &middot; engine v");
     html.push_str(env!("CARGO_PKG_VERSION"));
@@ -3008,7 +5763,7 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
         .unwrap_or_else(|| "unknown".to_string());
     html.push_str(&escape_html(&generated_at));
     html.push_str("</span></div>");
-    html.push_str("<h1>");
+    html.push_str("<h1 id=\"top\">");
     html.push_str(&escape_html(&report.case.name));
     html.push_str("</h1>");
     html.push_str("<p class=\"meta\">");
@@ -3050,7 +5805,50 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
         html.push_str("</p>");
     }
 
-    html.push_str("<section><h2>Technical Details</h2>");
+    let incomplete_finding_evidence = report
+        .folders
+        .iter()
+        .flat_map(|folder| &folder.bookmarks)
+        .flat_map(|bookmark| &bookmark.items)
+        .filter_map(|item| {
+            let evidence = item
+                .evidence_id
+                .and_then(|evidence_id| evidence_by_id.get(&evidence_id).copied());
+            bookmark_item_processing_warning(item, evidence)
+                .is_some()
+                .then_some(evidence)
+                .flatten()
+        })
+        .map(|evidence| evidence.display_name.as_str())
+        .collect::<HashSet<_>>();
+    if !incomplete_finding_evidence.is_empty() {
+        let mut names = incomplete_finding_evidence.into_iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        html.push_str("<div class=\"processing-warning\">WARNING: This report contains findings derived from truncated, failed, or still-running indexing for: ");
+        html.push_str(&escape_html(&names.join(", ")));
+        html.push_str(". Those findings represent partial/uncertain coverage and must not be interpreted as a complete examination of the source.</div>");
+    }
+
+    html.push_str("<nav class=\"kdft-toc\"><strong>Jump to:</strong> <a href=\"#technical-details\">Technical Details</a>");
+    for (index, tree) in report.directory_trees.iter().enumerate() {
+        html.push_str(" <a href=\"#dirtree-");
+        html.push_str(&index.to_string());
+        html.push_str("\">Directory Structure - ");
+        html.push_str(&escape_html(&tree.evidence_name));
+        html.push_str("</a>");
+    }
+    for (index, folder) in report.folders.iter().enumerate() {
+        html.push_str(" <a href=\"#folder-");
+        html.push_str(&index.to_string());
+        html.push_str("\">");
+        html.push_str(&escape_html(&folder.name));
+        html.push_str(" (");
+        html.push_str(&folder.bookmarks.len().to_string());
+        html.push_str(")</a>");
+    }
+    html.push_str("</nav>");
+
+    html.push_str("<section id=\"technical-details\"><h2>Technical Details</h2>");
     html.push_str("<table class=\"items\"><tbody>");
     let case_rows = [
         ("Case name", Some(report.case.name.clone())),
@@ -3080,7 +5878,7 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     html.push_str("</tbody></table>");
 
     if !report.evidence.is_empty() {
-        html.push_str("<h2>Evidence Sources</h2><table class=\"items\"><thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Extension</th><th>Size</th><th>SHA-256</th><th>Location</th><th>Attached</th><th>Indexed entries</th></tr></thead><tbody>");
+        html.push_str("<h2>Evidence Sources</h2><table class=\"items\"><thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Extension</th><th>Size</th><th>SHA-256 (decoded media for images; evidence file for files)</th><th>Acquisition/container file manifest</th><th>Latest processing status</th><th>Requested limit</th><th>Latest job indexed entries</th><th>Coverage / truncation reason</th><th>Location</th><th>Attached</th><th>Current indexed entries</th></tr></thead><tbody>");
         for evidence in &report.evidence {
             html.push_str("<tr><td>");
             html.push_str(&evidence.id.to_string());
@@ -3103,6 +5901,34 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
                 None => html.push_str("<span class=\"meta\">not computed</span>"),
             }
             html.push_str("</td><td>");
+            match evidence.acquisition_manifest_json.as_ref() {
+                Some(manifest) => render_acquisition_manifest_html(&mut html, manifest),
+                None if evidence.source_kind == "image" => html.push_str(
+                    "<span class=\"meta\">not computed; run the evidence hash job to create the acquisition-file manifest</span>",
+                ),
+                None => html.push_str("<span class=\"meta\">not applicable</span>"),
+            }
+            html.push_str("</td><td>");
+            match evidence.latest_process_job_status.as_deref() {
+                Some(status) => html.push_str(&escape_html(status)),
+                None => html.push_str("<span class=\"meta\">not processed</span>"),
+            }
+            html.push_str("</td><td>");
+            html.push_str(&escape_html(&processing_requested_limit_label(
+                evidence.requested_entry_limit,
+            )));
+            html.push_str("</td><td>");
+            match evidence.latest_process_entries_indexed {
+                Some(count) => html.push_str(&count.to_string()),
+                None => html.push_str("<span class=\"meta\">not recorded</span>"),
+            }
+            html.push_str("</td><td");
+            if processing_status_is_incomplete(evidence.latest_process_job_status.as_deref()) {
+                html.push_str(" class=\"processing-partial\"");
+            }
+            html.push('>');
+            html.push_str(&escape_html(&evidence.processing_coverage));
+            html.push_str("</td><td>");
             html.push_str(&escape_html(&evidence.source_path));
             html.push_str("</td><td>");
             html.push_str(&escape_html(&evidence.attached_at));
@@ -3114,8 +5940,10 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     }
     html.push_str("</section>");
 
-    for tree in &report.directory_trees {
-        html.push_str("<section><h2>Directory Structure - ");
+    for (dirtree_index, tree) in report.directory_trees.iter().enumerate() {
+        html.push_str("<section id=\"dirtree-");
+        html.push_str(&dirtree_index.to_string());
+        html.push_str("\"><h2>Directory Structure - ");
         html.push_str(&escape_html(&tree.evidence_name));
         html.push_str("</h2><p class=\"meta\">");
         html.push_str(&tree.total_entries.to_string());
@@ -3142,6 +5970,7 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
             html.push_str(&tree.lines.len().to_string());
             html.push_str(" lines.</p>");
         }
+        html.push_str("<a class=\"kdft-back-to-top\" href=\"#top\">&uarr; Back to top</a>");
         html.push_str("</section>");
     }
 
@@ -3149,8 +5978,10 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
         html.push_str("<p>No report-enabled bookmark folders.</p>");
     }
 
-    for folder in &report.folders {
-        html.push_str("<section><h2>");
+    for (folder_index, folder) in report.folders.iter().enumerate() {
+        html.push_str("<section id=\"folder-");
+        html.push_str(&folder_index.to_string());
+        html.push_str("\"><h2>");
         html.push_str(&escape_html(&folder.name));
         html.push_str("</h2>");
         if let Some(comment) = &folder.folder_comment {
@@ -3180,9 +6011,10 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
                 html.push_str(&escape_html(comment));
                 html.push_str("</p>");
             }
-            render_report_items_html(&mut html, &bookmark.items);
+            render_report_items_html(&mut html, &bookmark.items, &evidence_by_id);
             html.push_str("</article>");
         }
+        html.push_str("<a class=\"kdft-back-to-top\" href=\"#top\">&uarr; Back to top</a>");
         html.push_str("</section>");
     }
 
@@ -3199,9 +6031,12 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     html.push_str(&escape_html(&generated_at));
     html.push_str(". SHA-256 of all report content preceding this footer: <code>");
     html.push_str(&sha256);
-    html.push_str("</code>. To verify: hash the report file bytes up to (not including) the first occurrence of the marker <code>&lt;footer class=\"kdft-integrity\"</code> and compare with this value and with the report.export audit event stored in the case database.</footer>");
+    html.push_str("</code>. To verify: hash the report file bytes up to (not including) the first occurrence of the marker <code>&lt;footer class=\"kdft-integrity\"</code> and compare with this value and with the <code>content_prefix_sha256</code> field of the report.export audit event stored in the case database. A standard SHA-256 over the complete report file is recorded separately in that audit event as <code>report_file_sha256</code>.</footer>");
     html.push_str("</body></html>");
-    RenderedReport { html, sha256 }
+    RenderedReport {
+        html,
+        content_prefix_sha256: sha256,
+    }
 }
 
 fn format_size_bytes(size: i64) -> String {
@@ -3222,7 +6057,10 @@ fn format_size_bytes(size: i64) -> String {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`. Public so every court-facing digest in
+/// the workspace (evidence, recovery, report files) goes through one
+/// implementation.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
@@ -3427,6 +6265,7 @@ struct ChromiumProfilePaths {
 struct FirefoxProfilePaths {
     profile_dir: PathBuf,
     places_path: PathBuf,
+    downloads_path: PathBuf,
     formhistory_path: PathBuf,
     cookies_path: PathBuf,
     logins_path: PathBuf,
@@ -3477,6 +6316,10 @@ struct BrowserHistoryImportData {
     login_records: Vec<BrowserActivityRecord>,
     cookie_records: Vec<BrowserActivityRecord>,
     total_visits: usize,
+    /// Reader failures disclosed per artifact class ("cookies: no such
+    /// column ..."). Persisted with the import so a parse failure is never
+    /// presented as an artifact-free profile.
+    parse_errors: Vec<String>,
 }
 
 struct BrowserActivityRecord {
@@ -3683,15 +6526,88 @@ struct RawEntryForBytes {
     source_path: String,
 }
 
+fn source_path_exact_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    [
+        "source_path_exact",
+        "ntfs_path",
+        "fat_path",
+        "ext_path",
+        "local_relative_path",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Indexed parser metadata historically used `partition_index` as a one-based
+/// partition number (with 0 meaning a whole-image filesystem). Normalize that
+/// known stored convention into two explicit fields while retaining the old
+/// key for compatibility with existing UI code and cases.
+fn normalize_indexed_partition_numbering(metadata: &mut serde_json::Value) {
+    let Some(legacy) = metadata
+        .get("partition_index")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("volume_index_zero_based".to_string())
+        .or_insert_with(|| serde_json::json!(legacy.saturating_sub(1)));
+    object
+        .entry("partition_number_one_based".to_string())
+        .or_insert_with(|| {
+            if legacy == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(legacy)
+            }
+        });
+}
+
+fn metadata_json_with_path_identity(logical_path: &str, metadata_json: &str) -> Result<String> {
+    let mut metadata: serde_json::Value = serde_json::from_str(metadata_json)
+        .with_context(|| format!("parsing metadata for internal path {logical_path}"))?;
+    normalize_indexed_partition_numbering(&mut metadata);
+    let source_path_exact = source_path_exact_from_metadata(&metadata);
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "internal_path_key".to_string(),
+            serde_json::json!(logical_path),
+        );
+        if !object.contains_key("source_path_exact") {
+            object.insert(
+                "source_path_exact".to_string(),
+                source_path_exact
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    Ok(metadata.to_string())
+}
+
 fn filesystem_entry_from_raw(raw: RawFilesystemEntry) -> Result<FilesystemEntry> {
-    let metadata_json = serde_json::from_str(&raw.metadata_json)
+    let mut metadata_json: serde_json::Value = serde_json::from_str(&raw.metadata_json)
         .with_context(|| format!("parsing metadata_json for filesystem entry {}", raw.id))?;
+    normalize_indexed_partition_numbering(&mut metadata_json);
+    let source_path_exact = source_path_exact_from_metadata(&metadata_json);
     Ok(FilesystemEntry {
         id: raw.id,
         case_id: raw.case_id,
         evidence_id: raw.evidence_id,
         parent_id: raw.parent_id,
+        internal_path_key: raw.logical_path.clone(),
         logical_path: raw.logical_path,
+        source_path_exact,
         name: raw.name,
         entry_kind: raw.entry_kind,
         size_bytes: raw.size_bytes,
@@ -3940,24 +6856,90 @@ fn sqlite_column_exists(conn: &Connection, table_name: &str, column_name: &str) 
     Ok(false)
 }
 
+/// SQL expression for a browser-schema column that older database
+/// generations may not have (for example Firefox 3.0-era places.sqlite has no
+/// moz_places.last_visit_date and 2008-era formhistory.sqlite has only
+/// id/fieldname/value). Missing columns select NULL so era-specific databases
+/// still parse instead of failing the whole reader.
+fn sql_column_or_null(
+    conn: &Connection,
+    table_name: &str,
+    prefix: &str,
+    column_name: &str,
+) -> Result<String> {
+    Ok(if sqlite_column_exists(conn, table_name, column_name)? {
+        format!("{prefix}{column_name}")
+    } else {
+        "NULL".to_string()
+    })
+}
+
+/// One optional-artifact reader outcome: a parse failure becomes a disclosed
+/// error string on the import instead of silently presenting as "no records".
+fn reader_records_or_disclosed_error(
+    label: &str,
+    result: Result<Vec<BrowserActivityRecord>>,
+    parse_errors: &mut Vec<String>,
+) -> Vec<BrowserActivityRecord> {
+    match result {
+        Ok(records) => records,
+        Err(error) => {
+            parse_errors.push(format!("{label}: {error:#}"));
+            Vec::new()
+        }
+    }
+}
+
 fn collect_chromium_history_import(
     input_path: &Path,
     max_visits: usize,
 ) -> Result<BrowserHistoryImportData> {
     let profile_paths = chromium_profile_paths(input_path)?;
-    let history_rows =
-        read_chromium_history_rows(&profile_paths.history_path, max_visits).unwrap_or_default();
+    let mut parse_errors = Vec::new();
+    let history_rows = match read_chromium_history_rows(&profile_paths.history_path, max_visits) {
+        Ok(rows) => rows,
+        Err(error) => {
+            parse_errors.push(format!("history visits: {error:#}"));
+            Default::default()
+        }
+    };
     let visit_records =
         browser_history_visit_records(&history_rows.rows, &profile_paths.history_path);
-    let bookmark_records =
-        read_chromium_bookmark_records(&profile_paths.bookmarks_path).unwrap_or_default();
-    let preference_records =
-        read_chromium_preference_records(&profile_paths.preferences_path).unwrap_or_default();
-    let url_records = read_chromium_url_records(&profile_paths.history_path, max_visits);
-    let search_records = read_chromium_search_records(&profile_paths.history_path, max_visits);
-    let download_records = read_chromium_download_records(&profile_paths.history_path, max_visits);
-    let login_records = read_chromium_login_records(&profile_paths.profile_dir, max_visits);
-    let cookie_records = read_chromium_cookie_records(&profile_paths.profile_dir, max_visits);
+    let bookmark_records = reader_records_or_disclosed_error(
+        "bookmarks",
+        read_chromium_bookmark_records(&profile_paths.bookmarks_path),
+        &mut parse_errors,
+    );
+    let preference_records = reader_records_or_disclosed_error(
+        "preferences",
+        read_chromium_preference_records(&profile_paths.preferences_path),
+        &mut parse_errors,
+    );
+    let url_records = reader_records_or_disclosed_error(
+        "urls",
+        read_chromium_url_records_inner(&profile_paths.history_path, max_visits),
+        &mut parse_errors,
+    );
+    let search_records = reader_records_or_disclosed_error(
+        "search terms",
+        read_chromium_search_records_inner(&profile_paths.history_path, max_visits),
+        &mut parse_errors,
+    );
+    let download_records = reader_records_or_disclosed_error(
+        "downloads",
+        read_chromium_download_records_inner(&profile_paths.history_path, max_visits),
+        &mut parse_errors,
+    );
+    let login_records = reader_records_or_disclosed_error(
+        "logins",
+        read_chromium_login_records_inner(&profile_paths.profile_dir, max_visits),
+        &mut parse_errors,
+    );
+    let cookie_records = reader_records_or_disclosed_error(
+        "cookies",
+        read_chromium_cookie_records_inner(&profile_paths.profile_dir, max_visits),
+        &mut parse_errors,
+    );
     let source_path = stable_path_string(&profile_paths.profile_dir);
     let parameters_json = serde_json::json!({
         "browser_family": BrowserFamily::Chromium.as_str(),
@@ -3966,7 +6948,8 @@ fn collect_chromium_history_import(
         "history_db": profile_paths.history_path.to_string_lossy(),
         "bookmarks_file": profile_paths.bookmarks_path.to_string_lossy(),
         "preferences_file": profile_paths.preferences_path.to_string_lossy(),
-        "max_visits": history_limit_json(max_visits)
+        "max_visits": history_limit_json(max_visits),
+        "parse_errors": parse_errors
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -3987,6 +6970,7 @@ fn collect_chromium_history_import(
         login_records,
         cookie_records,
         total_visits: history_rows.total_visits,
+        parse_errors,
     })
 }
 
@@ -3995,27 +6979,64 @@ fn collect_firefox_history_import(
     max_visits: usize,
 ) -> Result<BrowserHistoryImportData> {
     let profile_paths = firefox_profile_paths(input_path)?;
-    let history_rows =
-        read_firefox_history_rows(&profile_paths.places_path, max_visits).unwrap_or_default();
+    let mut parse_errors = Vec::new();
+    let history_rows = match read_firefox_history_rows(&profile_paths.places_path, max_visits) {
+        Ok(rows) => rows,
+        Err(error) => {
+            parse_errors.push(format!("history visits: {error:#}"));
+            FirefoxHistoryRows::default()
+        }
+    };
     let visit_records =
         firefox_history_visit_records(&history_rows.rows, &profile_paths.places_path);
-    let bookmark_records = read_firefox_bookmark_records(&profile_paths.places_path, max_visits);
+    let bookmark_records = reader_records_or_disclosed_error(
+        "bookmarks",
+        read_firefox_bookmark_records_inner(&profile_paths.places_path, max_visits),
+        &mut parse_errors,
+    );
     let preference_records = Vec::new();
-    let url_records = read_firefox_url_records(&profile_paths.places_path, max_visits);
-    let search_records = read_firefox_search_records(&profile_paths.formhistory_path, max_visits);
-    let download_records = read_firefox_download_records(&profile_paths.places_path, max_visits);
-    let login_records = read_firefox_login_records(&profile_paths.logins_path, max_visits);
-    let cookie_records = read_firefox_cookie_records(&profile_paths.cookies_path, max_visits);
+    let url_records = reader_records_or_disclosed_error(
+        "urls",
+        read_firefox_url_records_inner(&profile_paths.places_path, max_visits),
+        &mut parse_errors,
+    );
+    let search_records = reader_records_or_disclosed_error(
+        "search terms",
+        read_firefox_search_records_inner(&profile_paths.formhistory_path, max_visits),
+        &mut parse_errors,
+    );
+    let mut download_records = reader_records_or_disclosed_error(
+        "downloads",
+        read_firefox_download_records_inner(&profile_paths.places_path, max_visits),
+        &mut parse_errors,
+    );
+    download_records.extend(reader_records_or_disclosed_error(
+        "downloads (downloads.sqlite)",
+        read_firefox_downloads_sqlite_records_inner(&profile_paths.downloads_path, max_visits),
+        &mut parse_errors,
+    ));
+    let login_records = reader_records_or_disclosed_error(
+        "logins",
+        read_firefox_login_records_inner(&profile_paths.logins_path, max_visits),
+        &mut parse_errors,
+    );
+    let cookie_records = reader_records_or_disclosed_error(
+        "cookies",
+        read_firefox_cookie_records_inner(&profile_paths.cookies_path, max_visits),
+        &mut parse_errors,
+    );
     let source_path = stable_path_string(&profile_paths.profile_dir);
     let parameters_json = serde_json::json!({
         "browser_family": BrowserFamily::Firefox.as_str(),
         "history_path": source_path,
         "profile_dir": profile_paths.profile_dir.to_string_lossy(),
         "places_file": profile_paths.places_path.to_string_lossy(),
+        "downloads_file": profile_paths.downloads_path.to_string_lossy(),
         "formhistory_file": profile_paths.formhistory_path.to_string_lossy(),
         "cookies_file": profile_paths.cookies_path.to_string_lossy(),
         "logins_file": profile_paths.logins_path.to_string_lossy(),
-        "max_visits": history_limit_json(max_visits)
+        "max_visits": history_limit_json(max_visits),
+        "parse_errors": parse_errors
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -4036,6 +7057,7 @@ fn collect_firefox_history_import(
         login_records,
         cookie_records,
         total_visits: history_rows.total_visits,
+        parse_errors,
     })
 }
 
@@ -4044,11 +7066,21 @@ fn collect_safari_history_import(
     max_visits: usize,
 ) -> Result<BrowserHistoryImportData> {
     let profile_paths = safari_profile_paths(input_path)?;
-    let history_rows =
-        read_safari_history_rows(&profile_paths.history_path, max_visits).unwrap_or_default();
+    let mut parse_errors = Vec::new();
+    let history_rows = match read_safari_history_rows(&profile_paths.history_path, max_visits) {
+        Ok(rows) => rows,
+        Err(error) => {
+            parse_errors.push(format!("history visits: {error:#}"));
+            Default::default()
+        }
+    };
     let visit_records =
         safari_history_visit_records(&history_rows.rows, &profile_paths.history_path);
-    let url_records = read_safari_url_records(&profile_paths.history_path, max_visits);
+    let url_records = reader_records_or_disclosed_error(
+        "urls",
+        read_safari_url_records_inner(&profile_paths.history_path, max_visits),
+        &mut parse_errors,
+    );
     let source_path = stable_path_string(&profile_paths.profile_dir);
     let parameters_json = serde_json::json!({
         "browser_family": BrowserFamily::Safari.as_str(),
@@ -4056,7 +7088,8 @@ fn collect_safari_history_import(
         "profile_dir": profile_paths.profile_dir.to_string_lossy(),
         "history_db": profile_paths.history_path.to_string_lossy(),
         "unsupported_artifacts": ["bookmarks_plist", "downloads_plist"],
-        "max_visits": history_limit_json(max_visits)
+        "max_visits": history_limit_json(max_visits),
+        "parse_errors": parse_errors
     })
     .to_string();
     Ok(BrowserHistoryImportData {
@@ -4077,14 +7110,12 @@ fn collect_safari_history_import(
         login_records: Vec::new(),
         cookie_records: Vec::new(),
         total_visits: history_rows.total_visits,
+        parse_errors,
     })
 }
 
 /// Unique URL rows from the Chromium `urls` table ("URLs" DFIR category, distinct from
 /// per-event "Visits").
-fn read_chromium_url_records(history_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_chromium_url_records_inner(history_path, max_rows).unwrap_or_default()
-}
 
 fn read_chromium_url_records_inner(
     history_path: &Path,
@@ -4156,12 +7187,6 @@ fn read_chromium_url_records_inner(
 }
 
 /// Search terms typed in the browser (Chromium `keyword_search_terms`).
-fn read_chromium_search_records(
-    history_path: &Path,
-    max_rows: usize,
-) -> Vec<BrowserActivityRecord> {
-    read_chromium_search_records_inner(history_path, max_rows).unwrap_or_default()
-}
 
 fn read_chromium_search_records_inner(
     history_path: &Path,
@@ -4213,12 +7238,6 @@ fn read_chromium_search_records_inner(
 }
 
 /// Download records from the Chromium `downloads` table.
-fn read_chromium_download_records(
-    history_path: &Path,
-    max_rows: usize,
-) -> Vec<BrowserActivityRecord> {
-    read_chromium_download_records_inner(history_path, max_rows).unwrap_or_default()
-}
 
 fn read_chromium_download_records_inner(
     history_path: &Path,
@@ -4329,9 +7348,6 @@ fn read_chromium_download_records_inner(
 
 /// Saved website credentials from `Login Data`. Only the origin, action URL, username, and
 /// usage timestamps are recorded; encrypted password values are never read or stored.
-fn read_chromium_login_records(profile_dir: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_chromium_login_records_inner(profile_dir, max_rows).unwrap_or_default()
-}
 
 fn read_chromium_login_records_inner(
     profile_dir: &Path,
@@ -4408,9 +7424,6 @@ fn read_chromium_login_records_inner(
 /// Cookie metadata from the Chromium cookie store (`Network\Cookies` or legacy `Cookies`).
 /// Cookie names, hosts, and timestamps are DFIR session/token indicators; encrypted cookie
 /// values are never read or stored.
-fn read_chromium_cookie_records(profile_dir: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_chromium_cookie_records_inner(profile_dir, max_rows).unwrap_or_default()
-}
 
 fn read_chromium_cookie_records_inner(
     profile_dir: &Path,
@@ -4821,14 +7834,18 @@ fn read_firefox_history_rows(places_path: &Path, max_visits: usize) -> Result<Fi
         [],
         |row| row.get(0),
     )?;
-    let mut stmt = conn.prepare(
+    let visit_count = sql_column_or_null(&conn, "moz_places", "p.", "visit_count")?;
+    let typed = sql_column_or_null(&conn, "moz_places", "p.", "typed")?;
+    let last_visit_date = sql_column_or_null(&conn, "moz_places", "p.", "last_visit_date")?;
+    let frecency = sql_column_or_null(&conn, "moz_places", "p.", "frecency")?;
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.id, v.place_id, p.url, p.title, v.visit_date, v.visit_type,
-                p.visit_count, p.typed, p.last_visit_date, p.frecency
+                {visit_count}, {typed}, {last_visit_date}, {frecency}
          FROM moz_historyvisits v
          JOIN moz_places p ON p.id = v.place_id
          ORDER BY v.visit_date DESC, v.id DESC
          LIMIT ?1",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_visits)], |row| {
         Ok(FirefoxHistoryRow {
             visit_id: row.get(0)?,
@@ -4888,10 +7905,6 @@ fn firefox_history_visit_records(
         .collect()
 }
 
-fn read_firefox_url_records(places_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_firefox_url_records_inner(places_path, max_rows).unwrap_or_default()
-}
-
 fn read_firefox_url_records_inner(
     places_path: &Path,
     max_rows: usize,
@@ -4901,12 +7914,16 @@ fn read_firefox_url_records_inner(
         return Ok(Vec::new());
     }
     let source_metadata = source_artifact_metadata(places_path, "places.sqlite");
-    let mut stmt = conn.prepare(
-        "SELECT id, url, title, visit_count, typed, last_visit_date, frecency
+    let visit_count = sql_column_or_null(&conn, "moz_places", "", "visit_count")?;
+    let typed = sql_column_or_null(&conn, "moz_places", "", "typed")?;
+    let last_visit_date = sql_column_or_null(&conn, "moz_places", "", "last_visit_date")?;
+    let frecency = sql_column_or_null(&conn, "moz_places", "", "frecency")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, url, title, {visit_count}, {typed}, {last_visit_date}, {frecency}
          FROM moz_places
-         ORDER BY COALESCE(last_visit_date, 0) DESC, id DESC
+         ORDER BY COALESCE({last_visit_date}, 0) DESC, id DESC
          LIMIT ?1",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -4957,13 +7974,6 @@ fn read_firefox_url_records_inner(
         });
     }
     Ok(records)
-}
-
-fn read_firefox_bookmark_records(
-    places_path: &Path,
-    max_rows: usize,
-) -> Vec<BrowserActivityRecord> {
-    read_firefox_bookmark_records_inner(places_path, max_rows).unwrap_or_default()
 }
 
 fn read_firefox_bookmark_records_inner(
@@ -5056,13 +8066,6 @@ fn read_firefox_bookmark_records_inner(
     Ok(records)
 }
 
-fn read_firefox_search_records(
-    formhistory_path: &Path,
-    max_rows: usize,
-) -> Vec<BrowserActivityRecord> {
-    read_firefox_search_records_inner(formhistory_path, max_rows).unwrap_or_default()
-}
-
 fn read_firefox_search_records_inner(
     formhistory_path: &Path,
     max_rows: usize,
@@ -5075,13 +8078,16 @@ fn read_firefox_search_records_inner(
         return Ok(Vec::new());
     }
     let source_metadata = source_artifact_metadata(formhistory_path, "formhistory.sqlite");
-    let mut stmt = conn.prepare(
-        "SELECT id, fieldname, value, timesUsed, firstUsed, lastUsed
+    let times_used = sql_column_or_null(&conn, "moz_formhistory", "", "timesUsed")?;
+    let first_used = sql_column_or_null(&conn, "moz_formhistory", "", "firstUsed")?;
+    let last_used = sql_column_or_null(&conn, "moz_formhistory", "", "lastUsed")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, fieldname, value, {times_used}, {first_used}, {last_used}
          FROM moz_formhistory
          WHERE fieldname = 'searchbar-history'
-         ORDER BY COALESCE(lastUsed, 0) DESC, id DESC
+         ORDER BY COALESCE({last_used}, 0) DESC, id DESC
          LIMIT ?1",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -5125,13 +8131,6 @@ fn read_firefox_search_records_inner(
         });
     }
     Ok(records)
-}
-
-fn read_firefox_download_records(
-    places_path: &Path,
-    max_rows: usize,
-) -> Vec<BrowserActivityRecord> {
-    read_firefox_download_records_inner(places_path, max_rows).unwrap_or_default()
 }
 
 fn read_firefox_download_records_inner(
@@ -5209,8 +8208,134 @@ fn read_firefox_download_records_inner(
     Ok(records)
 }
 
-fn read_firefox_login_records(logins_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_firefox_login_records_inner(logins_path, max_rows).unwrap_or_default()
+fn read_firefox_downloads_sqlite_records_inner(
+    downloads_path: &Path,
+    max_rows: usize,
+) -> Result<Vec<BrowserActivityRecord>> {
+    let downloads_metadata = match fs::metadata(downloads_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading Firefox downloads database {}",
+                    downloads_path.display()
+                )
+            })
+        }
+    };
+    if !downloads_metadata.is_file() {
+        bail!(
+            "Firefox downloads database path is not a file: {}",
+            downloads_path.display()
+        );
+    }
+    let (conn, _guard) = open_sqlite_copy_read_only(downloads_path)?;
+    if !sqlite_table_exists(&conn, "moz_downloads")? {
+        return Ok(Vec::new());
+    }
+
+    let guid = sql_column_or_null(&conn, "moz_downloads", "", "guid")?;
+    let name = sql_column_or_null(&conn, "moz_downloads", "", "name")?;
+    let source = sql_column_or_null(&conn, "moz_downloads", "", "source")?;
+    let target = sql_column_or_null(&conn, "moz_downloads", "", "target")?;
+    let temp_path = sql_column_or_null(&conn, "moz_downloads", "", "tempPath")?;
+    let start_time = sql_column_or_null(&conn, "moz_downloads", "", "startTime")?;
+    let end_time = sql_column_or_null(&conn, "moz_downloads", "", "endTime")?;
+    let state = sql_column_or_null(&conn, "moz_downloads", "", "state")?;
+    let referrer = sql_column_or_null(&conn, "moz_downloads", "", "referrer")?;
+    let curr_bytes = sql_column_or_null(&conn, "moz_downloads", "", "currBytes")?;
+    let max_bytes = sql_column_or_null(&conn, "moz_downloads", "", "maxBytes")?;
+    let mime_type = sql_column_or_null(&conn, "moz_downloads", "", "mimeType")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, {guid}, {name}, {source}, {target}, {temp_path},
+                {start_time}, {end_time}, {state}, {referrer},
+                {curr_bytes}, {max_bytes}, {mime_type}
+         FROM moz_downloads
+         ORDER BY COALESCE({start_time}, 0) DESC, id DESC
+         LIMIT ?1",
+    ))?;
+    let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<i64>>(11)?,
+            row.get::<_, Option<String>>(12)?,
+        ))
+    })?;
+
+    let source_metadata = source_artifact_metadata(downloads_path, "downloads.sqlite");
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            id,
+            guid,
+            name,
+            source_url,
+            target_uri,
+            temp_path,
+            start_time,
+            end_time,
+            state,
+            referrer,
+            curr_bytes,
+            max_bytes,
+            mime_type,
+        ) = row?;
+        let file_name = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| target_uri.as_deref().and_then(file_name_from_pathish))
+            .unwrap_or_else(|| format!("download-{id}"));
+        let host = host_from_url(source_url.as_deref().unwrap_or(""));
+        let state_label = state.map(firefox_download_state_label);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_download",
+            "browser_family": "firefox",
+            "download_id": id,
+            "guid": guid,
+            "file_name": file_name,
+            "source_url": source_url,
+            "target_uri": target_uri,
+            "temp_path": temp_path,
+            "referrer": referrer,
+            "mime_type": mime_type,
+            "curr_bytes": curr_bytes,
+            "max_bytes": max_bytes,
+            "state": state,
+            "state_label": state_label,
+            "host": host,
+            "start_time_prtime": start_time,
+            "start_time_utc": start_time.and_then(unix_micros_to_rfc3339),
+            "end_time_prtime": end_time,
+            "end_time_utc": end_time.and_then(unix_micros_to_rfc3339),
+        });
+        merge_json_object(&mut metadata, &source_metadata);
+        let logical_path = format!(
+            "/Browser Activities/Downloads/downloads-sqlite-{}-{}.record",
+            id,
+            sanitize_logical_segment(&file_name)
+        );
+        let display_name = file_name.chars().take(180).collect::<String>();
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(BrowserActivityRecord {
+            logical_path,
+            display_name,
+            metadata_json: metadata.to_string(),
+        });
+    }
+    Ok(records)
 }
 
 fn read_firefox_login_records_inner(
@@ -5296,10 +8421,6 @@ fn read_firefox_login_records_inner(
     Ok(records)
 }
 
-fn read_firefox_cookie_records(cookies_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_firefox_cookie_records_inner(cookies_path, max_rows).unwrap_or_default()
-}
-
 fn read_firefox_cookie_records_inner(
     cookies_path: &Path,
     max_rows: usize,
@@ -5312,12 +8433,14 @@ fn read_firefox_cookie_records_inner(
         return Ok(Vec::new());
     }
     let source_metadata = source_artifact_metadata(cookies_path, "cookies.sqlite");
-    let mut stmt = conn.prepare(
-        "SELECT id, host, name, path, creationTime, lastAccessed, expiry, isSecure, isHttpOnly
+    let creation_time = sql_column_or_null(&conn, "moz_cookies", "", "creationTime")?;
+    let last_accessed = sql_column_or_null(&conn, "moz_cookies", "", "lastAccessed")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, host, name, path, {creation_time}, {last_accessed}, expiry, isSecure, isHttpOnly
          FROM moz_cookies
-         ORDER BY COALESCE(creationTime, 0) DESC, id DESC
+         ORDER BY COALESCE({creation_time}, 0) DESC, id DESC
          LIMIT ?1",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -5449,10 +8572,6 @@ fn safari_history_visit_records(
         .collect()
 }
 
-fn read_safari_url_records(history_path: &Path, max_rows: usize) -> Vec<BrowserActivityRecord> {
-    read_safari_url_records_inner(history_path, max_rows).unwrap_or_default()
-}
-
 fn read_safari_url_records_inner(
     history_path: &Path,
     max_rows: usize,
@@ -5542,6 +8661,22 @@ fn firefox_visit_type_label(visit_type: i64) -> &'static str {
     }
 }
 
+fn firefox_download_state_label(state: i64) -> String {
+    match state {
+        0 => "downloading".to_string(),
+        1 => "finished".to_string(),
+        2 => "failed".to_string(),
+        3 => "canceled".to_string(),
+        4 => "paused".to_string(),
+        5 => "queued".to_string(),
+        6 => "blocked-parental".to_string(),
+        7 => "scanning".to_string(),
+        8 => "dirty".to_string(),
+        9 => "blocked-policy".to_string(),
+        value => format!("unknown ({value})"),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EntryCategory {
     main: &'static str,
@@ -5551,6 +8686,18 @@ struct EntryCategory {
     tags: &'static [&'static str],
 }
 
+/// Version stamp written into every entry's `category_source`. Public so the
+/// UI can detect entries categorized by an older classifier and offer the
+/// DB-only category refresh only when it would actually change something.
+pub const ENTRY_CATEGORY_CLASSIFIER_VERSION: &str = "extension_path_rules_v2";
+const RECATEGORIZE_BATCH_SIZE: i64 = 1_000;
+const NON_ARTIFACT_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "ico", "bmp", "svg", "webp", "tif", "tiff", "dll", "exe", "sys",
+    "drv", "ocx", "cpl", "scr", "mui", "rll", "mun", "cat", "inf", "ini", "manifest", "xsd", "xsl",
+    "xslt", "cs", "c", "cpp", "h", "hpp", "rc", "resx", "vb", "ts", "js", "map", "ttf", "otf",
+    "woff", "woff2", "eot", "lib", "obj", "winmd",
+];
+
 fn categorized_metadata_json(
     mut metadata: serde_json::Value,
     logical_path: &str,
@@ -5559,6 +8706,98 @@ fn categorized_metadata_json(
 ) -> String {
     add_entry_category(&mut metadata, logical_path, name, entry_kind);
     metadata.to_string()
+}
+
+/// Re-runs the current path/type classifier over entries already stored in a
+/// case. This is intentionally database-only: it neither opens nor reads any
+/// attached evidence source.
+pub fn recategorize_case_entries(case_path: &Path) -> Result<usize> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let mut entries_updated = 0_usize;
+    let mut fat_timestamps_repaired = 0_usize;
+    let mut next_entry_id: Option<i64> = tx.query_row(
+        "SELECT MIN(id) FROM filesystem_entries WHERE case_id = ?1",
+        params![case_id],
+        |row| row.get(0),
+    )?;
+
+    while let Some(first_entry_id) = next_entry_id {
+        let entries = {
+            let mut stmt = tx.prepare(
+                "SELECT id, logical_path, name, entry_kind, metadata_json
+                 FROM filesystem_entries
+                 WHERE case_id = ?1
+                   AND id >= ?2
+                 ORDER BY id
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![case_id, first_entry_id, RECATEGORIZE_BATCH_SIZE],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if entries.is_empty() {
+            break;
+        }
+        let last_entry_id = entries
+            .last()
+            .map(|entry| entry.0)
+            .context("re-categorization batch unexpectedly has no last entry")?;
+
+        let mut update = tx.prepare(
+            "UPDATE filesystem_entries
+             SET metadata_json = ?1
+             WHERE case_id = ?2 AND id = ?3",
+        )?;
+        for (entry_id, logical_path, name, entry_kind, metadata_json) in entries {
+            let mut metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+                .with_context(|| {
+                    format!("parsing metadata_json for filesystem entry {entry_id}")
+                })?;
+            // Piggyback on this DB-only rewrite pass to repair legacy
+            // Debug-formatted fat_* timestamps that predate the ISO fix.
+            if repair_legacy_fat_timestamps(&mut metadata) {
+                fat_timestamps_repaired += 1;
+            }
+            add_entry_category(&mut metadata, &logical_path, &name, &entry_kind);
+            let changed = update.execute(params![metadata.to_string(), case_id, entry_id])?;
+            if changed != 1 {
+                bail!("filesystem entry disappeared while re-categorizing: {entry_id}");
+            }
+            entries_updated = entries_updated
+                .checked_add(1)
+                .context("re-categorized entry count exceeds usize")?;
+        }
+        next_entry_id = last_entry_id.checked_add(1);
+    }
+
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'recategorize.run', ?2, 'case', ?1,
+                 json_object('entries_updated', ?3, 'classifier_version', ?4,
+                             'fat_timestamps_repaired', ?5))",
+        params![
+            case_id,
+            actor,
+            i64::try_from(entries_updated).unwrap_or(i64::MAX),
+            ENTRY_CATEGORY_CLASSIFIER_VERSION,
+            i64::try_from(fat_timestamps_repaired).unwrap_or(i64::MAX),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(entries_updated)
 }
 
 fn add_entry_category(
@@ -5591,7 +8830,7 @@ fn add_entry_category(
         );
         object.insert(
             "category_source".to_string(),
-            serde_json::Value::String("extension_path_rules_v1".to_string()),
+            serde_json::Value::String(ENTRY_CATEGORY_CLASSIFIER_VERSION.to_string()),
         );
         object.insert(
             "category_tags".to_string(),
@@ -5607,6 +8846,12 @@ fn add_entry_category(
 }
 
 fn should_index_content_head(metadata: &serde_json::Value, entry_kind: &str) -> bool {
+    // Examiner opted for a metadata-only index: no per-file content reads at
+    // all. This is the single choke point for every parser's content_head
+    // capture (local, FAT, NTFS).
+    if !processing_profile().capture_content {
+        return false;
+    }
     if entry_kind != "file" {
         return false;
     }
@@ -5743,6 +8988,15 @@ fn classify_entry(
                 &["browser", "cookie", "session", "token"],
             );
         }
+        "browser_cache_store" | "browser_cache_entry" => {
+            return category(
+                "Web Activity",
+                "Cache",
+                "Chromium HTTP disk cache entry",
+                "high",
+                &["browser", "cache", "web"],
+            );
+        }
         "browser_preference" => {
             return category(
                 "Accounts and Identity",
@@ -5756,18 +9010,45 @@ fn classify_entry(
             return category(
                 "Email and Communications",
                 "Email messages",
-                "Parsed RFC 822 email message",
+                "Parsed email message",
                 "high",
                 &["email", "communications", "message"],
+            );
+        }
+        "pst_folder" => {
+            return category(
+                "Email and Communications",
+                "Mailbox folders",
+                "Parsed PST/OST mailbox folder",
+                "high",
+                &["email", "mailbox", "folder"],
             );
         }
         "email_store" => {
             return category(
                 "Email and Communications",
                 "Email stores",
-                "Mailbox store requiring a dedicated mailbox parser",
+                "Mailbox store or mailbox parser status record",
                 "medium",
                 &["email", "mailbox", "store"],
+            );
+        }
+        "registry_hive" | "registry_key" | "registry_value" => {
+            return category(
+                "Operating System",
+                "Registry hives",
+                "Windows Registry hive key/value record",
+                "medium",
+                &["windows", "registry", "hive"],
+            );
+        }
+        "evtx_log" | "evtx_event_record" => {
+            return category(
+                "Operating System",
+                "Event logs",
+                "Windows EVTX event log record",
+                "high",
+                &["windows", "event-log", "timeline"],
             );
         }
         "deleted_file_record" => {
@@ -5823,8 +9104,27 @@ fn classify_entry(
         _ => {}
     }
 
-    let combined = format!("{logical_path}/{name}").to_ascii_lowercase();
-    let ext = extension_lower(name).or_else(|| extension_lower(logical_path));
+    let normalized_path = normalize_category_path(logical_path);
+    let filename = entry_filename_lower(logical_path, name);
+    let combined = normalized_entry_full_path(&normalized_path, &filename);
+    let ext = extension_lower(&filename).or_else(|| extension_lower(&normalized_path));
+
+    if let Some(category) =
+        precise_forensic_artifact_category(&combined, &filename, ext.as_deref(), entry_kind)
+    {
+        return category;
+    }
+
+    if is_system_root_path(&normalized_path) {
+        return category(
+            "Operating System",
+            "System files",
+            "File or directory under an operating-system root",
+            "low",
+            &["os", "system-file", "informational"],
+        );
+    }
+
     let filesystem_parser = metadata
         .get("filesystem_parser")
         .and_then(|value| value.as_str())
@@ -5909,105 +9209,118 @@ fn classify_entry(
         );
     }
 
-    if contains_any(
-        &combined,
-        &[
-            "/windows/prefetch",
-            ".pf",
-            "prefetch",
-            "amcache.hve",
-            "srum",
-            "shimcache",
-            "userassist",
-        ],
-    ) {
+    let keyword_heuristics_allowed = !ext_in(ext.as_deref(), NON_ARTIFACT_EXTS);
+
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &[
+                "/windows/prefetch",
+                ".pf",
+                "prefetch",
+                "amcache.hve",
+                "srum",
+                "shimcache",
+                "userassist",
+            ],
+        )
+    {
         return category(
             "Program Execution",
             "Execution artifacts",
             "Prefetch, Amcache, SRUM, Shimcache, or UserAssist artifact",
-            "high",
+            "medium",
             &["execution", "windows", "forensic-artifact"],
         );
     }
-    if contains_any(
-        &combined,
-        &[
-            "automaticdestinations-ms",
-            "customdestinations-ms",
-            ".lnk",
-            "recent/",
-            "recent\\",
-            "jumplist",
-        ],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &[
+                "automaticdestinations-ms",
+                "customdestinations-ms",
+                ".lnk",
+                "recent/",
+                "recent\\",
+                "jumplist",
+            ],
+        )
+    {
         return category(
             "Program Execution",
             "Shortcuts and jump lists",
             "Recent item shortcut or Windows jump list",
-            "high",
+            "medium",
             &["execution", "recent-files", "shortcuts"],
         );
     }
-    if contains_any(
-        &combined,
-        &[
-            "scheduled tasks",
-            "/tasks/",
-            "startup",
-            "launchagents",
-            "launchdaemons",
-            "runonce",
-        ],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &[
+                "scheduled tasks",
+                "/tasks/",
+                "startup",
+                "launchagents",
+                "launchdaemons",
+                "runonce",
+            ],
+        )
+    {
         return category(
             "Program Execution",
             "Startup and scheduled tasks",
             "Startup, launch, or scheduled task artifact",
-            "high",
+            "medium",
             &["execution", "persistence", "startup"],
         );
     }
-    if contains_any(
-        &combined,
-        &[
-            "login data",
-            "password",
-            "credentials",
-            "credential",
-            "keychain",
-            "key4.db",
-            "logins.json",
-            "wallet",
-            "vault",
-            "secret",
-            "token",
-            "oauth",
-        ],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &[
+                "login data",
+                "password",
+                "credentials",
+                "credential",
+                "keychain",
+                "key4.db",
+                "logins.json",
+                "wallet",
+                "vault",
+                "secret",
+                "token",
+                "oauth",
+            ],
+        )
+    {
         return category(
             "Accounts and Identity",
             "Credentials and tokens",
             "Password, token, keychain, wallet, or credential store",
-            "high",
+            "medium",
             &["accounts", "credentials", "secrets"],
         );
     }
-    if contains_any(&combined, &["session storage"])
-        || (has_browser_context(&combined)
-            && contains_any(&combined, &["cookies", "cookie", "sessions"]))
+    if keyword_heuristics_allowed
+        && (contains_any(&combined, &["session storage"])
+            || (has_browser_context(&combined)
+                && contains_any(&combined, &["cookies", "cookie", "sessions"])))
     {
         return category(
             "Accounts and Identity",
             "Cookies and sessions",
             "Cookie, browser session, or web authentication artifact",
-            "high",
+            "medium",
             &["accounts", "cookies", "sessions"],
         );
     }
-    if contains_any(
-        &combined,
-        &["onedrive", "dropbox", "google drive", "icloud", "/box/"],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &["onedrive", "dropbox", "google drive", "icloud", "/box/"],
+        )
+    {
         return category(
             "Cloud and Web",
             "Cloud sync",
@@ -6019,17 +9332,18 @@ fn classify_entry(
     // Unambiguous browser database names match on their own; generic words
     // (history/cache/bookmarks/downloads) need browser context or they hit OS
     // paths like system32/dllcache.
-    if contains_any(
-        &combined,
-        &[
-            "places.sqlite",
-            "webcachev01.dat",
-            "favicons",
-            "top sites",
-            "visited links",
-        ],
-    ) || (has_browser_context(&combined)
-        && contains_any(&combined, &["history", "cache", "bookmarks", "downloads"]))
+    if keyword_heuristics_allowed
+        && (contains_any(
+            &combined,
+            &[
+                "places.sqlite",
+                "webcachev01.dat",
+                "favicons",
+                "top sites",
+                "visited links",
+            ],
+        ) || (has_browser_context(&combined)
+            && contains_any(&combined, &["history", "cache", "bookmarks", "downloads"])))
     {
         return category(
             "Cloud and Web",
@@ -6039,66 +9353,63 @@ fn classify_entry(
             &["browser", "web"],
         );
     }
-    if contains_any(
-        &combined,
-        &[
-            "/windows/system32/config/sam",
-            "/windows/system32/config/security",
-            "/windows/system32/config/software",
-            "/windows/system32/config/system",
-            "/ntuser.dat",
-            "/usrclass.dat",
-        ],
-    ) {
+    if keyword_heuristics_allowed && is_registry_hive_candidate(logical_path, name) {
         return category(
             "Operating System",
             "Registry hives",
             "Windows registry hive",
-            "high",
+            "medium",
             &["windows", "registry", "accounts"],
         );
     }
-    if contains_any(&combined, &[".evtx", ".etl", "event logs", "winevt/logs"]) {
+    if keyword_heuristics_allowed
+        && contains_any(&combined, &[".evtx", ".etl", "event logs", "winevt/logs"])
+    {
         return category(
             "Operating System",
             "Event logs",
             "Windows event log or trace log",
-            "high",
+            "medium",
             &["windows", "logs", "timeline"],
         );
     }
-    if contains_any(&combined, &["recycle.bin", "/trash", "/.trash"]) {
+    if keyword_heuristics_allowed && contains_any(&combined, &["recycle.bin", "/trash", "/.trash"])
+    {
         return category(
             "Operating System",
             "Recycle and trash",
             "Deleted-item container",
-            "high",
+            "medium",
             &["deleted", "trash"],
         );
     }
-    if contains_any(
-        &combined,
-        &["consolidated.db", "geolocation", "locationd", "/maps/"],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &["consolidated.db", "geolocation", "locationd", "/maps/"],
+        )
+    {
         return category(
             "Location and Maps",
             "Geolocation data",
             "Location, maps, or geolocation artifact",
-            "high",
+            "medium",
             &["location", "maps"],
         );
     }
-    if contains_any(
-        &combined,
-        &[
-            "mobilebackup",
-            "manifest.db",
-            "android",
-            "iphone",
-            "itunes backup",
-            "mobile sync",
-        ],
-    ) {
+    if keyword_heuristics_allowed
+        && contains_any(
+            &combined,
+            &[
+                "mobilebackup",
+                "manifest.db",
+                "android",
+                "iphone",
+                "itunes backup",
+                "mobile sync",
+            ],
+        )
+    {
         return category(
             "Mobile Devices",
             "Mobile backups and app data",
@@ -6118,7 +9429,7 @@ fn classify_entry(
             "Pictures and Media",
             "Pictures",
             "Image or photo file",
-            "high",
+            "medium",
             &["pictures", "media"],
         );
     }
@@ -6130,7 +9441,7 @@ fn classify_entry(
             "Pictures and Media",
             "Camera raw pictures",
             "Camera raw image file",
-            "high",
+            "medium",
             &["pictures", "camera", "raw"],
         );
     }
@@ -6139,7 +9450,7 @@ fn classify_entry(
             "Pictures and Media",
             "Graphics and design",
             "Design, vector, or layered graphics file",
-            "high",
+            "medium",
             &["graphics", "design"],
         );
     }
@@ -6153,7 +9464,7 @@ fn classify_entry(
             "Pictures and Media",
             "Video",
             "Video file",
-            "high",
+            "medium",
             &["video", "media"],
         );
     }
@@ -6165,7 +9476,7 @@ fn classify_entry(
             "Pictures and Media",
             "Audio",
             "Audio recording or music file",
-            "high",
+            "medium",
             &["audio", "media"],
         );
     }
@@ -6179,7 +9490,7 @@ fn classify_entry(
             "Email and Communications",
             "Email stores and messages",
             "Email message or mailbox store",
-            "high",
+            "medium",
             &["email", "communications"],
         );
     }
@@ -6188,7 +9499,7 @@ fn classify_entry(
             "Email and Communications",
             "Contacts and calendars",
             "Contact card or calendar file",
-            "high",
+            "medium",
             &["contacts", "calendar"],
         );
     }
@@ -6197,7 +9508,7 @@ fn classify_entry(
             "Documents and Office",
             "PDF",
             "PDF document",
-            "high",
+            "medium",
             &["documents", "pdf"],
         );
     }
@@ -6209,7 +9520,7 @@ fn classify_entry(
             "Documents and Office",
             "Word processing",
             "Word processing document",
-            "high",
+            "medium",
             &["documents", "office"],
         );
     }
@@ -6221,7 +9532,7 @@ fn classify_entry(
             "Documents and Office",
             "Spreadsheets",
             "Spreadsheet or tabular data file",
-            "high",
+            "medium",
             &["documents", "spreadsheet"],
         );
     }
@@ -6230,7 +9541,7 @@ fn classify_entry(
             "Documents and Office",
             "Presentations",
             "Presentation file",
-            "high",
+            "medium",
             &["documents", "presentation"],
         );
     }
@@ -6251,7 +9562,7 @@ fn classify_entry(
             "Archives and Containers",
             "Archives",
             "Compressed archive",
-            "high",
+            "medium",
             &["archive", "container"],
         );
     }
@@ -6272,7 +9583,7 @@ fn classify_entry(
             "Archives and Containers",
             "Disk and VM images",
             "Forensic, disk, virtual machine, or optical image",
-            "high",
+            "medium",
             &["disk-image", "virtualization"],
         );
     }
@@ -6286,7 +9597,7 @@ fn classify_entry(
             "Security and Encryption",
             "Encrypted data and keys",
             "Encrypted container, key, or certificate",
-            "high",
+            "medium",
             &["security", "encryption", "keys"],
         );
     }
@@ -6295,7 +9606,7 @@ fn classify_entry(
             "Program Execution",
             "Executables and binaries",
             "Executable, library, driver, or binary",
-            "high",
+            "medium",
             &["execution", "binary"],
         );
     }
@@ -6307,7 +9618,7 @@ fn classify_entry(
             "Program Execution",
             "Installers and packages",
             "Installer or application package",
-            "high",
+            "medium",
             &["execution", "installer"],
         );
     }
@@ -6321,7 +9632,7 @@ fn classify_entry(
             "Program Execution",
             "Scripts",
             "Script or scriptable executable content",
-            "high",
+            "medium",
             &["execution", "script"],
         );
     }
@@ -6376,6 +9687,222 @@ fn classify_entry(
     )
 }
 
+fn precise_forensic_artifact_category(
+    normalized_full_path: &str,
+    filename: &str,
+    ext: Option<&str>,
+    entry_kind: &str,
+) -> Option<EntryCategory> {
+    if entry_kind != "file" {
+        return None;
+    }
+
+    let standard_registry_hive = matches!(
+        filename,
+        "sam" | "system" | "security" | "software" | "default"
+    ) && normalized_full_path.contains("/windows/system32/config/");
+    let profile_registry_hive = matches!(filename, "ntuser.dat" | "usrclass.dat")
+        && is_user_profile_path(normalized_full_path);
+    if standard_registry_hive || profile_registry_hive {
+        return Some(category(
+            "Operating System",
+            "Registry hives",
+            "Windows registry hive",
+            "high",
+            &["windows", "registry", "accounts"],
+        ));
+    }
+
+    if ext == Some("evtx") && normalized_full_path.contains("/windows/system32/winevt/logs/") {
+        return Some(category(
+            "Operating System",
+            "Event logs",
+            "Windows EVTX event log",
+            "high",
+            &["windows", "logs", "timeline"],
+        ));
+    }
+
+    if ext == Some("pf") && normalized_full_path.contains("/windows/prefetch/") {
+        return Some(category(
+            "Program Execution",
+            "Execution artifacts",
+            "Windows Prefetch artifact",
+            "high",
+            &["execution", "windows", "forensic-artifact"],
+        ));
+    }
+
+    if !is_user_or_browser_profile_path(normalized_full_path) {
+        return None;
+    }
+
+    let credential_store = matches!(
+        filename,
+        "login data"
+            | "key4.db"
+            | "key3.db"
+            | "logins.json"
+            | "signons.sqlite"
+            | "cert9.db"
+            | "wallet.dat"
+    ) || ext == Some("kdbx")
+        || filename.contains(".keychain")
+        || (filename == "credentials"
+            && ext.is_none()
+            && contains_any(normalized_full_path, &["/.aws/", "/.azure/", "/.ssh/"]));
+    if credential_store {
+        return Some(category(
+            "Accounts and Identity",
+            "Credentials and tokens",
+            "Known credential, keychain, wallet, or secret store",
+            "high",
+            &["accounts", "credentials", "secrets"],
+        ));
+    }
+
+    if filename == "cookies.sqlite"
+        || (filename == "cookies" && normalized_full_path.ends_with("/network/cookies"))
+    {
+        return Some(category(
+            "Accounts and Identity",
+            "Cookies and sessions",
+            "Known browser cookie store",
+            "high",
+            &["accounts", "cookies", "sessions"],
+        ));
+    }
+
+    None
+}
+
+fn normalize_category_path(value: &str) -> String {
+    let replaced = value.replace('\\', "/").to_ascii_lowercase();
+    let mut normalized = String::with_capacity(replaced.len().saturating_add(1));
+    if !replaced.starts_with('/') {
+        normalized.push('/');
+    }
+    let mut previous_was_separator = false;
+    for character in replaced.chars() {
+        if character == '/' {
+            if previous_was_separator {
+                continue;
+            }
+            previous_was_separator = true;
+        } else {
+            previous_was_separator = false;
+        }
+        normalized.push(character);
+    }
+    if normalized.len() > 1 {
+        normalized.truncate(normalized.trim_end_matches('/').len());
+    }
+    normalized
+}
+
+fn entry_filename_lower(logical_path: &str, name: &str) -> String {
+    let candidate = if name.is_empty() { logical_path } else { name };
+    candidate
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(candidate)
+        .to_ascii_lowercase()
+}
+
+fn normalized_entry_full_path(normalized_path: &str, filename: &str) -> String {
+    if filename.is_empty()
+        || normalized_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|path_filename| path_filename == filename)
+    {
+        return normalized_path.to_string();
+    }
+    if normalized_path == "/" {
+        format!("/{filename}")
+    } else {
+        format!("{normalized_path}/{filename}")
+    }
+}
+
+fn is_user_or_browser_profile_path(normalized_path: &str) -> bool {
+    if is_user_profile_path(normalized_path) {
+        return true;
+    }
+    if is_system_root_path(normalized_path) {
+        return false;
+    }
+    let bounded = format!("{}/", normalized_path.trim_end_matches('/'));
+    has_browser_context(normalized_path)
+        && contains_any(
+            &bounded,
+            &[
+                "/user data/",
+                "/profiles/",
+                "/appdata/",
+                "/library/application support/",
+                "/.config/",
+            ],
+        )
+}
+
+fn is_user_profile_path(normalized_path: &str) -> bool {
+    let bounded = format!("{}/", normalized_path.trim_end_matches('/'));
+    contains_any(
+        &bounded,
+        &["/users/", "/documents and settings/", "/home/", "/root/"],
+    )
+}
+
+fn is_system_root_path(normalized_path: &str) -> bool {
+    const SYSTEM_ROOTS: &[&str] = &[
+        "/windows/",
+        "/program files/",
+        "/program files (x86)/",
+        "/programdata/microsoft/",
+        "/$winreagent/",
+        "/system volume information/",
+        "/recovery/",
+        "/boot/",
+        "/efi/",
+        "/perflogs/",
+        "/windows.old/",
+        "/msocache/",
+        "/$windows.~bt/",
+        "/$windows.~ws/",
+        "/drivers/",
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/opt/",
+        "/proc/",
+        "/sys/",
+        "/run/",
+        "/var/lib/",
+    ];
+    const EVIDENCE_ROOTS: &[&str] = &["/etc/", "/home/", "/root/", "/var/log/", "/tmp/"];
+
+    let bounded = format!("{}/", normalized_path.trim_end_matches('/'));
+    if contains_any(&bounded, &["/users/", "/documents and settings/"]) {
+        return false;
+    }
+    let first_system_root = SYSTEM_ROOTS
+        .iter()
+        .filter_map(|root| bounded.find(root))
+        .min();
+    let first_evidence_root = EVIDENCE_ROOTS
+        .iter()
+        .filter_map(|root| bounded.find(root))
+        .min();
+    match (first_system_root, first_evidence_root) {
+        (Some(system), Some(evidence)) => system < evidence,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn category(
     main: &'static str,
     sub: &'static str,
@@ -6398,6 +9925,53 @@ fn extension_lower(value: &str) -> Option<String> {
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .filter(|value| !value.is_empty())
+}
+
+fn is_registry_hive_candidate(logical_path: &str, name: &str) -> bool {
+    registry_hive_candidate(logical_path, name, false)
+}
+
+fn is_registry_hive_evidence_candidate(path: &Path, display_name: &str) -> bool {
+    registry_hive_candidate(path.to_string_lossy().as_ref(), display_name, true)
+}
+
+fn registry_hive_candidate(
+    logical_path: &str,
+    name: &str,
+    allow_bare_standard_names: bool,
+) -> bool {
+    let combined = format!("{logical_path}/{name}")
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let ext = extension_lower(name).or_else(|| extension_lower(logical_path));
+    if ext.as_deref() == Some("hiv") {
+        return true;
+    }
+    if contains_any(
+        &combined,
+        &[
+            "/windows/system32/config/sam",
+            "/windows/system32/config/security",
+            "/windows/system32/config/software",
+            "/windows/system32/config/system",
+            "/ntuser.dat",
+            "/usrclass.dat",
+        ],
+    ) {
+        return true;
+    }
+    if !allow_bare_standard_names {
+        return false;
+    }
+    let filename = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    matches!(
+        filename.as_str(),
+        "ntuser.dat" | "usrclass.dat" | "sam" | "security" | "software" | "system"
+    )
 }
 
 fn ext_in(ext: Option<&str>, values: &[&str]) -> bool {
@@ -6445,7 +10019,12 @@ fn annotate_email_metadata_for_path(
     let Some(ext) = extension_lower(name).or_else(|| extension_lower(logical_path)) else {
         return;
     };
+    let parse_emails = processing_profile().parse_emails;
     if ext == "eml" {
+        if !parse_emails {
+            mark_email_parse_skipped(metadata, "eml", EMAIL_PARSE_DISABLED_NOTE);
+            return;
+        }
         if size_bytes > EMAIL_PARSE_MAX_BYTES {
             mark_email_parse_skipped(metadata, "eml", "message exceeds bounded email parse limit");
             return;
@@ -6459,7 +10038,7 @@ fn annotate_email_metadata_for_path(
             ),
         }
     } else if is_text_rfc822_email_candidate(&ext, logical_path, name) {
-        if size_bytes <= EMAIL_PARSE_MAX_BYTES {
+        if parse_emails && size_bytes <= EMAIL_PARSE_MAX_BYTES {
             if let Ok(bytes) = fs::read(path) {
                 try_apply_email_metadata_from_bytes(metadata, "text-rfc822", &bytes);
             }
@@ -6468,6 +10047,12 @@ fn annotate_email_metadata_for_path(
         mark_email_store(metadata, &ext);
     }
 }
+
+/// Recorded on .eml entries when the examiner ran processing with email
+/// parsing off, so the absence of parsed email metadata is disclosed rather
+/// than ambiguous.
+const EMAIL_PARSE_DISABLED_NOTE: &str =
+    "email parsing was disabled for this processing run; re-process with email parsing enabled";
 
 fn annotate_email_metadata_from_bytes(
     metadata: &mut serde_json::Value,
@@ -6594,6 +10179,2088 @@ fn is_text_rfc822_email_candidate(ext: &str, logical_path: &str, name: &str) -> 
         || combined.contains("/emails/")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryHiveHeaderKind {
+    Regf,
+    Unsupported,
+}
+
+#[derive(Debug)]
+struct RegistryHiveHeaderStatus {
+    kind: RegistryHiveHeaderKind,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct RegistryImportEntry {
+    logical_path: String,
+    display_name: String,
+    entry_kind: &'static str,
+    size_bytes: Option<i64>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct RegistryImportData {
+    entries: Vec<RegistryImportEntry>,
+    keys_indexed: usize,
+    values_indexed: usize,
+    total_entries_seen: usize,
+    truncated: bool,
+    root_logical_path: String,
+}
+
+fn detect_registry_hive_header(path: &Path) -> Result<RegistryHiveHeaderStatus> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening registry hive {}", path.display()))?;
+    let mut header = [0_u8; 4];
+    let read = file
+        .read(&mut header)
+        .with_context(|| format!("reading registry hive header {}", path.display()))?;
+    if read < header.len() {
+        return Ok(RegistryHiveHeaderStatus {
+            kind: RegistryHiveHeaderKind::Unsupported,
+            reason: Some("registry hive header is shorter than 4 bytes".to_string()),
+        });
+    }
+    if &header != b"regf" {
+        return Ok(RegistryHiveHeaderStatus {
+            kind: RegistryHiveHeaderKind::Unsupported,
+            reason: Some(
+                "Windows registry hive signature regf was not found at offset 0".to_string(),
+            ),
+        });
+    }
+    Ok(RegistryHiveHeaderStatus {
+        kind: RegistryHiveHeaderKind::Regf,
+        reason: None,
+    })
+}
+
+fn process_registry_hive_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    max_entries: usize,
+) -> Result<(usize, bool)> {
+    let path = PathBuf::from(&evidence.source_path);
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("reading registry hive evidence metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "registry hive evidence path is no longer a file: {}",
+            path.display()
+        );
+    }
+    let header = detect_registry_hive_header(&path)?;
+    if header.kind != RegistryHiveHeaderKind::Regf {
+        let reason = header
+            .reason
+            .unwrap_or_else(|| "unsupported registry hive variant".to_string());
+        return persist_unsupported_registry_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            &reason,
+        );
+    }
+
+    match collect_registry_hive_import(&path, &evidence.display_name, max_entries) {
+        Ok(import_data) => {
+            persist_registry_hive_import(conn, case_id, evidence, job_id, import_data)
+        }
+        Err(err) => persist_unsupported_registry_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            &format!("registry hive was detected, but the parser could not read it: {err}"),
+        ),
+    }
+}
+
+fn persist_unsupported_registry_status(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    size_bytes: u64,
+    reason: &str,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let logical_path = registry_root_logical_path(&evidence.display_name);
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "registry_hive",
+        "registry_parser": REGISTRY_PARSER_NAME,
+        "registry_parser_status": "unsupported",
+        "registry_parser_error": reason,
+        "registry_parser_scope": registry_parser_scope_text(),
+        "registry_deleted_recovery": "not attempted",
+        "registry_transaction_log_replay": "not attempted",
+        "source_artifact_path": evidence.source_path,
+    });
+    add_entry_category(&mut metadata, &logical_path, &evidence.display_name, "file");
+    upsert_filesystem_entry(
+        conn,
+        case_id,
+        evidence.id,
+        &logical_path,
+        &evidence.display_name,
+        "file",
+        Some(i64::try_from(size_bytes).context("registry hive size exceeds i64")?),
+        &metadata.to_string(),
+        job_id,
+    )?;
+    Ok((1, false))
+}
+
+fn persist_registry_hive_import(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    mut import_data: RegistryImportData,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    if let Some(root) = import_data
+        .entries
+        .iter_mut()
+        .find(|entry| entry.logical_path == import_data.root_logical_path)
+    {
+        if let Some(object) = root.metadata.as_object_mut() {
+            object.insert(
+                "registry_keys_indexed".to_string(),
+                serde_json::json!(import_data.keys_indexed),
+            );
+            object.insert(
+                "registry_values_indexed".to_string(),
+                serde_json::json!(import_data.values_indexed),
+            );
+            object.insert(
+                "registry_entries_seen".to_string(),
+                serde_json::json!(import_data.total_entries_seen),
+            );
+        }
+    }
+    let entries_indexed = import_data.entries.len();
+    for entry in import_data.entries {
+        upsert_filesystem_entry(
+            conn,
+            case_id,
+            evidence.id,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+            entry.size_bytes,
+            &entry.metadata.to_string(),
+            job_id,
+        )?;
+    }
+    Ok((entries_indexed, import_data.truncated))
+}
+
+fn collect_registry_hive_import(
+    path: &Path,
+    display_name: &str,
+    max_entries: usize,
+) -> Result<RegistryImportData> {
+    let root_logical_path = registry_root_logical_path(display_name);
+    let mut collector = RegistryImportCollector {
+        entries: Vec::new(),
+        keys_indexed: 0,
+        values_indexed: 0,
+        total_entries_seen: 0,
+        truncated: false,
+        max_entries,
+        root_logical_path: root_logical_path.clone(),
+        source_path: path.to_string_lossy().into_owned(),
+        hive_display_name: display_name.to_string(),
+        used_paths: HashSet::new(),
+    };
+    collector.push_hive_root()?;
+    if !collector.truncated {
+        let mut builder = RegistryParserBuilder::from_path(path.to_path_buf());
+        builder.recover_deleted(false);
+        let parser = builder
+            .build()
+            .with_context(|| format!("opening registry hive {}", path.display()))?;
+        let mut iter = RegistryParserIterator::new(&parser);
+        for key in iter.iter() {
+            if collector.truncated {
+                break;
+            }
+            let key_logical_path = collector.push_key(&key)?;
+            for value in key.value_iter() {
+                if collector.truncated {
+                    break;
+                }
+                collector.push_value(&key, &key_logical_path, value)?;
+            }
+        }
+    }
+    Ok(RegistryImportData {
+        entries: collector.entries,
+        keys_indexed: collector.keys_indexed,
+        values_indexed: collector.values_indexed,
+        total_entries_seen: collector.total_entries_seen,
+        truncated: collector.truncated,
+        root_logical_path,
+    })
+}
+
+struct RegistryImportCollector {
+    entries: Vec<RegistryImportEntry>,
+    keys_indexed: usize,
+    values_indexed: usize,
+    total_entries_seen: usize,
+    truncated: bool,
+    max_entries: usize,
+    root_logical_path: String,
+    source_path: String,
+    hive_display_name: String,
+    used_paths: HashSet<String>,
+}
+
+impl RegistryImportCollector {
+    fn should_stop_before_push(&mut self) -> bool {
+        self.total_entries_seen = self.total_entries_seen.saturating_add(1);
+        if self.entries.len() >= self.max_entries {
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_hive_root(&mut self) -> Result<()> {
+        if self.should_stop_before_push() {
+            return Ok(());
+        }
+        self.used_paths.insert(self.root_logical_path.clone());
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "registry_hive",
+            "registry_parser": REGISTRY_PARSER_NAME,
+            "registry_parser_status": "parsed",
+            "registry_parser_scope": registry_parser_scope_text(),
+            "registry_deleted_recovery": "not attempted",
+            "registry_transaction_log_replay": "not attempted",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        add_entry_category(
+            &mut metadata,
+            &self.root_logical_path,
+            &self.hive_display_name,
+            "directory",
+        );
+        self.entries.push(RegistryImportEntry {
+            logical_path: self.root_logical_path.clone(),
+            display_name: self.hive_display_name.clone(),
+            entry_kind: "directory",
+            size_bytes: None,
+            metadata,
+        });
+        Ok(())
+    }
+
+    fn push_key(&mut self, key: &notatin::cell_key_node::CellKeyNode) -> Result<String> {
+        if self.should_stop_before_push() {
+            return Ok(self.root_logical_path.clone());
+        }
+        let key_path = registry_key_display_path(&key.path);
+        let logical_path = registry_key_logical_path(
+            &self.root_logical_path,
+            &key_path,
+            key.file_offset_absolute,
+            &mut self.used_paths,
+        );
+        let last_write = key.last_key_written_date_and_time().to_rfc3339();
+        let display_name = key
+            .key_name
+            .trim()
+            .is_empty()
+            .then(|| {
+                registry_last_path_segment(&key_path)
+                    .unwrap_or("Registry key")
+                    .to_string()
+            })
+            .unwrap_or_else(|| key.key_name.clone());
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "registry_key",
+            "registry_parser": REGISTRY_PARSER_NAME,
+            "registry_parser_status": "parsed",
+            "registry_hive": self.hive_display_name.as_str(),
+            "registry_key_path": key_path,
+            "registry_key_name": display_name,
+            "registry_key_last_write_utc": last_write,
+            "modified_utc": last_write,
+            "registry_key_offset": key.file_offset_absolute,
+            "registry_deleted_recovery": "not attempted",
+            "registry_transaction_log_replay": "not attempted",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        add_entry_category(&mut metadata, &logical_path, &display_name, "directory");
+        self.entries.push(RegistryImportEntry {
+            logical_path: logical_path.clone(),
+            display_name,
+            entry_kind: "directory",
+            size_bytes: None,
+            metadata,
+        });
+        self.keys_indexed += 1;
+        Ok(logical_path)
+    }
+
+    fn push_value(
+        &mut self,
+        key: &notatin::cell_key_node::CellKeyNode,
+        key_logical_path: &str,
+        value: notatin::cell_key_value::CellKeyValue,
+    ) -> Result<()> {
+        if self.should_stop_before_push() {
+            return Ok(());
+        }
+        let key_path = registry_key_display_path(&key.path);
+        let value_name = value.get_pretty_name();
+        let logical_path = registry_value_logical_path(
+            key_logical_path,
+            &value_name,
+            value.file_offset_absolute,
+            &mut self.used_paths,
+        );
+        let value_type = registry_value_type_label(value.data_type);
+        let value_bytes = value.detail.value_bytes();
+        let value_size = value_bytes.as_ref().map(|bytes| bytes.len());
+        let (content, warnings) = value.get_content();
+        let rendered = registry_render_value(value.data_type, &content);
+        let last_write = key.last_key_written_date_and_time().to_rfc3339();
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "registry_value",
+            "registry_parser": REGISTRY_PARSER_NAME,
+            "registry_parser_status": "parsed",
+            "registry_hive": self.hive_display_name.as_str(),
+            "registry_key_path": key_path,
+            "registry_key_last_write_utc": last_write,
+            "modified_utc": last_write,
+            "registry_value_name": value_name,
+            "registry_value_type": value_type,
+            "registry_value_data": rendered.text,
+            "registry_value_data_truncated": rendered.truncated,
+            "registry_value_offset": value.file_offset_absolute,
+            "registry_deleted_recovery": "not attempted",
+            "registry_transaction_log_replay": "not attempted",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        if let Some(object) = metadata.as_object_mut() {
+            if let Some(size) = value_size {
+                object.insert(
+                    "registry_value_data_size".to_string(),
+                    serde_json::json!(size),
+                );
+            }
+            if let Some(items) = rendered.items {
+                object.insert(
+                    "registry_value_data_items".to_string(),
+                    serde_json::Value::Array(
+                        items.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            if let Some(warnings) = warnings {
+                object.insert(
+                    "registry_value_warnings".to_string(),
+                    serde_json::Value::String(warnings.to_string()),
+                );
+            }
+        }
+        add_entry_category(&mut metadata, &logical_path, &value_name, "record");
+        self.entries.push(RegistryImportEntry {
+            logical_path,
+            display_name: value_name,
+            entry_kind: "record",
+            size_bytes: value_size.map(|size| i64::try_from(size).unwrap_or(i64::MAX)),
+            metadata,
+        });
+        self.values_indexed += 1;
+        Ok(())
+    }
+}
+
+struct RegistryRenderedValue {
+    text: String,
+    truncated: bool,
+    items: Option<Vec<String>>,
+}
+
+fn registry_render_value(
+    data_type: RegistryValueDataType,
+    value: &RegistryCellValue,
+) -> RegistryRenderedValue {
+    match value {
+        RegistryCellValue::String(value) => {
+            let (text, truncated) = truncate_registry_text(
+                &registry_clean_string(value),
+                REGISTRY_VALUE_TEXT_PREVIEW_CHARS,
+            );
+            RegistryRenderedValue {
+                text,
+                truncated,
+                items: None,
+            }
+        }
+        RegistryCellValue::MultiString(values) => {
+            let cleaned = values
+                .iter()
+                .map(|value| registry_clean_string(value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            let joined = cleaned.join(" | ");
+            let (text, truncated) =
+                truncate_registry_text(&joined, REGISTRY_VALUE_TEXT_PREVIEW_CHARS);
+            RegistryRenderedValue {
+                text,
+                truncated,
+                items: Some(cleaned),
+            }
+        }
+        RegistryCellValue::Binary(bytes) => {
+            let (text, truncated) = registry_hex_preview(bytes);
+            RegistryRenderedValue {
+                text,
+                truncated,
+                items: None,
+            }
+        }
+        RegistryCellValue::U32(value) => RegistryRenderedValue {
+            text: format!("{value} (0x{value:08X})"),
+            truncated: false,
+            items: None,
+        },
+        RegistryCellValue::I32(value) => RegistryRenderedValue {
+            text: value.to_string(),
+            truncated: false,
+            items: None,
+        },
+        RegistryCellValue::U64(value) => {
+            let mut text = format!("{value} (0x{value:016X})");
+            if data_type == RegistryValueDataType::REG_FILETIME {
+                if let Some(utc) = pst_filetime_to_rfc3339(i64::try_from(*value).ok().unwrap_or(0))
+                {
+                    text.push_str(" | ");
+                    text.push_str(&utc);
+                }
+            }
+            RegistryRenderedValue {
+                text,
+                truncated: false,
+                items: None,
+            }
+        }
+        RegistryCellValue::I64(value) => RegistryRenderedValue {
+            text: value.to_string(),
+            truncated: false,
+            items: None,
+        },
+        RegistryCellValue::None => RegistryRenderedValue {
+            text: String::new(),
+            truncated: false,
+            items: None,
+        },
+        RegistryCellValue::Error => RegistryRenderedValue {
+            text: "value content could not be decoded".to_string(),
+            truncated: false,
+            items: None,
+        },
+    }
+}
+
+fn registry_clean_string(value: &str) -> String {
+    value.trim_end_matches('\0').trim().to_string()
+}
+
+fn truncate_registry_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let text = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (text, truncated)
+}
+
+fn registry_hex_preview(bytes: &[u8]) -> (String, bool) {
+    let truncated = bytes.len() > REGISTRY_BINARY_PREVIEW_BYTES;
+    let mut text = bytes
+        .iter()
+        .take(REGISTRY_BINARY_PREVIEW_BYTES)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if truncated {
+        text.push_str(&format!(" ... ({} bytes total)", bytes.len()));
+    }
+    (text, truncated)
+}
+
+fn registry_value_type_label(data_type: RegistryValueDataType) -> &'static str {
+    match data_type {
+        RegistryValueDataType::REG_BIN => "REG_BINARY",
+        RegistryValueDataType::REG_NONE => "REG_NONE",
+        RegistryValueDataType::REG_SZ => "REG_SZ",
+        RegistryValueDataType::REG_EXPAND_SZ => "REG_EXPAND_SZ",
+        RegistryValueDataType::REG_DWORD => "REG_DWORD",
+        RegistryValueDataType::REG_DWORD_BIG_ENDIAN => "REG_DWORD_BIG_ENDIAN",
+        RegistryValueDataType::REG_LINK => "REG_LINK",
+        RegistryValueDataType::REG_MULTI_SZ => "REG_MULTI_SZ",
+        RegistryValueDataType::REG_RESOURCE_LIST => "REG_RESOURCE_LIST",
+        RegistryValueDataType::REG_FULL_RESOURCE_DESCRIPTOR => "REG_FULL_RESOURCE_DESCRIPTOR",
+        RegistryValueDataType::REG_RESOURCE_REQUIREMENTS_LIST => "REG_RESOURCE_REQUIREMENTS_LIST",
+        RegistryValueDataType::REG_QWORD => "REG_QWORD",
+        RegistryValueDataType::REG_FILETIME => "REG_FILETIME",
+        RegistryValueDataType::REG_UNKNOWN => "REG_UNKNOWN",
+        _ => "REG_COMPOSITE_OR_UNKNOWN",
+    }
+}
+
+fn registry_root_logical_path(display_name: &str) -> String {
+    format!("/Registry/{}", sanitize_logical_segment(display_name))
+}
+
+fn registry_key_display_path(path: &str) -> String {
+    let cleaned = path
+        .replace('/', "\\")
+        .split('\\')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\\");
+    if cleaned.is_empty() {
+        "\\".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn registry_last_path_segment(path: &str) -> Option<&str> {
+    path.rsplit('\\').find(|segment| !segment.trim().is_empty())
+}
+
+fn registry_key_logical_path(
+    root: &str,
+    key_path: &str,
+    offset: usize,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    let segments = key_path
+        .split('\\')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(sanitize_logical_segment)
+        .collect::<Vec<_>>();
+    let path = if segments.is_empty() {
+        format!("{root}/Root")
+    } else {
+        format!("{root}/{}", segments.join("/"))
+    };
+    unique_registry_logical_path(path, offset, used_paths)
+}
+
+fn registry_value_logical_path(
+    key_logical_path: &str,
+    value_name: &str,
+    offset: usize,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    let segment = format!("{}.value", sanitize_logical_segment(value_name));
+    unique_registry_logical_path(format!("{key_logical_path}/{segment}"), offset, used_paths)
+}
+
+fn unique_registry_logical_path(
+    path: String,
+    offset: usize,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    if used_paths.insert(path.clone()) {
+        return path;
+    }
+    let mut index = 1_usize;
+    loop {
+        let candidate = format!("{path}-{offset:08X}-{index}");
+        if used_paths.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn registry_parser_scope_text() -> &'static str {
+    "Allocated Windows Registry hive keys and values parsed with notatin; common value types are rendered as bounded text or hex previews; deleted key recovery and transaction-log replay are deferred"
+}
+
+#[derive(Debug)]
+struct EvtxImportEntry {
+    logical_path: String,
+    display_name: String,
+    entry_kind: &'static str,
+    size_bytes: Option<i64>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct EvtxImportData {
+    entries: Vec<EvtxImportEntry>,
+    records_indexed: usize,
+    total_records_seen: usize,
+    parser_errors: Vec<String>,
+    parser_errors_truncated: bool,
+    truncated: bool,
+    root_logical_path: String,
+}
+
+fn is_evtx_evidence_candidate(path: &Path, display_name: &str) -> bool {
+    extension_lower(display_name)
+        .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
+        .as_deref()
+        == Some("evtx")
+}
+
+fn process_evtx_event_log_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    max_entries: usize,
+) -> Result<(usize, bool)> {
+    let path = PathBuf::from(&evidence.source_path);
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("reading EVTX evidence metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("EVTX evidence path is no longer a file: {}", path.display());
+    }
+
+    match collect_evtx_event_log_import(&path, &evidence.display_name, max_entries) {
+        Ok(import_data) => {
+            if import_data.records_indexed == 0 && !import_data.parser_errors.is_empty() {
+                let reason = format!(
+                    "EVTX parser opened the file, but no event records could be read: {}",
+                    import_data.parser_errors[0]
+                );
+                return persist_unsupported_evtx_status(
+                    conn,
+                    case_id,
+                    evidence,
+                    job_id,
+                    metadata.len(),
+                    &reason,
+                );
+            }
+            persist_evtx_event_log_import(conn, case_id, evidence, job_id, import_data)
+        }
+        Err(err) => persist_unsupported_evtx_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            &format!("EVTX event log was detected, but the parser could not read it: {err}"),
+        ),
+    }
+}
+
+fn persist_unsupported_evtx_status(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    size_bytes: u64,
+    reason: &str,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let logical_path = evtx_root_logical_path(&evidence.display_name);
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "evtx_log",
+        "evtx_parser": EVTX_PARSER_NAME,
+        "evtx_parser_status": "unsupported",
+        "evtx_parser_error": reason,
+        "evtx_parser_scope": evtx_parser_scope_text(),
+        "evtx_event_id_curation": "not attempted",
+        "evtx_etl_trace_log_parsing": "not attempted",
+        "evtx_event_correlation": "not attempted",
+        "evtx_message_template_resolution": "evtx crate rendered JSON only; custom provider message template expansion is deferred",
+        "source_artifact_path": evidence.source_path,
+    });
+    add_entry_category(&mut metadata, &logical_path, &evidence.display_name, "file");
+    upsert_filesystem_entry(
+        conn,
+        case_id,
+        evidence.id,
+        &logical_path,
+        &evidence.display_name,
+        "file",
+        Some(i64::try_from(size_bytes).context("EVTX file size exceeds i64")?),
+        &metadata.to_string(),
+        job_id,
+    )?;
+    Ok((1, false))
+}
+
+fn persist_evtx_event_log_import(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    mut import_data: EvtxImportData,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let records_indexed = import_data.records_indexed;
+    let total_records_seen = import_data.total_records_seen;
+    let parser_errors = import_data.parser_errors.clone();
+    let parser_errors_truncated = import_data.parser_errors_truncated;
+    let truncated = import_data.truncated;
+    if let Some(root) = import_data
+        .entries
+        .iter_mut()
+        .find(|entry| entry.logical_path == import_data.root_logical_path)
+    {
+        if let Some(object) = root.metadata.as_object_mut() {
+            let parser_status = if parser_errors.is_empty() {
+                "parsed"
+            } else {
+                "partial"
+            };
+            object.insert(
+                "evtx_parser_status".to_string(),
+                serde_json::json!(parser_status),
+            );
+            object.insert(
+                "evtx_records_indexed".to_string(),
+                serde_json::json!(records_indexed),
+            );
+            object.insert(
+                "evtx_records_seen".to_string(),
+                serde_json::json!(total_records_seen),
+            );
+            object.insert("evtx_truncated".to_string(), serde_json::json!(truncated));
+            object.insert(
+                "evtx_partial".to_string(),
+                serde_json::json!(!parser_errors.is_empty()),
+            );
+            if !parser_errors.is_empty() {
+                object.insert(
+                    "evtx_parser_errors".to_string(),
+                    serde_json::Value::Array(
+                        parser_errors
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+                object.insert(
+                    "evtx_parser_errors_truncated".to_string(),
+                    serde_json::json!(parser_errors_truncated),
+                );
+            }
+        }
+    }
+
+    let entries_indexed = import_data.entries.len();
+    for entry in import_data.entries {
+        upsert_filesystem_entry(
+            conn,
+            case_id,
+            evidence.id,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+            entry.size_bytes,
+            &entry.metadata.to_string(),
+            job_id,
+        )?;
+    }
+    Ok((entries_indexed, import_data.truncated))
+}
+
+fn collect_evtx_event_log_import(
+    path: &Path,
+    display_name: &str,
+    max_records: usize,
+) -> Result<EvtxImportData> {
+    let root_logical_path = evtx_root_logical_path(display_name);
+    let mut collector = EvtxImportCollector {
+        entries: Vec::new(),
+        records_indexed: 0,
+        total_records_seen: 0,
+        parser_errors: Vec::new(),
+        parser_errors_truncated: false,
+        truncated: false,
+        max_records,
+        root_logical_path: root_logical_path.clone(),
+        source_path: path.to_string_lossy().into_owned(),
+        log_display_name: display_name.to_string(),
+        channel_hint: evtx_channel_hint(display_name),
+        used_paths: HashSet::new(),
+    };
+    collector.push_log_root();
+
+    let mut parser = EvtxParser::from_path(path)
+        .with_context(|| format!("opening EVTX event log {}", path.display()))?
+        .with_configuration(EvtxParserSettings::new().indent(false));
+    for record in parser.records_json_value() {
+        match record {
+            Ok(record) => {
+                collector.total_records_seen = collector.total_records_seen.saturating_add(1);
+                if collector.records_indexed >= collector.max_records {
+                    collector.truncated = true;
+                    break;
+                }
+                collector.push_record(record)?;
+            }
+            Err(err) => collector.push_parser_error(err.to_string()),
+        }
+    }
+
+    Ok(EvtxImportData {
+        entries: collector.entries,
+        records_indexed: collector.records_indexed,
+        total_records_seen: collector.total_records_seen,
+        parser_errors: collector.parser_errors,
+        parser_errors_truncated: collector.parser_errors_truncated,
+        truncated: collector.truncated,
+        root_logical_path,
+    })
+}
+
+struct EvtxImportCollector {
+    entries: Vec<EvtxImportEntry>,
+    records_indexed: usize,
+    total_records_seen: usize,
+    parser_errors: Vec<String>,
+    parser_errors_truncated: bool,
+    truncated: bool,
+    max_records: usize,
+    root_logical_path: String,
+    source_path: String,
+    log_display_name: String,
+    channel_hint: Option<String>,
+    used_paths: HashSet<String>,
+}
+
+impl EvtxImportCollector {
+    fn push_log_root(&mut self) {
+        self.used_paths.insert(self.root_logical_path.clone());
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "evtx_log",
+            "evtx_parser": EVTX_PARSER_NAME,
+            "evtx_parser_status": "parsed",
+            "evtx_parser_scope": evtx_parser_scope_text(),
+            "evtx_event_id_curation": "not attempted",
+            "evtx_etl_trace_log_parsing": "not attempted",
+            "evtx_event_correlation": "not attempted",
+            "evtx_message_template_resolution": "evtx crate rendered JSON only; custom provider message template expansion is deferred",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        if let Some(object) = metadata.as_object_mut() {
+            insert_optional_string(
+                object,
+                "evtx_channel_hint",
+                self.channel_hint.as_ref().cloned(),
+            );
+        }
+        add_entry_category(
+            &mut metadata,
+            &self.root_logical_path,
+            &self.log_display_name,
+            "directory",
+        );
+        self.entries.push(EvtxImportEntry {
+            logical_path: self.root_logical_path.clone(),
+            display_name: self.log_display_name.clone(),
+            entry_kind: "directory",
+            size_bytes: None,
+            metadata,
+        });
+    }
+
+    fn push_record(&mut self, record: SerializedEvtxRecord<serde_json::Value>) -> Result<()> {
+        let record_id = record.event_record_id;
+        let data = record.data;
+        let system = data.get("Event").and_then(|event| event.get("System"));
+        let event_id = system.and_then(|system| evtx_json_path_u64(system, &["EventID"]));
+        let event_id_text = system.and_then(|system| evtx_json_path_string(system, &["EventID"]));
+        let level_code = system.and_then(|system| evtx_json_path_u64(system, &["Level"]));
+        let level_text = evtx_level_label(
+            level_code,
+            system
+                .and_then(|system| evtx_json_path_string(system, &["Level"]))
+                .as_deref(),
+        );
+        let provider = system.and_then(evtx_provider_name);
+        let logged_utc = system
+            .and_then(evtx_time_created)
+            .unwrap_or_else(|| record.timestamp.to_string());
+        let channel = system
+            .and_then(|system| evtx_json_path_string(system, &["Channel"]))
+            .or_else(|| self.channel_hint.clone());
+        let computer = system.and_then(|system| evtx_json_path_string(system, &["Computer"]));
+        let user_sid = evtx_find_user_sid(&data);
+        let summary = evtx_record_summary(
+            &data,
+            event_id_text.as_deref(),
+            level_text.as_deref(),
+            provider.as_deref(),
+            channel.as_deref(),
+            computer.as_deref(),
+        );
+        let display_name = event_id_text
+            .as_deref()
+            .map(|event_id| format!("Event {event_id} (record {record_id})"))
+            .unwrap_or_else(|| format!("Event record {record_id}"));
+        let logical_path =
+            evtx_record_logical_path(&self.root_logical_path, record_id, &mut self.used_paths);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "evtx_event_record",
+            "evtx_parser": EVTX_PARSER_NAME,
+            "evtx_parser_status": "parsed",
+            "evtx_parser_scope": evtx_parser_scope_text(),
+            "evtx_source_log": self.log_display_name.as_str(),
+            "evtx_record_id": record_id,
+            "evtx_logged_utc": logged_utc,
+            "created_utc": logged_utc,
+            "evtx_summary": summary.text,
+            "evtx_summary_truncated": summary.truncated,
+            "evtx_event_id_curation": "not attempted",
+            "evtx_event_correlation": "not attempted",
+            "evtx_message_template_resolution": "evtx crate rendered JSON only; custom provider message template expansion is deferred",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        if let Some(object) = metadata.as_object_mut() {
+            if let Some(event_id) = event_id {
+                object.insert("evtx_event_id".to_string(), serde_json::json!(event_id));
+            } else {
+                insert_optional_string(object, "evtx_event_id", event_id_text);
+            }
+            if let Some(level_code) = level_code {
+                object.insert("evtx_level_code".to_string(), serde_json::json!(level_code));
+            }
+            insert_optional_string(object, "evtx_level", level_text);
+            insert_optional_string(object, "evtx_provider", provider);
+            insert_optional_string(object, "evtx_channel", channel);
+            insert_optional_string(object, "evtx_computer", computer);
+            insert_optional_string(object, "evtx_user_sid", user_sid);
+        }
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        self.entries.push(EvtxImportEntry {
+            logical_path,
+            display_name,
+            entry_kind: "record",
+            size_bytes: None,
+            metadata,
+        });
+        self.records_indexed += 1;
+        Ok(())
+    }
+
+    fn push_parser_error(&mut self, error: String) {
+        if self.parser_errors.len() < EVTX_PARSER_ERROR_LIMIT {
+            self.parser_errors.push(error);
+        } else {
+            self.parser_errors_truncated = true;
+        }
+    }
+}
+
+struct EvtxRenderedSummary {
+    text: String,
+    truncated: bool,
+}
+
+fn evtx_record_summary(
+    data: &serde_json::Value,
+    event_id: Option<&str>,
+    level: Option<&str>,
+    provider: Option<&str>,
+    channel: Option<&str>,
+    computer: Option<&str>,
+) -> EvtxRenderedSummary {
+    let mut parts = Vec::new();
+    if let Some(event_id) = event_id {
+        parts.push(format!("Event ID={event_id}"));
+    }
+    if let Some(level) = level {
+        parts.push(format!("Level={level}"));
+    }
+    if let Some(provider) = provider {
+        parts.push(format!("Provider={provider}"));
+    }
+    if let Some(channel) = channel {
+        parts.push(format!("Channel={channel}"));
+    }
+    if let Some(computer) = computer {
+        parts.push(format!("Computer={computer}"));
+    }
+    let mut pair_truncated = false;
+    if let Some((label, payload)) = evtx_event_payload(data) {
+        let mut payload_parts = Vec::new();
+        pair_truncated = evtx_flatten_summary_value(payload, "", &mut payload_parts, 24);
+        if !payload_parts.is_empty() {
+            parts.push(format!("{label}: {}", payload_parts.join("; ")));
+        } else if let Some(text) = evtx_scalar_string(payload) {
+            parts.push(format!("{label}: {text}"));
+        }
+    }
+    if parts.is_empty() {
+        if let Some(text) = evtx_compact_json_preview(data) {
+            parts.push(text);
+        }
+    }
+    let (text, text_truncated) =
+        truncate_evtx_text(&parts.join(" | "), EVTX_EVENT_SUMMARY_PREVIEW_CHARS);
+    EvtxRenderedSummary {
+        text,
+        truncated: pair_truncated || text_truncated,
+    }
+}
+
+fn evtx_event_payload(data: &serde_json::Value) -> Option<(&'static str, &serde_json::Value)> {
+    let event = data.get("Event")?;
+    ["EventData", "UserData"].iter().find_map(|key| {
+        event
+            .get(*key)
+            .filter(|value| !value.is_null())
+            .map(|value| (*key, value))
+    })
+}
+
+fn evtx_flatten_summary_value(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+    max_pairs: usize,
+) -> bool {
+    if out.len() >= max_pairs {
+        return true;
+    }
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {
+            if let Some(text) = evtx_scalar_string(value) {
+                if !prefix.is_empty() {
+                    out.push(format!("{prefix}={text}"));
+                } else {
+                    out.push(text);
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(values) => {
+            if values.iter().all(|value| {
+                !matches!(
+                    value,
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_)
+                )
+            }) {
+                let joined = values
+                    .iter()
+                    .filter_map(evtx_scalar_string)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !joined.is_empty() {
+                    if prefix.is_empty() {
+                        out.push(joined);
+                    } else {
+                        out.push(format!("{prefix}={joined}"));
+                    }
+                }
+                values.len() > 8
+            } else {
+                let mut truncated = false;
+                for (index, value) in values.iter().enumerate() {
+                    if out.len() >= max_pairs {
+                        truncated = true;
+                        break;
+                    }
+                    let child_prefix = if prefix.is_empty() {
+                        format!("[{index}]")
+                    } else {
+                        format!("{prefix}[{index}]")
+                    };
+                    truncated |= evtx_flatten_summary_value(value, &child_prefix, out, max_pairs);
+                }
+                truncated
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let mut truncated = false;
+            if let Some(text_value) = object.get("#text") {
+                truncated |= evtx_flatten_summary_value(text_value, prefix, out, max_pairs);
+            }
+            for (key, value) in object {
+                if key == "#text" || key == "#attributes" || key.ends_with("_attributes") {
+                    continue;
+                }
+                if out.len() >= max_pairs {
+                    truncated = true;
+                    break;
+                }
+                let child_prefix = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                truncated |= evtx_flatten_summary_value(value, &child_prefix, out, max_pairs);
+            }
+            truncated
+        }
+    }
+}
+
+fn evtx_provider_name(system: &serde_json::Value) -> Option<String> {
+    evtx_json_path_string(system, &["Provider", "#attributes", "Name"])
+        .or_else(|| evtx_json_path_string(system, &["Provider_attributes", "Name"]))
+        .or_else(|| evtx_json_path_string(system, &["Provider", "Name"]))
+        .or_else(|| evtx_json_path_string(system, &["Provider"]))
+}
+
+fn evtx_time_created(system: &serde_json::Value) -> Option<String> {
+    evtx_json_path_string(system, &["TimeCreated", "#attributes", "SystemTime"])
+        .or_else(|| evtx_json_path_string(system, &["TimeCreated_attributes", "SystemTime"]))
+        .or_else(|| evtx_json_path_string(system, &["TimeCreated", "SystemTime"]))
+}
+
+fn evtx_json_path_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    evtx_scalar_string(current)
+}
+
+fn evtx_json_path_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    evtx_scalar_u64(current)
+}
+
+fn evtx_scalar_string(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::String(value) => value.split_whitespace().collect::<Vec<_>>().join(" "),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Object(object) => object.get("#text").and_then(evtx_scalar_string)?,
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+fn evtx_scalar_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok())),
+        serde_json::Value::String(value) => value.trim().parse::<u64>().ok(),
+        serde_json::Value::Object(object) => object.get("#text").and_then(evtx_scalar_u64),
+        _ => None,
+    }
+}
+
+fn evtx_level_label(level_code: Option<u64>, raw_level: Option<&str>) -> Option<String> {
+    if let Some(level_code) = level_code {
+        let label = match level_code {
+            0 => "Information",
+            1 => "Critical",
+            2 => "Error",
+            3 => "Warning",
+            4 => "Information",
+            5 => "Verbose",
+            _ => return Some(format!("Unknown ({level_code})")),
+        };
+        return Some(label.to_string());
+    }
+    raw_level.map(ToString::to_string)
+}
+
+fn evtx_find_user_sid(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            trimmed.starts_with("S-1-").then(|| trimmed.to_string())
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(evtx_find_user_sid),
+        serde_json::Value::Object(object) => {
+            for preferred in [
+                "UserID",
+                "SubjectUserSid",
+                "TargetUserSid",
+                "MemberSid",
+                "SecurityID",
+            ] {
+                if let Some(sid) = object.get(preferred).and_then(evtx_find_user_sid) {
+                    return Some(sid);
+                }
+            }
+            object.values().find_map(evtx_find_user_sid)
+        }
+        _ => None,
+    }
+}
+
+fn evtx_compact_json_preview(value: &serde_json::Value) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .and_then(|text| (!text.is_empty()).then_some(text))
+}
+
+fn truncate_evtx_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let text = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (text, truncated)
+}
+
+fn evtx_root_logical_path(display_name: &str) -> String {
+    format!("/Event Logs/{}", sanitize_logical_segment(display_name))
+}
+
+fn evtx_record_logical_path(
+    root: &str,
+    record_id: u64,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    let base = format!("{root}/{record_id}.record");
+    if used_paths.insert(base.clone()) {
+        return base;
+    }
+    let mut index = 1_u32;
+    loop {
+        let candidate = format!("{root}/{record_id}-{index}.record");
+        if used_paths.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn evtx_channel_hint(display_name: &str) -> Option<String> {
+    let stem = Path::new(display_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(display_name)
+        .trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let channel = stem
+        .replace("%4", "/")
+        .replace("%2F", "/")
+        .replace("%2f", "/");
+    Some(channel)
+}
+
+fn evtx_parser_scope_text() -> &'static str {
+    "Windows EVTX event records parsed with the evtx crate as rendered JSON; ETL trace logs, curated Event-ID highlighting, cross-event correlation, and custom provider message-template expansion are deferred"
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PstHeaderKind {
+    Unicode { version: u16 },
+    Ansi { version: u16 },
+    Unsupported,
+}
+
+#[derive(Debug)]
+struct PstHeaderStatus {
+    kind: PstHeaderKind,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct MailboxImportEntry {
+    logical_path: String,
+    display_name: String,
+    entry_kind: &'static str,
+    size_bytes: Option<i64>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct MailboxImportData {
+    entries: Vec<MailboxImportEntry>,
+    folders_indexed: usize,
+    messages_indexed: usize,
+    total_messages_seen: usize,
+    truncated: bool,
+    store_display_name: Option<String>,
+}
+
+#[derive(Default)]
+struct PstRecipientLists {
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+}
+
+fn is_pst_ost_extension(ext: &str) -> bool {
+    matches!(ext, "pst" | "ost")
+}
+
+fn detect_pst_header(path: &Path) -> Result<PstHeaderStatus> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("opening mailbox {}", path.display()))?;
+    let mut header = [0_u8; 12];
+    let read = file
+        .read(&mut header)
+        .with_context(|| format!("reading PST/OST header {}", path.display()))?;
+    if read < header.len() {
+        return Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unsupported,
+            reason: Some("PST/OST header is shorter than 12 bytes".to_string()),
+        });
+    }
+    if &header[0..4] != b"!BDN" {
+        return Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unsupported,
+            reason: Some("PST/OST NDB magic !BDN was not found at offset 0".to_string()),
+        });
+    }
+
+    // MS-PST header layout: dwMagic(0), dwCRCPartial(4), wMagicClient(8), wVer(10).
+    let version = u16::from_le_bytes([header[10], header[11]]);
+    if version >= 23 {
+        Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unicode { version },
+            reason: None,
+        })
+    } else if version > 0 {
+        Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Ansi { version },
+            reason: Some(format!(
+                "ANSI PST/OST header detected (wVer {version}); this slice supports Unicode PST/OST only"
+            )),
+        })
+    } else {
+        Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unsupported,
+            reason: Some("PST/OST header version is zero or unreadable".to_string()),
+        })
+    }
+}
+
+fn process_pst_mailbox_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    max_messages: usize,
+) -> Result<(usize, bool)> {
+    let path = PathBuf::from(&evidence.source_path);
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("reading mailbox evidence metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "mailbox evidence path is no longer a file: {}",
+            path.display()
+        );
+    }
+    let email_format = extension_lower(&evidence.display_name)
+        .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
+        .unwrap_or_else(|| "pst".to_string());
+    let header = detect_pst_header(&path)?;
+    if header.kind != (PstHeaderKind::Unicode { version: 23 })
+        && !matches!(header.kind, PstHeaderKind::Unicode { .. })
+    {
+        let reason = header
+            .reason
+            .unwrap_or_else(|| "unsupported PST/OST variant".to_string());
+        return persist_unsupported_mailbox_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            &email_format,
+            &header.kind,
+            &reason,
+        );
+    }
+
+    match collect_pst_mailbox_import(&path, &email_format, max_messages) {
+        Ok(import_data) => persist_pst_mailbox_import(conn, case_id, evidence, job_id, import_data),
+        Err(err) => persist_unsupported_mailbox_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            &email_format,
+            &header.kind,
+            &format!(
+                "Unicode PST/OST was detected, but the mailbox parser could not read it: {err}"
+            ),
+        ),
+    }
+}
+
+fn persist_unsupported_mailbox_status(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    size_bytes: u64,
+    email_format: &str,
+    header_kind: &PstHeaderKind,
+    reason: &str,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let logical_path = format!("/{}", sanitize_logical_segment(&evidence.display_name));
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "email_store",
+        "email_format": email_format,
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_status": "unsupported",
+        "email_parser_error": reason,
+        "pst_parser_scope": pst_parser_scope_text(),
+        "pst_deleted_recovery": "not attempted",
+        "pst_attachment_content_extraction": "not attempted",
+    });
+    if let Some(object) = metadata.as_object_mut() {
+        match header_kind {
+            PstHeaderKind::Unicode { version } => {
+                object.insert("pst_variant".to_string(), serde_json::json!("unicode"));
+                object.insert("pst_header_version".to_string(), serde_json::json!(version));
+            }
+            PstHeaderKind::Ansi { version } => {
+                object.insert("pst_variant".to_string(), serde_json::json!("ansi"));
+                object.insert("pst_header_version".to_string(), serde_json::json!(version));
+            }
+            PstHeaderKind::Unsupported => {
+                object.insert("pst_variant".to_string(), serde_json::json!("unsupported"));
+            }
+        }
+    }
+    add_entry_category(&mut metadata, &logical_path, &evidence.display_name, "file");
+    upsert_filesystem_entry(
+        conn,
+        case_id,
+        evidence.id,
+        &logical_path,
+        &evidence.display_name,
+        "file",
+        Some(i64::try_from(size_bytes).context("mailbox size exceeds i64")?),
+        &metadata.to_string(),
+        job_id,
+    )?;
+    Ok((1, false))
+}
+
+fn persist_pst_mailbox_import(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    mut import_data: MailboxImportData,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let folders_indexed = import_data.folders_indexed;
+    let messages_indexed = import_data.messages_indexed;
+    let total_messages_seen = import_data.total_messages_seen;
+    let store_display_name = import_data.store_display_name.clone();
+    if let Some(root) = import_data
+        .entries
+        .iter_mut()
+        .find(|entry| entry.logical_path == "/Mailbox")
+    {
+        if let Some(object) = root.metadata.as_object_mut() {
+            object.insert(
+                "pst_folders_indexed".to_string(),
+                serde_json::json!(folders_indexed),
+            );
+            object.insert(
+                "pst_messages_indexed".to_string(),
+                serde_json::json!(messages_indexed),
+            );
+            object.insert(
+                "pst_total_messages_seen".to_string(),
+                serde_json::json!(total_messages_seen),
+            );
+            insert_optional_string(object, "pst_store_display_name", store_display_name);
+        }
+    }
+    let entries_indexed = import_data.entries.len();
+    for entry in import_data.entries {
+        upsert_filesystem_entry(
+            conn,
+            case_id,
+            evidence.id,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+            entry.size_bytes,
+            &entry.metadata.to_string(),
+            job_id,
+        )?;
+    }
+    Ok((entries_indexed, import_data.truncated))
+}
+
+fn collect_pst_mailbox_import(
+    path: &Path,
+    email_format: &str,
+    max_messages: usize,
+) -> Result<MailboxImportData> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("opening PST/OST read-only {}", path.display()))?;
+    let pst_file = outlook_pst::UnicodePstFile::read_from(Box::new(file))
+        .with_context(|| format!("reading Unicode PST/OST {}", path.display()))?;
+    let store: Rc<dyn PstStore> =
+        outlook_pst::messaging::store::UnicodeStore::read(Rc::new(pst_file))
+            .context("opening PST/OST message store")?;
+    let store_display_name = store.properties().display_name().ok();
+    let mut collector = PstImportCollector {
+        entries: Vec::new(),
+        folders_indexed: 0,
+        messages_indexed: 0,
+        total_messages_seen: 0,
+        truncated: false,
+        email_format: email_format.to_string(),
+        source_path: path.to_string_lossy().into_owned(),
+        max_messages,
+    };
+    collector.push_mailbox_root(store_display_name.as_deref());
+
+    let ipm_sub_tree = store
+        .properties()
+        .ipm_sub_tree_entry_id()
+        .context("locating PST/OST IPM subtree")?;
+    let ipm_folder = store
+        .open_folder(&ipm_sub_tree)
+        .context("opening PST/OST IPM subtree folder")?;
+    collector.collect_folder_messages(store.clone(), ipm_folder.clone(), &[], "Mailbox")?;
+    collector.collect_child_folders(store, ipm_folder, Vec::new(), "Mailbox".to_string())?;
+
+    Ok(MailboxImportData {
+        entries: collector.entries,
+        folders_indexed: collector.folders_indexed,
+        messages_indexed: collector.messages_indexed,
+        total_messages_seen: collector.total_messages_seen,
+        truncated: collector.truncated,
+        store_display_name,
+    })
+}
+
+struct PstImportCollector {
+    entries: Vec<MailboxImportEntry>,
+    folders_indexed: usize,
+    messages_indexed: usize,
+    total_messages_seen: usize,
+    truncated: bool,
+    email_format: String,
+    source_path: String,
+    max_messages: usize,
+}
+
+impl PstImportCollector {
+    fn push_mailbox_root(&mut self, store_display_name: Option<&str>) {
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "email_store",
+            "email_format": self.email_format.as_str(),
+            "email_parser": PST_PARSER_NAME,
+            "email_parser_status": "parsed",
+            "pst_parser_scope": pst_parser_scope_text(),
+            "pst_deleted_recovery": "not attempted",
+            "pst_attachment_content_extraction": "not attempted",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        if let Some(object) = metadata.as_object_mut() {
+            insert_optional_string(
+                object,
+                "pst_store_display_name",
+                store_display_name.map(ToString::to_string),
+            );
+        }
+        add_entry_category(&mut metadata, "/Mailbox", "Mailbox", "directory");
+        self.entries.push(MailboxImportEntry {
+            logical_path: "/Mailbox".to_string(),
+            display_name: store_display_name.unwrap_or("Mailbox").to_string(),
+            entry_kind: "directory",
+            size_bytes: None,
+            metadata,
+        });
+    }
+
+    fn collect_child_folders(
+        &mut self,
+        store: Rc<dyn PstStore>,
+        parent: Rc<dyn PstFolder>,
+        parent_segments: Vec<String>,
+        parent_display_path: String,
+    ) -> Result<()> {
+        if self.truncated {
+            return Ok(());
+        }
+        let Some(hierarchy_table) = parent.hierarchy_table() else {
+            return Ok(());
+        };
+
+        let mut folders = Vec::new();
+        for row in hierarchy_table.rows_matrix() {
+            let node_id = u32::from(row.id());
+            let entry_id = store
+                .properties()
+                .make_entry_id(PstNodeId::from(node_id))
+                .with_context(|| format!("building PST folder entry id 0x{node_id:08X}"))?;
+            let folder = store
+                .open_folder(&entry_id)
+                .with_context(|| format!("opening PST folder 0x{node_id:08X}"))?;
+            let name = folder
+                .properties()
+                .display_name()
+                .unwrap_or_else(|_| format!("Folder 0x{node_id:08X}"));
+            folders.push((name, node_id, folder));
+        }
+        folders.sort_by(|left, right| {
+            left.0
+                .to_ascii_lowercase()
+                .cmp(&right.0.to_ascii_lowercase())
+                .then_with(|| left.1.cmp(&right.1))
+        });
+
+        let mut used_segments = HashSet::new();
+        for (name, node_id, folder) in folders {
+            if self.truncated {
+                break;
+            }
+            let segment = unique_mailbox_segment(&name, node_id, &mut used_segments);
+            let mut segments = parent_segments.clone();
+            segments.push(segment);
+            let logical_path = mailbox_logical_path(&segments);
+            let display_path = format!("{parent_display_path}/{}", name);
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "pst_folder",
+                "email_format": self.email_format.as_str(),
+                "email_parser": PST_PARSER_NAME,
+                "email_parser_status": "parsed",
+                "pst_folder_name": name,
+                "pst_folder_path": display_path,
+                "pst_folder_node_id": format!("0x{node_id:08X}"),
+                "source_artifact_path": self.source_path.as_str(),
+            });
+            if let Some(object) = metadata.as_object_mut() {
+                if let Ok(count) = folder.properties().content_count() {
+                    object.insert(
+                        "pst_folder_message_count".to_string(),
+                        serde_json::json!(count),
+                    );
+                }
+                if let Ok(count) = folder.properties().unread_count() {
+                    object.insert(
+                        "pst_folder_unread_count".to_string(),
+                        serde_json::json!(count),
+                    );
+                }
+                if let Ok(has_subfolders) = folder.properties().has_sub_folders() {
+                    object.insert(
+                        "pst_folder_has_subfolders".to_string(),
+                        serde_json::json!(has_subfolders),
+                    );
+                }
+            }
+            add_entry_category(&mut metadata, &logical_path, &name, "directory");
+            self.entries.push(MailboxImportEntry {
+                logical_path,
+                display_name: name,
+                entry_kind: "directory",
+                size_bytes: None,
+                metadata,
+            });
+            self.folders_indexed += 1;
+            self.collect_folder_messages(store.clone(), folder.clone(), &segments, &display_path)?;
+            self.collect_child_folders(store.clone(), folder, segments, display_path)?;
+        }
+        Ok(())
+    }
+
+    fn collect_folder_messages(
+        &mut self,
+        store: Rc<dyn PstStore>,
+        folder: Rc<dyn PstFolder>,
+        folder_segments: &[String],
+        folder_display_path: &str,
+    ) -> Result<()> {
+        let Some(contents_table) = folder.contents_table() else {
+            return Ok(());
+        };
+        let mut used_segments = HashSet::new();
+        for row in contents_table.rows_matrix() {
+            self.total_messages_seen += 1;
+            if self.messages_indexed >= self.max_messages {
+                self.truncated = true;
+                break;
+            }
+            let node_id = u32::from(row.id());
+            let entry_id = store
+                .properties()
+                .make_entry_id(PstNodeId::from(node_id))
+                .with_context(|| format!("building PST message entry id 0x{node_id:08X}"))?;
+            let message_result = store.open_message(&entry_id, Some(PST_MESSAGE_PROP_IDS));
+            let (display_name, size_bytes, mut metadata) = match message_result {
+                Ok(message) => {
+                    let subject = pst_message_string(message.as_ref(), 0x0037);
+                    let display_name = subject
+                        .clone()
+                        .unwrap_or_else(|| format!("Message 0x{node_id:08X}"));
+                    let size_bytes = pst_message_i32(message.as_ref(), 0x0E08).map(i64::from);
+                    (
+                        display_name,
+                        size_bytes,
+                        pst_message_metadata(
+                            message.as_ref(),
+                            &self.email_format,
+                            folder_display_path,
+                            &self.source_path,
+                            node_id,
+                        ),
+                    )
+                }
+                Err(err) => (
+                    format!("Message 0x{node_id:08X}"),
+                    None,
+                    pst_message_error_metadata(
+                        &self.email_format,
+                        folder_display_path,
+                        &self.source_path,
+                        node_id,
+                        &format!("could not open PST/OST message: {err}"),
+                    ),
+                ),
+            };
+            let segment = unique_mailbox_segment(&display_name, node_id, &mut used_segments);
+            let mut message_segments = folder_segments.to_vec();
+            message_segments.push(format!("{segment}.record"));
+            let logical_path = mailbox_logical_path(&message_segments);
+            add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+            self.entries.push(MailboxImportEntry {
+                logical_path,
+                display_name,
+                entry_kind: "record",
+                size_bytes,
+                metadata,
+            });
+            self.messages_indexed += 1;
+        }
+        Ok(())
+    }
+}
+
+fn unique_mailbox_segment(name: &str, node_id: u32, used: &mut HashSet<String>) -> String {
+    let base = sanitize_logical_segment(name);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut index = 1_u32;
+    loop {
+        let candidate = format!("{base}-{node_id:08X}-{index}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn mailbox_logical_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        "/Mailbox".to_string()
+    } else {
+        format!("/Mailbox/{}", segments.join("/"))
+    }
+}
+
+fn pst_message_metadata(
+    message: &dyn PstMessage,
+    email_format: &str,
+    folder_path: &str,
+    source_path: &str,
+    node_id: u32,
+) -> serde_json::Value {
+    let headers = pst_message_string(message, 0x007D).map(|value| parse_email_headers(&value));
+    let recipients = pst_message_recipients(message);
+    let body_preview =
+        pst_message_string(message, 0x1000).and_then(|body| email_body_preview(&body));
+    let delivery_time = pst_message_time(message, 0x0E06)
+        .or_else(|| pst_message_time(message, 0x0039))
+        .or_else(|| pst_message_time(message, 0x3007));
+    let from = pst_format_person(
+        pst_message_string(message, 0x0C1A).or_else(|| pst_message_string(message, 0x0042)),
+        pst_message_string(message, 0x0C1F),
+    );
+    let message_id = pst_message_string(message, 0x1035).or_else(|| {
+        headers
+            .as_ref()
+            .and_then(|headers| header_value(headers, "message-id"))
+    });
+    let reply_to = headers
+        .as_ref()
+        .and_then(|headers| header_value(headers, "reply-to"))
+        .or_else(|| pst_message_string(message, 0x0050));
+    let in_reply_to = headers
+        .as_ref()
+        .and_then(|headers| header_value(headers, "in-reply-to"));
+
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "email_message",
+        "email_format": email_format,
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_status": "parsed",
+        "pst_message_node_id": format!("0x{node_id:08X}"),
+        "pst_folder_path": folder_path,
+        "pst_parser_scope": pst_parser_scope_text(),
+        "pst_plain_text_body_supported": true,
+        "pst_body_html_present": message.properties().get(0x1013).is_some(),
+        "pst_body_rtf_present": message.properties().get(0x1009).is_some(),
+        "pst_attachment_content_extraction": "not attempted",
+        "pst_deleted_recovery": "not attempted",
+        "source_artifact_path": source_path,
+    });
+    if let Some(object) = metadata.as_object_mut() {
+        insert_optional_string(object, "email_from", from);
+        insert_optional_string(
+            object,
+            "email_to",
+            join_email_values(recipients.to).or_else(|| pst_message_string(message, 0x0E04)),
+        );
+        insert_optional_string(
+            object,
+            "email_cc",
+            join_email_values(recipients.cc).or_else(|| pst_message_string(message, 0x0E03)),
+        );
+        insert_optional_string(
+            object,
+            "email_bcc",
+            join_email_values(recipients.bcc).or_else(|| pst_message_string(message, 0x0E02)),
+        );
+        insert_optional_string(object, "email_subject", pst_message_string(message, 0x0037));
+        insert_optional_string(object, "email_date", delivery_time);
+        insert_optional_string(object, "email_message_id", message_id);
+        insert_optional_string(object, "email_reply_to", reply_to);
+        insert_optional_string(object, "email_in_reply_to", in_reply_to);
+        insert_optional_string(object, "email_body_preview", body_preview);
+        insert_optional_string(
+            object,
+            "pst_message_class",
+            pst_message_string(message, 0x001A),
+        );
+        if let Some(flags) = pst_message_i32(message, 0x0E07) {
+            object.insert("pst_message_flags".to_string(), serde_json::json!(flags));
+        }
+        if let Some(size) = pst_message_i32(message, 0x0E08) {
+            object.insert(
+                "pst_message_size_bytes".to_string(),
+                serde_json::json!(size),
+            );
+        }
+        let attachments = pst_attachment_names(message);
+        if !attachments.is_empty() {
+            object.insert(
+                "email_attachment_names".to_string(),
+                serde_json::Value::Array(
+                    attachments
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "pst_attachment_count".to_string(),
+                serde_json::json!(attachments.len()),
+            );
+        }
+    }
+    metadata
+}
+
+fn pst_message_error_metadata(
+    email_format: &str,
+    folder_path: &str,
+    source_path: &str,
+    node_id: u32,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "artifact_kind": "email_message",
+        "email_format": email_format,
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_status": "skipped",
+        "email_parser_error": reason,
+        "pst_message_node_id": format!("0x{node_id:08X}"),
+        "pst_folder_path": folder_path,
+        "pst_parser_scope": pst_parser_scope_text(),
+        "source_artifact_path": source_path,
+    })
+}
+
+fn pst_parser_scope_text() -> &'static str {
+    "Unicode PST/OST folder and message metadata, display recipients, plain-text body preview, and attachment names only; ANSI PST, HTML/RTF rendering, attachment content extraction, and PST deleted-item recovery are deferred"
+}
+
+fn pst_message_string(message: &dyn PstMessage, prop_id: u16) -> Option<String> {
+    message
+        .properties()
+        .get(prop_id)
+        .and_then(pst_property_string)
+}
+
+fn pst_message_i32(message: &dyn PstMessage, prop_id: u16) -> Option<i32> {
+    message.properties().get(prop_id).and_then(pst_property_i32)
+}
+
+fn pst_message_time(message: &dyn PstMessage, prop_id: u16) -> Option<String> {
+    message
+        .properties()
+        .get(prop_id)
+        .and_then(pst_property_time)
+        .and_then(pst_filetime_to_rfc3339)
+}
+
+fn pst_property_string(value: &PstPropertyValue) -> Option<String> {
+    let text = match value {
+        PstPropertyValue::String8(value) => value.to_string(),
+        PstPropertyValue::Unicode(value) => value.to_string(),
+        _ => return None,
+    };
+    let normalized = normalize_email_header_value(&text);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn pst_property_i32(value: &PstPropertyValue) -> Option<i32> {
+    match value {
+        PstPropertyValue::Integer16(value) => Some(i32::from(*value)),
+        PstPropertyValue::Integer32(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn pst_property_time(value: &PstPropertyValue) -> Option<i64> {
+    match value {
+        PstPropertyValue::Time(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn pst_filetime_to_rfc3339(filetime_100ns: i64) -> Option<String> {
+    const FILETIME_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
+    let unix_100ns = i128::from(filetime_100ns).checked_sub(FILETIME_TO_UNIX_EPOCH_100NS)?;
+    let seconds = unix_100ns.div_euclid(10_000_000);
+    let nanos = unix_100ns.rem_euclid(10_000_000) * 100;
+    let seconds = i64::try_from(seconds).ok()?;
+    DateTime::<Utc>::from_timestamp(seconds, nanos as u32).map(|value| value.to_rfc3339())
+}
+
+fn pst_message_recipients(message: &dyn PstMessage) -> PstRecipientLists {
+    let mut recipients = PstRecipientLists::default();
+    let Some(table) = message.recipient_table() else {
+        return recipients;
+    };
+    for row in table.rows_matrix() {
+        let recipient_type = pst_table_property(table.as_ref(), row, 0x0C15)
+            .as_ref()
+            .and_then(pst_property_i32)
+            .unwrap_or_default();
+        let name = pst_table_property(table.as_ref(), row, 0x3001)
+            .as_ref()
+            .and_then(pst_property_string);
+        let email = pst_table_property(table.as_ref(), row, 0x3003)
+            .as_ref()
+            .and_then(pst_property_string);
+        let Some(value) = pst_format_person(name, email) else {
+            continue;
+        };
+        match recipient_type {
+            1 => recipients.to.push(value),
+            2 => recipients.cc.push(value),
+            3 => recipients.bcc.push(value),
+            _ => {}
+        }
+    }
+    recipients
+}
+
+fn pst_attachment_names(message: &dyn PstMessage) -> Vec<String> {
+    let Some(table) = message.attachment_table() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for row in table.rows_matrix() {
+        let name = [0x3707, 0x3704, 0x3001]
+            .iter()
+            .find_map(|prop_id| {
+                pst_table_property(table.as_ref(), row, *prop_id)
+                    .as_ref()
+                    .and_then(pst_property_string)
+            })
+            .unwrap_or_else(|| format!("Attachment 0x{:08X}", u32::from(row.id())));
+        if seen.insert(name.to_ascii_lowercase()) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn pst_table_property(
+    table: &dyn PstTableContext,
+    row: &PstTableRowData,
+    prop_id: u16,
+) -> Option<PstPropertyValue> {
+    let context = table.context();
+    let index = context
+        .columns()
+        .iter()
+        .position(|column| column.prop_id() == prop_id)?;
+    let columns = row.columns(context).ok()?;
+    let value = columns.get(index)?.as_ref()?;
+    table
+        .read_column(value, context.columns()[index].prop_type())
+        .ok()
+}
+
+fn pst_format_person(name: Option<String>, email: Option<String>) -> Option<String> {
+    match (name, email) {
+        (Some(name), Some(email)) if !name.eq_ignore_ascii_case(&email) => {
+            Some(format!("{name} <{email}>"))
+        }
+        (Some(name), _) => Some(name),
+        (_, Some(email)) => Some(email),
+        _ => None,
+    }
+}
+
+fn join_email_values(values: Vec<String>) -> Option<String> {
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
 struct ParsedEmail {
     from: Option<String>,
     to: Option<String>,
@@ -6705,12 +12372,720 @@ fn email_body_preview(body_text: &str) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+#[derive(Debug)]
+struct ChromeCacheImportEntry {
+    logical_path: String,
+    display_name: String,
+    entry_kind: &'static str,
+    size_bytes: Option<i64>,
+    metadata: serde_json::Value,
+    content_head: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ChromeCacheImportData {
+    entries: Vec<ChromeCacheImportEntry>,
+    cache_entries_indexed: usize,
+    cache_entries_seen: usize,
+    parser_errors: Vec<String>,
+    truncated: bool,
+    root_logical_path: String,
+}
+
+#[derive(Debug)]
+struct ChromeCacheParsedEntry {
+    entry_index: usize,
+    cache_key: String,
+    hash: u32,
+    state: String,
+    reuse_count: i32,
+    refetch_count: i32,
+    creation_time_utc: Option<String>,
+    stream_sizes: [usize; 4],
+    header_bytes: Vec<u8>,
+    body_stream_index: Option<usize>,
+    body_size: Option<usize>,
+    body_head: Option<Vec<u8>>,
+    stream_errors: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ChromeCacheHttpMetadata {
+    status_line: Option<String>,
+    status_code: Option<i64>,
+    headers: BTreeMap<String, String>,
+}
+
+fn chrome_cache_effective_max_entries(max_entries: usize) -> usize {
+    if max_entries == 0 || max_entries == usize::MAX {
+        CHROME_CACHE_DEFAULT_MAX_ENTRIES
+    } else {
+        max_entries
+    }
+}
+
+fn has_chromium_blockfile_cache_layout(path: &Path) -> bool {
+    path.join("index").is_file()
+        && (0..=3).any(|index| path.join(format!("data_{index}")).is_file())
+}
+
+fn process_chromium_blockfile_cache_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    max_entries: usize,
+) -> Result<(usize, bool)> {
+    let path = PathBuf::from(&evidence.source_path);
+    if !path.is_dir() {
+        bail!(
+            "Chrome cache evidence path is no longer a directory: {}",
+            path.display()
+        );
+    }
+    let max_entries = chrome_cache_effective_max_entries(max_entries);
+    match collect_chromium_blockfile_cache_import(&path, &evidence.display_name, max_entries) {
+        Ok(import_data) => {
+            persist_chromium_blockfile_cache_import(conn, case_id, evidence, job_id, import_data)
+        }
+        Err(err) => persist_unsupported_chromium_blockfile_cache_status(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            &format!(
+                "Chrome blockfile cache was detected, but the parser could not read it: {err}"
+            ),
+        ),
+    }
+}
+
+fn persist_unsupported_chromium_blockfile_cache_status(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    reason: &str,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    let logical_path = chrome_cache_root_logical_path(&evidence.display_name);
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "browser_cache_store",
+        "browser_family": "chromium",
+        "browser_cache_format": "blockfile",
+        "browser_cache_parser": CHROME_CACHE_PARSER_NAME,
+        "browser_cache_parser_status": "unsupported",
+        "browser_cache_parser_error": reason,
+        "browser_cache_parser_scope": chrome_cache_parser_scope_text(),
+        "source_artifact": "Chrome Cache",
+        "source_artifact_path": evidence.source_path,
+    });
+    add_entry_category(
+        &mut metadata,
+        &logical_path,
+        &evidence.display_name,
+        "directory",
+    );
+    upsert_filesystem_entry(
+        conn,
+        case_id,
+        evidence.id,
+        &logical_path,
+        &evidence.display_name,
+        "directory",
+        None,
+        &metadata.to_string(),
+        job_id,
+    )?;
+    Ok((1, false))
+}
+
+fn persist_chromium_blockfile_cache_import(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    mut import_data: ChromeCacheImportData,
+) -> Result<(usize, bool)> {
+    conn.execute(
+        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+    )?;
+    if let Some(root) = import_data
+        .entries
+        .iter_mut()
+        .find(|entry| entry.logical_path == import_data.root_logical_path)
+    {
+        if let Some(object) = root.metadata.as_object_mut() {
+            object.insert(
+                "browser_cache_entries_indexed".to_string(),
+                serde_json::json!(import_data.cache_entries_indexed),
+            );
+            object.insert(
+                "browser_cache_entries_seen".to_string(),
+                serde_json::json!(import_data.cache_entries_seen),
+            );
+            object.insert(
+                "browser_cache_truncated".to_string(),
+                serde_json::json!(import_data.truncated),
+            );
+            if !import_data.parser_errors.is_empty() {
+                object.insert(
+                    "browser_cache_parser_errors".to_string(),
+                    serde_json::json!(import_data.parser_errors),
+                );
+            }
+        }
+    }
+    let entries_indexed = import_data.entries.len();
+    for entry in import_data.entries {
+        upsert_filesystem_entry_with_content(
+            conn,
+            case_id,
+            evidence.id,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+            entry.size_bytes,
+            &entry.metadata.to_string(),
+            job_id,
+            entry.content_head.as_deref(),
+        )?;
+    }
+    Ok((entries_indexed, import_data.truncated))
+}
+
+fn collect_chromium_blockfile_cache_import(
+    path: &Path,
+    display_name: &str,
+    max_entries: usize,
+) -> Result<ChromeCacheImportData> {
+    let root_logical_path = chrome_cache_root_logical_path(display_name);
+    let mut collector = ChromeCacheImportCollector {
+        entries: Vec::new(),
+        cache_entries_indexed: 0,
+        cache_entries_seen: 0,
+        parser_errors: Vec::new(),
+        truncated: false,
+        max_entries,
+        root_logical_path: root_logical_path.clone(),
+        source_path: path.to_string_lossy().into_owned(),
+        cache_display_name: display_name.to_string(),
+        used_paths: HashSet::new(),
+    };
+    collector.push_cache_root()?;
+    if !collector.truncated {
+        // chrome-cache-parser 0.2.5 is not defensive against malformed/corrupt index files: a
+        // bogus `table_len` in the index header causes an out-of-range slice index PANIC inside
+        // the crate's own `addresses()` (verified: `range end index 368 out of range for slice of
+        // length 27` against a hand-crafted garbage index). Forensic input is inherently
+        // untrusted - a truncated/corrupted real Cache directory is common, not an edge case -
+        // so a third-party parser panic here must not be allowed to take down the whole process.
+        // catch_unwind converts it into the same graceful "unsupported" fallback used for every
+        // other parser error in this codebase.
+        // Deliberately NOT touching the global panic hook here to silence the printed
+        // backtrace (std::panic::set_hook/take_hook are process-wide, and this server spawns a
+        // real OS thread per request - crates/kdft-ui/src/main.rs uses std::thread::spawn - so
+        // swapping the hook around this call would race with a panic on any OTHER concurrently
+        // handled request). The stderr backtrace this produces on a malformed cache is noisy but
+        // harmless; catch_unwind below is what actually matters for correctness/safety.
+        let walk_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                let cache = ChromeCache::from_path(path.to_path_buf()).with_context(|| {
+                    format!("opening Chrome blockfile cache {}", path.display())
+                })?;
+                let entries = cache
+                    .entries()
+                    .with_context(|| format!("reading Chrome cache index {}", path.display()))?;
+                for (entry_index, lazy_entry) in entries.enumerate() {
+                    if collector.truncated {
+                        break;
+                    }
+                    collector.cache_entries_seen = collector.cache_entries_seen.saturating_add(1);
+                    match parse_chromium_blockfile_cache_entry(entry_index, lazy_entry) {
+                        Ok(parsed) => collector.push_cache_entry(parsed)?,
+                        Err(err) => {
+                            collector.note_parser_error(format!("entry {entry_index}: {err}"))
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        match walk_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(panic_payload) => {
+                bail!(
+                    "Chrome cache parser panicked while reading the cache index/entries: {}",
+                    chrome_cache_panic_message(&panic_payload)
+                );
+            }
+        }
+    }
+    Ok(ChromeCacheImportData {
+        entries: collector.entries,
+        cache_entries_indexed: collector.cache_entries_indexed,
+        cache_entries_seen: collector.cache_entries_seen,
+        parser_errors: collector.parser_errors,
+        truncated: collector.truncated,
+        root_logical_path,
+    })
+}
+
+fn chrome_cache_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic (no string payload)".to_string()
+    }
+}
+
+struct ChromeCacheImportCollector {
+    entries: Vec<ChromeCacheImportEntry>,
+    cache_entries_indexed: usize,
+    cache_entries_seen: usize,
+    parser_errors: Vec<String>,
+    truncated: bool,
+    max_entries: usize,
+    root_logical_path: String,
+    source_path: String,
+    cache_display_name: String,
+    used_paths: HashSet<String>,
+}
+
+impl ChromeCacheImportCollector {
+    fn should_stop_before_push(&mut self) -> bool {
+        if self.entries.len() >= self.max_entries {
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn note_parser_error(&mut self, error: String) {
+        if self.parser_errors.len() < CHROME_CACHE_PARSER_ERROR_LIMIT {
+            self.parser_errors.push(error);
+        }
+    }
+
+    fn push_cache_root(&mut self) -> Result<()> {
+        if self.should_stop_before_push() {
+            return Ok(());
+        }
+        self.used_paths.insert(self.root_logical_path.clone());
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_cache_store",
+            "browser_family": "chromium",
+            "browser_cache_format": "blockfile",
+            "browser_cache_parser": CHROME_CACHE_PARSER_NAME,
+            "browser_cache_parser_status": "parsed",
+            "browser_cache_parser_scope": chrome_cache_parser_scope_text(),
+            "browser_cache_deleted_recovery": "not attempted",
+            "browser_cache_body_decompression": "not attempted",
+            "source_artifact": "Chrome Cache",
+            "source_artifact_path": self.source_path.as_str(),
+        });
+        add_entry_category(
+            &mut metadata,
+            &self.root_logical_path,
+            &self.cache_display_name,
+            "directory",
+        );
+        self.entries.push(ChromeCacheImportEntry {
+            logical_path: self.root_logical_path.clone(),
+            display_name: self.cache_display_name.clone(),
+            entry_kind: "directory",
+            size_bytes: None,
+            metadata,
+            content_head: None,
+        });
+        Ok(())
+    }
+
+    fn push_cache_entry(&mut self, parsed: ChromeCacheParsedEntry) -> Result<()> {
+        if self.should_stop_before_push() {
+            return Ok(());
+        }
+        let key = parsed.cache_key.trim();
+        let url = (!key.is_empty()).then(|| key.to_string());
+        let host = url
+            .as_deref()
+            .map(host_from_url)
+            .unwrap_or_else(|| "unknown-host".to_string());
+        let display_name = url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Chrome cache entry")
+            .chars()
+            .take(180)
+            .collect::<String>();
+        let hash_hex = format!("0x{:08X}", parsed.hash);
+        let logical_path = chrome_cache_entry_logical_path(
+            &self.root_logical_path,
+            &host,
+            &hash_hex,
+            parsed.entry_index,
+            &mut self.used_paths,
+        );
+        let http = parse_chrome_cache_http_metadata(&parsed.header_bytes);
+        let content_type = chrome_cache_header_value(&http.headers, "content-type");
+        let last_modified = chrome_cache_header_value(&http.headers, "last-modified");
+        let expires = chrome_cache_header_value(&http.headers, "expires");
+        let cache_control = chrome_cache_header_value(&http.headers, "cache-control");
+        let content_encoding = chrome_cache_header_value(&http.headers, "content-encoding");
+        let search_text = format!("{} {}", key, host);
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_cache_entry",
+            "browser_family": "chromium",
+            "browser_cache_format": "blockfile",
+            "browser_cache_parser": CHROME_CACHE_PARSER_NAME,
+            "browser_cache_parser_status": "parsed",
+            "browser_cache_parser_scope": chrome_cache_parser_scope_text(),
+            "browser_cache_deleted_recovery": "not attempted",
+            "browser_cache_body_decompression": "not attempted",
+            "cache_key": url.clone(),
+            "url": url,
+            "host": host,
+            "cache_entry_index": parsed.entry_index,
+            "cache_entry_hash": hash_hex,
+            "cache_entry_state": parsed.state,
+            "cache_reuse_count": parsed.reuse_count,
+            "cache_refetch_count": parsed.refetch_count,
+            "cache_stream_sizes": parsed.stream_sizes,
+            "cache_header_stream_size": parsed.stream_sizes[0],
+            "cache_body_stream_index": parsed.body_stream_index,
+            "cache_body_size_bytes": parsed.body_size,
+            "created_utc": parsed.creation_time_utc.clone(),
+            "creation_utc": parsed.creation_time_utc,
+            "http_status_line": http.status_line,
+            "http_status_code": http.status_code,
+            "http_headers": http.headers,
+            "content_type": content_type,
+            "content_encoding": content_encoding,
+            "last_modified": last_modified,
+            "expires": expires,
+            "cache_control": cache_control,
+            "source_artifact": "Chrome Cache",
+            "source_artifact_path": self.source_path.as_str(),
+            "search_text": search_text,
+        });
+        if !parsed.stream_errors.is_empty() {
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "browser_cache_stream_errors".to_string(),
+                    serde_json::json!(parsed.stream_errors),
+                );
+            }
+        }
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        self.entries.push(ChromeCacheImportEntry {
+            logical_path,
+            display_name,
+            entry_kind: "record",
+            size_bytes: parsed.body_size.and_then(|size| i64::try_from(size).ok()),
+            metadata,
+            content_head: parsed.body_head,
+        });
+        self.cache_entries_indexed += 1;
+        Ok(())
+    }
+}
+
+fn parse_chromium_blockfile_cache_entry(
+    entry_index: usize,
+    lazy_entry: LazyBlockFileCacheEntry,
+) -> Result<ChromeCacheParsedEntry> {
+    let (cache_key, hash, state, reuse_count, refetch_count, creation_time_utc, stream_sizes) = {
+        let entry = lazy_entry.get().context("reading blockfile cache entry")?;
+        (
+            entry.key.to_string(),
+            entry.hash,
+            chrome_cache_entry_state_label(entry.state.kind()).to_string(),
+            entry.reuse_count,
+            entry.refetch_count,
+            entry
+                .creation_time
+                .into_datetime_utc()
+                .ok()
+                .map(|value| value.to_rfc3339()),
+            entry
+                .data_size
+                .map(|size| usize::try_from(size.max(0)).unwrap_or(0)),
+        )
+    };
+    let stream_readers = lazy_entry
+        .stream_readers()
+        .context("opening Chrome cache entry streams")?;
+    let mut header_bytes = Vec::new();
+    let mut body_stream_index = None;
+    let mut body_size = None;
+    let mut body_head = None;
+    let mut stream_errors = Vec::new();
+    for (stream_index, reader_result) in stream_readers.into_iter().enumerate() {
+        let Some(&stream_size) = stream_sizes.get(stream_index) else {
+            continue;
+        };
+        if stream_size == 0 {
+            continue;
+        }
+        let reader = match reader_result {
+            Ok(reader) => reader,
+            Err(err) => {
+                if stream_errors.len() < CHROME_CACHE_PARSER_ERROR_LIMIT {
+                    stream_errors.push(format!("stream {stream_index}: {err}"));
+                }
+                continue;
+            }
+        };
+        if stream_index == 0 {
+            header_bytes = read_chrome_cache_stream_prefix(
+                reader,
+                stream_size,
+                CHROME_CACHE_HEADER_PARSE_BYTES,
+            )
+            .with_context(|| format!("reading Chrome cache header stream {entry_index}"))?;
+        } else if body_stream_index.is_none() {
+            let head = read_chrome_cache_stream_prefix(reader, stream_size, CONTENT_INDEX_BYTES)
+                .with_context(|| format!("reading Chrome cache body stream {entry_index}"))?;
+            body_stream_index = Some(stream_index);
+            body_size = Some(stream_size);
+            body_head = Some(head);
+        }
+    }
+    Ok(ChromeCacheParsedEntry {
+        entry_index,
+        cache_key,
+        hash,
+        state,
+        reuse_count,
+        refetch_count,
+        creation_time_utc,
+        stream_sizes,
+        header_bytes,
+        body_stream_index,
+        body_size,
+        body_head,
+        stream_errors,
+    })
+}
+
+fn read_chrome_cache_stream_prefix(
+    reader: Box<dyn Read>,
+    stream_size: usize,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(stream_size.min(limit) as u64)
+        .read_to_end(&mut bytes)
+        .context("reading Chrome cache stream")?;
+    Ok(bytes)
+}
+
+fn read_chrome_cache_entry_body_bytes(
+    entry: &EntryForBytes,
+    offset: u64,
+    length: usize,
+) -> Result<Option<EntryBytes>> {
+    if entry.metadata_json["artifact_kind"].as_str() != Some("browser_cache_entry")
+        || entry.metadata_json["browser_cache_format"].as_str() != Some("blockfile")
+    {
+        return Ok(None);
+    }
+    let Some(entry_index) = entry.metadata_json["cache_entry_index"].as_u64() else {
+        return Ok(None);
+    };
+    let Some(stream_index) = entry.metadata_json["cache_body_stream_index"].as_u64() else {
+        return Ok(None);
+    };
+    let cache_path = Path::new(&entry.source_path);
+    let cache = ChromeCache::from_path(cache_path.to_path_buf()).with_context(|| {
+        format!(
+            "opening Chrome blockfile cache for body read {}",
+            cache_path.display()
+        )
+    })?;
+    let mut entries = cache
+        .entries()
+        .with_context(|| format!("reading Chrome cache index {}", cache_path.display()))?;
+    let lazy_entry = entries
+        .nth(usize::try_from(entry_index).context("cache entry index exceeds usize")?)
+        .with_context(|| format!("Chrome cache entry {entry_index} is no longer available"))?;
+    let stream_readers = lazy_entry
+        .stream_readers()
+        .context("opening Chrome cache entry streams")?;
+    let reader = stream_readers
+        .into_iter()
+        .nth(usize::try_from(stream_index).context("cache stream index exceeds usize")?)
+        .with_context(|| format!("Chrome cache stream {stream_index} is not available"))?
+        .context("opening Chrome cache body stream")?;
+    let total_size = entry
+        .metadata_json
+        .get("cache_body_size_bytes")
+        .and_then(|value| value.as_u64())
+        .or_else(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
+        .unwrap_or(0);
+    let bytes = read_from_chrome_cache_stream(reader, offset, length, total_size)?;
+    let bytes_read = bytes.len();
+    Ok(Some(EntryBytes {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        logical_path: entry.logical_path.clone(),
+        offset,
+        requested_length: length,
+        bytes_read,
+        total_size,
+        eof: offset.saturating_add(bytes_read as u64) >= total_size,
+        bytes,
+    }))
+}
+
+fn read_from_chrome_cache_stream(
+    mut reader: Box<dyn Read>,
+    offset: u64,
+    length: usize,
+    total_size: u64,
+) -> Result<Vec<u8>> {
+    let mut remaining_skip = offset.min(total_size);
+    let mut skip_buffer = [0_u8; 8192];
+    while remaining_skip > 0 {
+        let want = usize::try_from(remaining_skip)
+            .unwrap_or(usize::MAX)
+            .min(skip_buffer.len());
+        let read = reader
+            .read(&mut skip_buffer[..want])
+            .context("skipping Chrome cache body bytes")?;
+        if read == 0 {
+            return Ok(Vec::new());
+        }
+        remaining_skip = remaining_skip.saturating_sub(read as u64);
+    }
+    let remaining = total_size.saturating_sub(offset.min(total_size));
+    let want = usize::try_from(remaining).unwrap_or(usize::MAX).min(length);
+    let mut bytes = Vec::new();
+    reader
+        .take(want as u64)
+        .read_to_end(&mut bytes)
+        .context("reading Chrome cache body bytes")?;
+    Ok(bytes)
+}
+
+fn parse_chrome_cache_http_metadata(header_bytes: &[u8]) -> ChromeCacheHttpMetadata {
+    let mut metadata = ChromeCacheHttpMetadata::default();
+    if header_bytes.is_empty() {
+        return metadata;
+    }
+    let text = String::from_utf8_lossy(header_bytes);
+    let start = text.find("HTTP/").unwrap_or(0);
+    let normalized = text[start..].replace('\0', "\n").replace('\r', "\n");
+    let mut saw_status = false;
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_matches(|ch: char| ch.is_control()).trim();
+        if line.is_empty() {
+            if saw_status {
+                break;
+            }
+            continue;
+        }
+        if line.starts_with("HTTP/") {
+            metadata.status_line = Some(line.chars().take(240).collect());
+            metadata.status_code = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<i64>().ok());
+            saw_status = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if !is_http_header_name(key) {
+            continue;
+        }
+        let value = normalize_email_header_value(value);
+        if value.is_empty() {
+            continue;
+        }
+        metadata
+            .headers
+            .entry(key.to_ascii_lowercase())
+            .and_modify(|existing| {
+                existing.push_str("; ");
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    metadata
+}
+
+fn is_http_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn chrome_cache_header_value(headers: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    headers
+        .get(&key.to_ascii_lowercase())
+        .map(|value| normalize_email_header_value(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn chrome_cache_entry_state_label(state: BlockCacheEntryState) -> &'static str {
+    match state {
+        BlockCacheEntryState::Normal => "normal",
+        BlockCacheEntryState::Evicted => "evicted",
+        BlockCacheEntryState::Doomed => "doomed",
+        BlockCacheEntryState::Unknown => "unknown",
+    }
+}
+
+fn chrome_cache_root_logical_path(display_name: &str) -> String {
+    format!("/Browser Cache/{}", sanitize_logical_segment(display_name))
+}
+
+fn chrome_cache_entry_logical_path(
+    root_logical_path: &str,
+    host: &str,
+    hash_hex: &str,
+    entry_index: usize,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    let host = sanitize_logical_segment(host);
+    let hash = sanitize_logical_segment(hash_hex);
+    let mut logical_path = format!("{root_logical_path}/{host}/{entry_index:08}-{hash}.record");
+    if used_paths.insert(logical_path.clone()) {
+        return logical_path;
+    }
+    let mut suffix = 1_usize;
+    loop {
+        logical_path =
+            format!("{root_logical_path}/{host}/{entry_index:08}-{hash}-{suffix}.record");
+        if used_paths.insert(logical_path.clone()) {
+            return logical_path;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn chrome_cache_parser_scope_text() -> &'static str {
+    "Chromium blockfile HTTP disk cache only: index plus data_N files parsed as one folder-level evidence unit when the evidence path is the Cache directory itself; Simple Cache, Code Cache, GPUCache, deleted/evicted recovery, full body decompression, and long out-of-band cache keys are deferred"
+}
+
 fn process_file_evidence(
     conn: &Connection,
     case_id: i64,
     evidence: &EvidenceForProcessing,
     job_id: i64,
-    _max_entries: usize,
+    max_entries: usize,
 ) -> Result<(usize, bool)> {
     let path = PathBuf::from(&evidence.source_path);
     let metadata = fs::metadata(&path)
@@ -6718,8 +13093,24 @@ fn process_file_evidence(
     if !metadata.is_file() {
         bail!("file evidence path is no longer a file: {}", path.display());
     }
+    if is_registry_hive_evidence_candidate(&path, &evidence.display_name) {
+        return process_registry_hive_evidence(conn, case_id, evidence, job_id, max_entries);
+    }
+    if is_evtx_evidence_candidate(&path, &evidence.display_name) {
+        return process_evtx_event_log_evidence(conn, case_id, evidence, job_id, max_entries);
+    }
+    if extension_lower(&evidence.display_name)
+        .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
+        .as_deref()
+        .is_some_and(is_pst_ost_extension)
+    {
+        return process_pst_mailbox_evidence(conn, case_id, evidence, job_id, max_entries);
+    }
     let logical_path = format!("/{}", evidence.display_name);
-    let mut metadata_value = serde_json::json!({});
+    let mut metadata_value = serde_json::json!({
+        "local_relative_path": evidence.display_name,
+        "source_path_exact": evidence.display_name,
+    });
     annotate_email_metadata_for_path(
         &mut metadata_value,
         &path,
@@ -6761,6 +13152,15 @@ fn process_folder_evidence(
         bail!(
             "folder evidence path is no longer a directory: {}",
             root.display()
+        );
+    }
+    if has_chromium_blockfile_cache_layout(&root) {
+        return process_chromium_blockfile_cache_evidence(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            max_entries,
         );
     }
 
@@ -6817,6 +13217,29 @@ fn process_folder_evidence(
                     &logical_path,
                     &name,
                     metadata.len(),
+                );
+            }
+            if let Some(object) = metadata_value.as_object_mut() {
+                let exact_relative = logical_path.trim_start_matches('/').to_string();
+                object.insert(
+                    "local_relative_path".to_string(),
+                    serde_json::json!(exact_relative),
+                );
+                object.insert(
+                    "source_path_exact".to_string(),
+                    serde_json::json!(exact_relative),
+                );
+                object.insert(
+                    "created_utc".to_string(),
+                    optional_system_time_json(metadata.created().ok()),
+                );
+                object.insert(
+                    "modified_utc".to_string(),
+                    optional_system_time_json(metadata.modified().ok()),
+                );
+                object.insert(
+                    "accessed_utc".to_string(),
+                    optional_system_time_json(metadata.accessed().ok()),
                 );
             }
             add_entry_category(&mut metadata_value, &logical_path, &name, entry_kind);
@@ -6955,18 +13378,37 @@ fn process_image_evidence(
                 );
                 let detected_filesystem =
                     detect_volume_filesystem_at(&mut *opened.reader, partition.start_offset)?;
-                let can_parse_fat = detected_filesystem == Some("FAT")
-                    || is_supported_fat_partition(
-                        partition.partition_type.as_deref(),
-                        partition.filesystem.as_deref(),
-                    );
-                let can_parse_ntfs = detected_filesystem == Some("NTFS")
-                    || is_supported_ntfs_partition(
-                        partition.partition_type.as_deref(),
-                        partition.filesystem.as_deref(),
-                    );
-                let can_parse_ext = detected_filesystem == Some("EXT");
-                let filesystem_parser = if can_parse_fat {
+                let bitlocker_locked = detected_filesystem == Some(BITLOCKER_LOCKED_FILESYSTEM);
+                let bitlocker_inspection = if bitlocker_locked {
+                    bitlocker_inspection_at(
+                        &mut *opened.reader,
+                        partition.start_offset,
+                        Some(partition.size_bytes),
+                    )?
+                } else {
+                    None
+                };
+                let filesystem_metadata = if bitlocker_locked {
+                    Some(BITLOCKER_LOCKED_FILESYSTEM)
+                } else {
+                    partition.filesystem.as_deref()
+                };
+                let can_parse_fat = !bitlocker_locked
+                    && (detected_filesystem == Some("FAT")
+                        || is_supported_fat_partition(
+                            partition.partition_type.as_deref(),
+                            partition.filesystem.as_deref(),
+                        ));
+                let can_parse_ntfs = !bitlocker_locked
+                    && (detected_filesystem == Some("NTFS")
+                        || is_supported_ntfs_partition(
+                            partition.partition_type.as_deref(),
+                            partition.filesystem.as_deref(),
+                        ));
+                let can_parse_ext = !bitlocker_locked && detected_filesystem == Some("EXT");
+                let filesystem_parser = if bitlocker_locked {
+                    "locked"
+                } else if can_parse_fat {
                     "fatfs"
                 } else if can_parse_ntfs {
                     "ntfs"
@@ -6975,7 +13417,9 @@ fn process_image_evidence(
                 } else {
                     "pending"
                 };
-                let filesystem_browsing_status = if can_parse_fat {
+                let filesystem_browsing_status = if bitlocker_locked {
+                    bitlocker_status_message(bitlocker_inspection.as_ref())
+                } else if can_parse_fat {
                     "FAT parser attempted; parsed entries appear under /Image Analysis/Volumes"
                 } else if can_parse_ntfs {
                     "NTFS parser attempted; parsed entries appear under /Image Analysis/Volumes"
@@ -6989,7 +13433,7 @@ fn process_image_evidence(
                 } else {
                     None
                 };
-                let metadata = serde_json::json!({
+                let mut metadata = serde_json::json!({
                     "artifact_kind": "disk_partition",
                     "container_format": opened.format,
                     "partition_scheme": scheme,
@@ -6997,7 +13441,8 @@ fn process_image_evidence(
                     "name": partition.name,
                     "label": partition.label,
                     "partition_type": partition.partition_type,
-                    "filesystem": partition.filesystem,
+                    "partition_reported_filesystem": partition.filesystem,
+                    "filesystem": filesystem_metadata,
                     "detected_filesystem": detected_filesystem,
                     "start_offset": partition.start_offset,
                     "size_bytes": partition.size_bytes,
@@ -7008,6 +13453,12 @@ fn process_image_evidence(
                     "filesystem_browsing_status": filesystem_browsing_status,
                     "volume_entry_prefix": volume_entry_prefix,
                 });
+                if bitlocker_locked {
+                    merge_json_object(
+                        &mut metadata,
+                        &bitlocker_metadata_value(bitlocker_inspection.as_ref()),
+                    );
+                }
                 insert_image_record(
                     conn,
                     case_id,
@@ -7417,12 +13868,59 @@ impl Seek for SplitRawReader {
 /// A browsable volume within a disk image, discovered without indexing.
 #[derive(Debug, Serialize)]
 pub struct LiveVolume {
+    /// Deprecated compatibility alias for `volume_index_zero_based`.
     pub index: usize,
+    pub volume_index_zero_based: usize,
+    /// Human partition number when this volume came from a partition table;
+    /// whole-image filesystems have no partition number.
+    pub partition_number_one_based: Option<usize>,
     pub name: String,
     pub filesystem: String,
     pub start_offset: u64,
     pub size_bytes: u64,
     pub browsable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitlocker: Option<LiveBitLockerInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveBitLockerInfo {
+    pub status: String,
+    pub metadata_state: String,
+    pub variant: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_method_raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decrypt_supported: Option<bool>,
+    pub can_unlock_with_recovery_key: bool,
+    pub can_unlock_with_password: bool,
+    pub tpm_only: bool,
+    pub protectors: Vec<LiveBitLockerProtector>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveBitLockerProtector {
+    pub raw: u16,
+    pub raw_hex: String,
+    pub kind: String,
+}
+
+pub enum BitLockerUnlockCredential<'a> {
+    RecoveryKey(&'a str),
+    Password(&'a str),
+}
+
+impl std::fmt::Debug for BitLockerUnlockCredential<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoveryKey(_) => {
+                f.write_str("BitLockerUnlockCredential::RecoveryKey(<redacted>)")
+            }
+            Self::Password(_) => f.write_str("BitLockerUnlockCredential::Password(<redacted>)"),
+        }
+    }
 }
 
 /// One entry returned while browsing a directory live from the image.
@@ -7466,6 +13964,17 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
         for partition in &layout.partitions {
             let filesystem = live_volume_filesystem(&mut *opened.reader, partition.start_offset)?;
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
+            let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+                bitlocker_inspection_at(
+                    &mut *opened.reader,
+                    partition.start_offset,
+                    Some(partition.size_bytes),
+                )?
+                .as_ref()
+                .map(live_bitlocker_info)
+            } else {
+                None
+            };
             let label = partition
                 .label
                 .as_deref()
@@ -7473,6 +13982,8 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
                 .unwrap_or(&partition.name);
             volumes.push(LiveVolume {
                 index: volumes.len(),
+                volume_index_zero_based: volumes.len(),
+                partition_number_one_based: Some(volumes.len() + 1),
                 name: format!(
                     "{:03}-{}",
                     volumes.len() + 1,
@@ -7482,6 +13993,7 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
                 start_offset: partition.start_offset,
                 size_bytes: partition.size_bytes,
                 browsable,
+                bitlocker,
             });
         }
     }
@@ -7489,13 +14001,23 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
         let filesystem = live_volume_filesystem(&mut *opened.reader, 0)?;
         if filesystem != "unknown" {
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
+            let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+                bitlocker_inspection_at(&mut *opened.reader, 0, Some(opened.decoded_size))?
+                    .as_ref()
+                    .map(live_bitlocker_info)
+            } else {
+                None
+            };
             volumes.push(LiveVolume {
                 index: 0,
+                volume_index_zero_based: 0,
+                partition_number_one_based: None,
                 name: "whole-image".to_string(),
                 filesystem,
                 start_offset: 0,
                 size_bytes: opened.decoded_size,
                 browsable,
+                bitlocker,
             });
         }
     }
@@ -7513,6 +14035,96 @@ fn live_volume_filesystem(
         return Ok("BTRFS".to_string());
     }
     Ok("unknown".to_string())
+}
+
+fn bitlocker_inspection_at(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    start_offset: u64,
+    size_bytes: Option<u64>,
+) -> Result<Option<bitlocker_decrypt::BitLockerInspection>> {
+    let len = size_bytes.unwrap_or_else(|| u64::MAX.saturating_sub(start_offset));
+    let mut slice = PartitionSlice::new(reader, start_offset, len);
+    bitlocker_decrypt::inspect_reader(&mut slice).context("inspecting BitLocker FVE metadata")
+}
+
+fn live_bitlocker_info(inspection: &bitlocker_decrypt::BitLockerInspection) -> LiveBitLockerInfo {
+    let encryption_method = inspection
+        .encryption_method
+        .map(|method| method.description);
+    LiveBitLockerInfo {
+        status: inspection.status_message().to_string(),
+        metadata_state: bitlocker_metadata_state_label(inspection.metadata_state).to_string(),
+        variant: bitlocker_variant_label(inspection.variant).to_string(),
+        encryption_method: encryption_method.map(str::to_string),
+        encryption_method_raw: inspection
+            .encryption_method
+            .map(|method| format!("0x{:04x}", method.raw)),
+        decrypt_supported: inspection
+            .encryption_method
+            .map(|method| method.decrypt_supported),
+        can_unlock_with_recovery_key: inspection.can_unlock_with_recovery_key(),
+        can_unlock_with_password: inspection.can_unlock_with_password(),
+        tpm_only: inspection.is_tpm_only(),
+        protectors: inspection
+            .protectors
+            .iter()
+            .map(|protector| LiveBitLockerProtector {
+                raw: protector.raw,
+                raw_hex: format!("0x{:04x}", protector.raw),
+                kind: protector.kind.label().to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn bitlocker_status_message(
+    inspection: Option<&bitlocker_decrypt::BitLockerInspection>,
+) -> &'static str {
+    inspection
+        .map(bitlocker_decrypt::BitLockerInspection::status_message)
+        .unwrap_or(BITLOCKER_LOCKED_STATUS)
+}
+
+fn bitlocker_metadata_value(
+    inspection: Option<&bitlocker_decrypt::BitLockerInspection>,
+) -> serde_json::Value {
+    let bitlocker = inspection
+        .map(live_bitlocker_info)
+        .and_then(|info| serde_json::to_value(info).ok())
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "bitlocker": bitlocker,
+        "bitlocker_credential_storage": "not persisted; recovery key/password must be supplied per decrypt session",
+    })
+}
+
+fn bitlocker_metadata_state_label(
+    state: bitlocker_decrypt::BitLockerMetadataState,
+) -> &'static str {
+    match state {
+        bitlocker_decrypt::BitLockerMetadataState::Parsed => "parsed",
+        bitlocker_decrypt::BitLockerMetadataState::HeaderOnly => "header-only",
+    }
+}
+
+fn bitlocker_variant_label(variant: bitlocker_decrypt::BitLockerVariant) -> &'static str {
+    match variant {
+        bitlocker_decrypt::BitLockerVariant::WindowsVista => "Windows Vista",
+        bitlocker_decrypt::BitLockerVariant::Windows7OrLater => "Windows 7 or later",
+        bitlocker_decrypt::BitLockerVariant::BitLockerToGo => "BitLocker To Go",
+    }
+}
+
+fn sort_live_entries(entries: &mut [LiveEntry]) {
+    entries.sort_by(|left, right| {
+        (right.is_dir as u8)
+            .cmp(&(left.is_dir as u8))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
 }
 
 /// Lists the immediate children of one directory in one volume, read live from
@@ -7535,16 +14147,90 @@ pub fn list_image_directory(
         "EXT" => list_ext_directory(image_path, volume.start_offset, relative)?,
         other => bail!("live browsing is not supported for {other} volumes"),
     };
-    entries.sort_by(|left, right| {
-        (right.is_dir as u8)
-            .cmp(&(left.is_dir as u8))
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-    });
+    sort_live_entries(&mut entries);
     Ok(entries)
+}
+
+pub fn list_bitlocker_ntfs_directory(
+    image_path: &Path,
+    volume_index: usize,
+    credential: BitLockerUnlockCredential<'_>,
+    dir_path: &str,
+) -> Result<Vec<LiveEntry>> {
+    let volumes = list_image_volumes(image_path)?;
+    let volume = volumes
+        .get(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    ensure_bitlocker_locked_volume(volume)?;
+    let relative = dir_path.trim_matches('/');
+
+    let mut opened = open_disk_image(image_path)?;
+    let slice = PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+    let mut decrypted = bitlocker_decrypt::unlock_reader(slice, bitlocker_credential(credential)?)
+        .with_context(|| {
+            format!(
+                "unlocking BitLocker volume {} at offset {}",
+                volume.name, volume.start_offset
+            )
+        })?;
+    let mut entries = list_ntfs_directory_from_reader(&mut decrypted, relative, None)
+        .context("browsing decrypted BitLocker NTFS volume")?;
+    sort_live_entries(&mut entries);
+    Ok(entries)
+}
+
+pub fn read_bitlocker_ntfs_file_bytes(
+    image_path: &Path,
+    volume_index: usize,
+    credential: BitLockerUnlockCredential<'_>,
+    file_path: &str,
+    offset: u64,
+    length: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let length = length.min(LIVE_BYTES_MAX_LEN);
+    let volumes = list_image_volumes(image_path)?;
+    let volume = volumes
+        .get(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    ensure_bitlocker_locked_volume(volume)?;
+    let relative = file_path.trim_matches('/');
+
+    let mut opened = open_disk_image(image_path)?;
+    let slice = PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+    let mut decrypted = bitlocker_decrypt::unlock_reader(slice, bitlocker_credential(credential)?)
+        .with_context(|| {
+            format!(
+                "unlocking BitLocker volume {} at offset {}",
+                volume.name, volume.start_offset
+            )
+        })?;
+    read_ntfs_path_bytes_from_reader(&mut decrypted, relative, offset, length)
+        .context("reading decrypted BitLocker NTFS file")
+}
+
+fn ensure_bitlocker_locked_volume(volume: &LiveVolume) -> Result<()> {
+    if volume.filesystem != BITLOCKER_LOCKED_FILESYSTEM {
+        bail!(
+            "volume {} is {}, not a locked BitLocker volume",
+            volume.index,
+            volume.filesystem
+        );
+    }
+    Ok(())
+}
+
+fn bitlocker_credential(
+    credential: BitLockerUnlockCredential<'_>,
+) -> Result<bitlocker_decrypt::BitLockerCredential> {
+    match credential {
+        BitLockerUnlockCredential::RecoveryKey(recovery_key) => {
+            bitlocker_decrypt::BitLockerCredential::recovery_key(recovery_key)
+                .context("validating BitLocker recovery key")
+        }
+        BitLockerUnlockCredential::Password(password) => {
+            Ok(bitlocker_decrypt::BitLockerCredential::password(password))
+        }
+    }
 }
 
 fn list_ntfs_directory(
@@ -7555,21 +14241,28 @@ fn list_ntfs_directory(
 ) -> Result<Vec<LiveEntry>> {
     let mut opened = open_disk_image(image_path)?;
     let mut slice = PartitionSlice::new(&mut *opened.reader, start_offset, size_bytes);
-    let ntfs = ntfs::Ntfs::new(&mut slice)
-        .with_context(|| format!("opening NTFS volume at offset {start_offset}"))?;
+    list_ntfs_directory_from_reader(&mut slice, relative, Some(start_offset))
+}
+
+fn list_ntfs_directory_from_reader<T: Read + Seek>(
+    fs: &mut T,
+    relative: &str,
+    physical_base: Option<u64>,
+) -> Result<Vec<LiveEntry>> {
+    let ntfs = ntfs::Ntfs::new(fs).context("opening NTFS volume")?;
     let mut record = ntfs
-        .root_directory(&mut slice)
+        .root_directory(fs)
         .context("opening NTFS root directory")?
         .file_record_number();
     for component in relative.split('/').filter(|value| !value.is_empty()) {
-        let children = collect_ntfs_dir_children(&ntfs, &mut slice, record)?;
+        let children = collect_ntfs_dir_children(&ntfs, fs, record)?;
         let child = children
             .iter()
             .find(|child| child.is_directory && child.name.eq_ignore_ascii_case(component))
             .with_context(|| format!("directory not found: {component}"))?;
         record = child.file_record_number;
     }
-    let children = collect_ntfs_dir_children(&ntfs, &mut slice, record)?;
+    let children = collect_ntfs_dir_children(&ntfs, fs, record)?;
     Ok(children
         .into_iter()
         .map(|child| LiveEntry {
@@ -7578,15 +14271,16 @@ fn list_ntfs_directory(
                 &ntfs,
                 child.file_record_number,
             ),
-            mft_record_physical_offset: ntfs_mft_record_logical_offset(
-                &ntfs,
-                child.file_record_number,
-            )
-            .map(|offset| start_offset.saturating_add(offset)),
+            mft_record_physical_offset: physical_base.and_then(|base| {
+                ntfs_mft_record_logical_offset(&ntfs, child.file_record_number)
+                    .map(|offset| base.saturating_add(offset))
+            }),
             file_data_logical_offset: child.file_data_logical_offset,
-            file_data_physical_offset: child
-                .file_data_logical_offset
-                .map(|offset| start_offset.saturating_add(offset)),
+            file_data_physical_offset: physical_base.and_then(|base| {
+                child
+                    .file_data_logical_offset
+                    .map(|offset| base.saturating_add(offset))
+            }),
             ntfs_mft_record_modification_time_utc: child
                 .standard_mft_record_modification_time_utc
                 .or(child.mft_record_modification_time_utc),
@@ -7605,6 +14299,59 @@ fn list_ntfs_directory(
             symlink: false,
         })
         .collect())
+}
+
+fn read_ntfs_path_bytes_from_reader<T: Read + Seek>(
+    fs: &mut T,
+    relative: &str,
+    offset: u64,
+    length: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let ntfs = ntfs::Ntfs::new(&mut *fs).context("opening NTFS volume")?;
+    let target = ntfs_file_child_for_relative_path(&ntfs, fs, relative)?;
+    if target.is_directory {
+        bail!("NTFS path is a directory, not a readable file: {relative}");
+    }
+    let total = target.size_bytes;
+    let read_end = offset.saturating_add(length as u64);
+    let read_len = usize::try_from(read_end).unwrap_or(usize::MAX);
+    let bytes = read_ntfs_file_record_bytes(&ntfs, fs, target.file_record_number, read_len)?;
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let end = start.saturating_add(length).min(bytes.len());
+    Ok((bytes[start..end].to_vec(), total))
+}
+
+fn ntfs_file_child_for_relative_path<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    relative: &str,
+) -> Result<NtfsDirChild> {
+    let mut record = ntfs
+        .root_directory(fs)
+        .context("opening NTFS root directory")?
+        .file_record_number();
+    let components: Vec<&str> = relative
+        .split('/')
+        .filter(|value| !value.is_empty())
+        .collect();
+    let Some((file_name, dir_components)) = components.split_last() else {
+        bail!("no file path given");
+    };
+    for component in dir_components {
+        let children = collect_ntfs_dir_children(ntfs, fs, record)?;
+        let child = children
+            .iter()
+            .find(|child| child.is_directory && child.name.eq_ignore_ascii_case(component))
+            .with_context(|| format!("directory not found: {component}"))?;
+        record = child.file_record_number;
+    }
+    let children = collect_ntfs_dir_children(ntfs, fs, record)?;
+    children
+        .into_iter()
+        .find(|child| child.name.eq_ignore_ascii_case(file_name))
+        .with_context(|| format!("file not found: {file_name}"))
 }
 
 fn list_fat_directory(
@@ -7658,15 +14405,22 @@ fn fat_datetime_iso(value: fatfs::DateTime) -> Option<String> {
     if value.date.year == 0 {
         return None;
     }
-    Some(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+    let base = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         value.date.year,
         value.date.month,
         value.date.day,
         value.time.hour,
         value.time.min,
         value.time.sec
-    ))
+    );
+    // FAT creation times carry 10ms-resolution fractions; keep them rather
+    // than silently rounding examiner-facing timestamps to whole seconds.
+    Some(if value.time.millis != 0 {
+        format!("{base}.{:03}Z", value.time.millis)
+    } else {
+        format!("{base}Z")
+    })
 }
 
 fn fat_date_iso(value: fatfs::Date) -> Option<String> {
@@ -7684,47 +14438,30 @@ fn list_ext_directory(
     start_offset: u64,
     relative: &str,
 ) -> Result<Vec<LiveEntry>> {
-    let opened = open_disk_image(image_path)?;
-    let reader = Ext4ImageReader {
-        reader: opened.reader,
-        partition_start: start_offset,
-    };
-    let fs = ext4_view::Ext4::load(Box::new(reader))
-        .map_err(|err| anyhow!("opening ext volume at offset {start_offset}: {err}"))?;
+    let fs = open_ext4_superblock(image_path, start_offset)?;
     let path = if relative.is_empty() {
         "/".to_string()
     } else {
         format!("/{relative}")
     };
-    let read_dir = fs
-        .read_dir(path.as_str())
-        .map_err(|err| anyhow!("reading ext directory {path}: {err}"))?;
-    let mut entries = Vec::new();
-    for entry in read_dir {
-        let entry = entry.map_err(|err| anyhow!("reading ext directory entry: {err}"))?;
-        let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let size_bytes = entry
-            .metadata()
-            .ok()
-            .map(|meta| i64::try_from(meta.len()).unwrap_or(i64::MAX));
+    let children = ext4_list_dir(&fs, &path)?;
+    let mut entries = Vec::with_capacity(children.len());
+    for child in children {
+        let size_bytes = i64::try_from(child.size).unwrap_or(i64::MAX);
         entries.push(LiveEntry {
-            name,
-            is_dir,
-            size_bytes: if is_dir { None } else { size_bytes },
-            created_utc: None,
-            modified_utc: None,
-            accessed_utc: None,
+            name: child.name,
+            is_dir: child.is_dir,
+            size_bytes: if child.is_dir { None } else { Some(size_bytes) },
+            created_utc: child.btime_utc.or(child.ctime_utc),
+            modified_utc: child.mtime_utc,
+            accessed_utc: child.atime_utc,
             ntfs_file_record_number: None,
             mft_record_logical_offset: None,
             mft_record_physical_offset: None,
             file_data_logical_offset: None,
             file_data_physical_offset: None,
             ntfs_mft_record_modification_time_utc: None,
-            symlink: false,
+            symlink: child.is_symlink,
         });
     }
     Ok(entries)
@@ -7904,6 +14641,42 @@ fn system_time_rfc3339(value: Option<std::time::SystemTime>) -> Option<String> {
     value.map(|time| DateTime::<Utc>::from(time).to_rfc3339())
 }
 
+/// Converts a `fatfs` DOS date (no time component - FAT last-accessed dates
+/// are date-only) to RFC 3339. A DOS date of zero decodes to an invalid
+/// calendar date (month/day 0), which `NaiveDate::from_ymd_opt` correctly
+/// rejects, so "unset" naturally becomes `None` with no extra sentinel check.
+fn fatfs_date_to_rfc3339(date: &fatfs::Date) -> Option<String> {
+    chrono::NaiveDate::from_ymd_opt(
+        i32::from(date.year),
+        u32::from(date.month),
+        u32::from(date.day),
+    )
+    .map(|naive| {
+        DateTime::<Utc>::from_naive_utc_and_offset(naive.and_time(chrono::NaiveTime::MIN), Utc)
+            .to_rfc3339()
+    })
+}
+
+/// Converts a `fatfs` DOS date+time to RFC 3339. Same zero-date handling as
+/// `fatfs_date_to_rfc3339`.
+fn fatfs_datetime_to_rfc3339(value: &fatfs::DateTime) -> Option<String> {
+    let naive_date = chrono::NaiveDate::from_ymd_opt(
+        i32::from(value.date.year),
+        u32::from(value.date.month),
+        u32::from(value.date.day),
+    )?;
+    let naive_time = chrono::NaiveTime::from_hms_milli_opt(
+        u32::from(value.time.hour),
+        u32::from(value.time.min),
+        u32::from(value.time.sec),
+        u32::from(value.time.millis),
+    )?;
+    Some(
+        DateTime::<Utc>::from_naive_utc_and_offset(naive_date.and_time(naive_time), Utc)
+            .to_rfc3339(),
+    )
+}
+
 fn local_live_entry(name: String, metadata: fs::Metadata) -> Result<LiveEntry> {
     let file_type = metadata.file_type();
     let symlink = file_type.is_symlink();
@@ -8018,16 +14791,8 @@ pub fn read_image_directory_bytes(
     let relative = file_path.trim_matches('/');
     match volume.filesystem.as_str() {
         "EXT" => {
-            let opened = open_disk_image(image_path)?;
-            let reader = Ext4ImageReader {
-                reader: opened.reader,
-                partition_start: volume.start_offset,
-            };
-            let fs = ext4_view::Ext4::load(Box::new(reader))
-                .map_err(|err| anyhow!("opening ext volume: {err}"))?;
-            let data = fs
-                .read(format!("/{relative}").as_str())
-                .map_err(|err| anyhow!("reading ext file {relative}: {err}"))?;
+            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            let data = ext4_read_file_bytes(&fs, &format!("/{relative}"))?;
             let total = data.len() as u64;
             let start = (offset as usize).min(data.len());
             let end = start.saturating_add(length).min(data.len());
@@ -8442,15 +15207,8 @@ pub fn export_image_file(
 
     let bytes: Vec<u8> = match volume.filesystem.as_str() {
         "EXT" => {
-            let opened = open_disk_image(image_path)?;
-            let reader = Ext4ImageReader {
-                reader: opened.reader,
-                partition_start: volume.start_offset,
-            };
-            let fs = ext4_view::Ext4::load(Box::new(reader))
-                .map_err(|err| anyhow!("opening ext volume: {err}"))?;
-            fs.read(format!("/{relative}").as_str())
-                .map_err(|err| anyhow!("reading ext file {relative}: {err}"))?
+            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            ext4_read_file_bytes(&fs, &format!("/{relative}"))?
         }
         "FAT" => {
             let mut opened = open_disk_image(image_path)?;
@@ -8749,13 +15507,7 @@ pub fn export_image_tree(
 
     match volume.filesystem.as_str() {
         "EXT" => {
-            let opened = open_disk_image(image_path)?;
-            let reader = Ext4ImageReader {
-                reader: opened.reader,
-                partition_start: volume.start_offset,
-            };
-            let fs = ext4_view::Ext4::load(Box::new(reader))
-                .map_err(|err| anyhow!("opening ext volume: {err}"))?;
+            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
             let start = if relative.is_empty() {
                 "/".to_string()
             } else {
@@ -8768,41 +15520,37 @@ pub fn export_image_tree(
                     break;
                 }
                 sink.dirs += 1;
-                let read_dir = match fs.read_dir(ext_path.as_str()) {
-                    Ok(read_dir) => read_dir,
+                let children = match ext4_list_dir(&fs, &ext_path) {
+                    Ok(children) => children,
                     Err(err) => {
                         sink.skip(format!("{ext_path}: {err}"));
                         continue;
                     }
                 };
-                for entry in read_dir {
+                for child in children {
                     if !sink.file_budget_left() {
                         sink.truncated = true;
                         break;
                     }
-                    let Ok(entry) = entry else { continue };
-                    let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
-                    if name == "." || name == ".." {
-                        continue;
-                    }
                     let child_path = if ext_path == "/" {
-                        format!("/{name}")
+                        format!("/{}", child.name)
                     } else {
-                        format!("{ext_path}/{name}")
+                        format!("{ext_path}/{}", child.name)
                     };
                     let mut child_rel = rel_parts.clone();
-                    child_rel.push(name.clone());
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                    if is_dir {
+                    child_rel.push(child.name.clone());
+                    if child.is_dir {
                         stack.push((child_path, child_rel));
                         continue;
                     }
-                    let size = entry.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
-                    if size > LIVE_EXPORT_MAX_BYTES {
-                        sink.skip(format!("{child_path}: {size} bytes exceeds export cap"));
+                    if child.size > LIVE_EXPORT_MAX_BYTES {
+                        sink.skip(format!(
+                            "{child_path}: {} bytes exceeds export cap",
+                            child.size
+                        ));
                         continue;
                     }
-                    match fs.read(child_path.as_str()) {
+                    match ext4_read_file_bytes(&fs, &child_path) {
                         Ok(bytes) => sink.write_file(&child_rel, &bytes)?,
                         Err(err) => sink.skip(format!("{child_path}: {err}")),
                     }
@@ -9086,14 +15834,30 @@ pub fn export_local_tree(
     sink.finish()
 }
 
-/// Shared cap for "Bookmark folder (recursive)" (indexed Analyze and live browse):
-/// how many descendant files one recursive folder bookmark can insert.
-pub const RECURSIVE_FOLDER_BOOKMARK_LIMIT: usize = 5000;
+/// Default cap for "Bookmark folder (recursive)" (indexed Analyze and live
+/// browse) when the examiner doesn't request a specific limit. Recursive
+/// bookmarking only inserts case-database rows referencing already-listed
+/// files - it never touches or copies the evidence - so unlike evidence
+/// processing this does not need a small, deliberately-raised-by-hand
+/// default: a real folder (a home directory, a browser cache, a Python venv
+/// site-packages) routinely holds tens of thousands of files, so 5,000 was
+/// hit on ordinary casework, not just pathological cases. Still raisable via
+/// the "Recursive bookmark limit" input in the UI's Add Evidence panel.
+pub const RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT: usize = 100_000;
+/// Hard sanity ceiling on a recursive folder bookmark regardless of what is
+/// requested. Generous enough for any realistic real-case folder (well into
+/// the hundreds of thousands of files) - this only guards against a
+/// runaway/typo'd request growing one case-database transaction
+/// unreasonably large, not against normal casework.
+pub const RECURSIVE_FOLDER_BOOKMARK_LIMIT: usize = 1_000_000;
 
 pub struct LiveTreeFileRef {
     pub relative_path: String,
     pub name: String,
     pub size_bytes: u64,
+    pub created_utc: Option<String>,
+    pub modified_utc: Option<String>,
+    pub accessed_utc: Option<String>,
 }
 
 pub struct LiveTreeListResult {
@@ -9123,13 +15887,23 @@ impl TreeListSink {
         self.files.len() < self.max_files
     }
 
-    fn push(&mut self, rel_parts: &[String], size_bytes: u64) {
+    fn push(
+        &mut self,
+        rel_parts: &[String],
+        size_bytes: u64,
+        created_utc: Option<String>,
+        modified_utc: Option<String>,
+        accessed_utc: Option<String>,
+    ) {
         let relative_path = rel_parts.join("/");
         let name = rel_parts.last().cloned().unwrap_or_default();
         self.files.push(LiveTreeFileRef {
             relative_path,
             name,
             size_bytes,
+            created_utc,
+            modified_utc,
+            accessed_utc,
         });
     }
 
@@ -9162,13 +15936,7 @@ pub fn list_image_tree_files(
 
     match volume.filesystem.as_str() {
         "EXT" => {
-            let opened = open_disk_image(image_path)?;
-            let reader = Ext4ImageReader {
-                reader: opened.reader,
-                partition_start: volume.start_offset,
-            };
-            let fs = ext4_view::Ext4::load(Box::new(reader))
-                .map_err(|err| anyhow!("opening ext volume: {err}"))?;
+            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
             let start = if relative.is_empty() {
                 "/".to_string()
             } else {
@@ -9181,34 +15949,33 @@ pub fn list_image_tree_files(
                     break;
                 }
                 sink.dirs += 1;
-                let read_dir = match fs.read_dir(ext_path.as_str()) {
-                    Ok(read_dir) => read_dir,
+                let children = match ext4_list_dir(&fs, &ext_path) {
+                    Ok(children) => children,
                     Err(_) => continue,
                 };
-                for entry in read_dir {
+                for child in children {
                     if !sink.file_budget_left() {
                         sink.truncated = true;
                         break;
                     }
-                    let Ok(entry) = entry else { continue };
-                    let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
-                    if name == "." || name == ".." {
-                        continue;
-                    }
                     let child_path = if ext_path == "/" {
-                        format!("/{name}")
+                        format!("/{}", child.name)
                     } else {
-                        format!("{ext_path}/{name}")
+                        format!("{ext_path}/{}", child.name)
                     };
                     let mut child_rel = rel_parts.clone();
-                    child_rel.push(name.clone());
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                    if is_dir {
+                    child_rel.push(child.name.clone());
+                    if child.is_dir {
                         stack.push((child_path, child_rel));
                         continue;
                     }
-                    let size = entry.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
-                    sink.push(&child_rel, size);
+                    sink.push(
+                        &child_rel,
+                        child.size,
+                        child.btime_utc.or(child.ctime_utc),
+                        child.mtime_utc,
+                        child.atime_utc,
+                    );
                 }
             }
         }
@@ -9255,7 +16022,13 @@ pub fn list_image_tree_files(
                         stack.push((child_path, child_rel));
                         continue;
                     }
-                    sink.push(&child_rel, entry.len());
+                    sink.push(
+                        &child_rel,
+                        entry.len(),
+                        fatfs_datetime_to_rfc3339(&entry.created()),
+                        fatfs_datetime_to_rfc3339(&entry.modified()),
+                        fatfs_date_to_rfc3339(&entry.accessed()),
+                    );
                 }
             }
         }
@@ -9302,7 +16075,22 @@ pub fn list_image_tree_files(
                         stack.push((child.file_record_number, child_rel));
                         continue;
                     }
-                    sink.push(&child_rel, child.size_bytes);
+                    sink.push(
+                        &child_rel,
+                        child.size_bytes,
+                        child
+                            .standard_creation_time_utc
+                            .clone()
+                            .or(child.creation_time_utc.clone()),
+                        child
+                            .standard_modification_time_utc
+                            .clone()
+                            .or(child.modification_time_utc.clone()),
+                        child
+                            .standard_access_time_utc
+                            .clone()
+                            .or(child.access_time_utc.clone()),
+                    );
                 }
             }
         }
@@ -9391,7 +16179,13 @@ pub fn list_local_tree_files(
             if !file_type.is_file() {
                 continue;
             }
-            sink.push(&child_rel, metadata.len());
+            sink.push(
+                &child_rel,
+                metadata.len(),
+                system_time_rfc3339(metadata.created().ok()),
+                system_time_rfc3339(metadata.modified().ok()),
+                system_time_rfc3339(metadata.accessed().ok()),
+            );
         }
         if sink.truncated {
             break;
@@ -9483,7 +16277,11 @@ pub fn bookmark_indexed_folder_recursive(
     folder_logical_path: &str,
     max_entries: usize,
 ) -> Result<RecursiveBookmarkResult> {
-    let max_entries = max_entries.clamp(1, RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    // Only floor-guard against a literal 0 (which would bookmark nothing);
+    // the ceiling, if any, is the caller's decision (see api_bookmark_folder_
+    // recursive_indexed/_live in kdft-ui) - this function no longer imposes
+    // its own upper bound.
+    let max_entries = max_entries.max(1);
     let (entry_ids, total_candidates) = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -9512,6 +16310,24 @@ pub fn bookmark_indexed_folder_recursive(
 /// N per-item DB round trips). Each item's `item_ref_json` includes `metadata`
 /// and `size_bytes` up front so report rendering's `enrich_live_bookmark_item`
 /// does not need to re-open the live source once per item.
+fn live_volume_numbering(
+    source_kind: &str,
+    source_path: &str,
+    requested_volume_index: usize,
+) -> Result<(usize, Option<usize>)> {
+    if source_kind != "image" {
+        return Ok((requested_volume_index, None));
+    }
+    let volumes = list_image_volumes(Path::new(source_path))?;
+    let volume = volumes
+        .get(requested_volume_index)
+        .with_context(|| format!("volume index {requested_volume_index} out of range"))?;
+    Ok((
+        volume.volume_index_zero_based,
+        volume.partition_number_one_based,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn bulk_add_live_bookmark_items(
     case_path: &Path,
@@ -9524,6 +16340,8 @@ pub fn bulk_add_live_bookmark_items(
     filesystem: &str,
     files: &[LiveTreeFileRef],
 ) -> Result<BulkBookmarkItemsResult> {
+    let (volume_index_zero_based, partition_number_one_based) =
+        live_volume_numbering(source_kind, source_path, volume)?;
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -9549,6 +16367,8 @@ pub fn bulk_add_live_bookmark_items(
             "relative_path": file.relative_path,
             "display_name": file.name,
             "volume": volume,
+            "volume_index_zero_based": volume_index_zero_based,
+            "partition_number_one_based": partition_number_one_based,
             "path": file.relative_path,
             "volume_name": volume_name,
             "filesystem": filesystem,
@@ -9556,10 +16376,15 @@ pub fn bulk_add_live_bookmark_items(
             "is_deleted": false,
             "symlink": false,
             "file_extension": file_extension,
+            "created_utc": file.created_utc,
+            "modified_utc": file.modified_utc,
+            "accessed_utc": file.accessed_utc,
             "metadata": {
                 "source_kind": source_kind,
                 "source_path": source_path,
                 "volume_index": volume,
+                "volume_index_zero_based": volume_index_zero_based,
+                "partition_number_one_based": partition_number_one_based,
             }
         });
         let data_preview = format!("Live file, {} bytes", file.size_bytes);
@@ -9584,8 +16409,18 @@ pub fn bulk_add_live_bookmark_items(
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'bookmark.item.bulk_add_live', ?2, 'bookmark', ?3,
-                 json_object('items_added', ?4))",
-        params![case_id, actor, bookmark_id, items_added],
+                 json_object('items_added', ?4, 'source_kind', ?5,
+                             'volume_index_zero_based', ?6,
+                             'partition_number_one_based', ?7))",
+        params![
+            case_id,
+            actor,
+            bookmark_id,
+            items_added,
+            source_kind,
+            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
+        ],
     )?;
     tx.commit()?;
     Ok(BulkBookmarkItemsResult {
@@ -9632,6 +16467,23 @@ pub fn bookmark_live_folder_recursive(
 }
 
 /// Audit trail for a recursive live folder export.
+fn evidence_live_volume_numbering(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    requested_volume_index: usize,
+) -> Result<(usize, Option<usize>)> {
+    let (source_kind, source_path): (String, String) = conn
+        .query_row(
+            "SELECT source_kind, source_path FROM evidence_sources
+             WHERE case_id = ?1 AND id = ?2",
+            params![case_id, evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .context("evidence source not found for live-volume audit")?;
+    live_volume_numbering(&source_kind, &source_path, requested_volume_index)
+}
+
 pub fn record_live_tree_export(
     case_path: &Path,
     evidence_id: i64,
@@ -9641,19 +16493,26 @@ pub fn record_live_tree_export(
 ) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
+    let (volume_index_zero_based, partition_number_one_based) =
+        evidence_live_volume_numbering(&conn, case_id, evidence_id, volume_index)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'live.export_tree', ?2, 'evidence', ?3,
-                 json_object('volume', ?4, 'dir_path', ?5, 'output_dir', ?6,
-                             'files_exported', ?7, 'bytes_written', ?8,
-                             'skipped', ?9, 'truncated', ?10, 'manifest_path', ?11))",
+                 json_object('volume', ?4,
+                             'volume_index_zero_based', ?5,
+                             'partition_number_one_based', ?6,
+                             'dir_path', ?7, 'output_dir', ?8,
+                             'files_exported', ?9, 'bytes_written', ?10,
+                             'skipped', ?11, 'truncated', ?12, 'manifest_path', ?13))",
         params![
             case_id,
             actor,
             evidence_id,
             volume_index as i64,
+            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
             dir_path,
             result.output_dir,
             result.files_exported as i64,
@@ -9677,18 +16536,25 @@ pub fn record_live_export(
 ) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
+    let (volume_index_zero_based, partition_number_one_based) =
+        evidence_live_volume_numbering(&conn, case_id, evidence_id, volume_index)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'live.export', ?2, 'evidence', ?3,
-                 json_object('volume', ?4, 'file_path', ?5, 'output_path', ?6,
-                             'bytes_written', ?7, 'sha256', ?8))",
+                 json_object('volume', ?4,
+                             'volume_index_zero_based', ?5,
+                             'partition_number_one_based', ?6,
+                             'file_path', ?7, 'output_path', ?8,
+                             'bytes_written', ?9, 'sha256', ?10))",
         params![
             case_id,
             actor,
             evidence_id,
             volume_index as i64,
+            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
             file_path,
             result.output_path,
             result.bytes_written as i64,
@@ -9709,21 +16575,27 @@ pub fn record_live_tree_export_with_source_kind(
 ) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
+    let (volume_index_zero_based, partition_number_one_based) =
+        evidence_live_volume_numbering(&conn, case_id, evidence_id, volume_index)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'live.export_tree', ?2, 'evidence', ?3,
-                 json_object('source_kind', ?4, 'volume', ?5, 'dir_path', ?6,
-                             'output_dir', ?7, 'files_exported', ?8,
-                             'bytes_written', ?9, 'skipped', ?10,
-                             'truncated', ?11, 'manifest_path', ?12))",
+                 json_object('source_kind', ?4, 'volume', ?5,
+                             'volume_index_zero_based', ?6,
+                             'partition_number_one_based', ?7,
+                             'dir_path', ?8, 'output_dir', ?9, 'files_exported', ?10,
+                             'bytes_written', ?11, 'skipped', ?12,
+                             'truncated', ?13, 'manifest_path', ?14))",
         params![
             case_id,
             actor,
             evidence_id,
             source_kind,
             volume_index as i64,
+            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
             dir_path,
             result.output_dir,
             result.files_exported as i64,
@@ -9747,19 +16619,26 @@ pub fn record_live_export_with_source_kind(
 ) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
+    let (volume_index_zero_based, partition_number_one_based) =
+        evidence_live_volume_numbering(&conn, case_id, evidence_id, volume_index)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'live.export', ?2, 'evidence', ?3,
-                 json_object('source_kind', ?4, 'volume', ?5, 'file_path', ?6,
-                             'output_path', ?7, 'bytes_written', ?8, 'sha256', ?9))",
+                 json_object('source_kind', ?4, 'volume', ?5,
+                             'volume_index_zero_based', ?6,
+                             'partition_number_one_based', ?7,
+                             'file_path', ?8, 'output_path', ?9,
+                             'bytes_written', ?10, 'sha256', ?11))",
         params![
             case_id,
             actor,
             evidence_id,
             source_kind,
             volume_index as i64,
+            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
             file_path,
             result.output_path,
             result.bytes_written as i64,
@@ -9795,12 +16674,61 @@ fn open_disk_image(path: &Path) -> Result<OpenedDiskImage> {
 
     let opened = disk_forensic::container::open(path)
         .with_context(|| format!("opening disk image {}", path.display()))?;
+    let format = format!("{:?}", opened.format);
+    // EA-002: a file with a structured disk-container extension that could only
+    // be opened as RAW was NOT actually decoded - for example a split or
+    // multi-extent VMDK whose descriptor references extent files that were never
+    // read. Refuse it explicitly instead of silently examining a few KB of
+    // descriptor text as if it were the whole disk (which otherwise records a
+    // false "completed" process over synthetic records).
+    if is_structured_container_extension(path) && format == "Raw" {
+        bail!(
+            "{} has a structured disk-container extension but decoded only as RAW ({} bytes): its \
+             real disk image/extents were not decoded (for example a split or multi-extent VMDK \
+             whose extent files were not read). KDFT refuses to examine the container descriptor \
+             as if it were the disk. This container variant is not yet supported; if you genuinely \
+             have a raw image, attach it with a .img/.dd/.raw name.",
+            path.display(),
+            opened.size
+        );
+    }
     Ok(OpenedDiskImage {
-        format: format!("{:?}", opened.format),
+        format,
         decoded_size: opened.size,
         reader: opened.reader,
         container_finding_count: opened.findings.len(),
     })
+}
+
+/// Disk-container extensions that must decode to a real structured image rather
+/// than fall back to RAW. See EA-002 in `open_disk_image`: a file with one of
+/// these extensions opened as RAW means the container was not truly decoded and
+/// must be refused, not indexed as if the descriptor were the disk. Genuinely
+/// raw images use `.img`/`.dd`/`.raw`/`.bin` and are unaffected. `.vdi` is
+/// handled by its own decoder branch above and never reaches here.
+fn is_structured_container_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "vmdk"
+                    | "vhd"
+                    | "vhdx"
+                    | "avhd"
+                    | "avhdx"
+                    | "e01"
+                    | "ex01"
+                    | "s01"
+                    | "l01"
+                    | "aff"
+                    | "aff4"
+                    | "qcow"
+                    | "qcow2"
+                    | "vpc"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn looks_like_vdi(path: &Path) -> bool {
@@ -10001,6 +16929,39 @@ fn process_whole_volume_fallback(
         };
     }
 
+    let bitlocker_inspection = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+        bitlocker_inspection_at(reader, 0, Some(decoded_size))?
+    } else {
+        None
+    };
+    let filesystem_parser = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+        "locked"
+    } else {
+        "pending"
+    };
+    let filesystem_browsing_status = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+        bitlocker_status_message(bitlocker_inspection.as_ref())
+    } else {
+        "pending filesystem parser"
+    };
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "disk_volume",
+        "container_format": container_format,
+        "partition_scheme": partition_scheme,
+        "name": "Whole Image",
+        "filesystem": filesystem,
+        "start_offset": 0,
+        "size_bytes": decoded_size,
+        "end_offset_exclusive": decoded_size,
+        "filesystem_parser": filesystem_parser,
+        "filesystem_browsing_status": filesystem_browsing_status,
+    });
+    if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+        merge_json_object(
+            &mut metadata,
+            &bitlocker_metadata_value(bitlocker_inspection.as_ref()),
+        );
+    }
     insert_image_record(
         conn,
         case_id,
@@ -10008,18 +16969,7 @@ fn process_whole_volume_fallback(
         "/Image Analysis/Volumes/000-whole-image.record",
         "Whole Image Volume",
         Some(i64::try_from(decoded_size).unwrap_or(i64::MAX)),
-        &serde_json::json!({
-            "artifact_kind": "disk_volume",
-            "container_format": container_format,
-            "partition_scheme": partition_scheme,
-            "name": "Whole Image",
-            "filesystem": filesystem,
-            "start_offset": 0,
-            "size_bytes": decoded_size,
-            "end_offset_exclusive": decoded_size,
-            "filesystem_parser": "pending",
-            "filesystem_browsing_status": "pending filesystem parser",
-        }),
+        &metadata,
         job_id,
     )?;
     *indexed += 1;
@@ -10122,25 +17072,625 @@ fn record_btrfs_volume(
 
 const EXT_MAX_DIRS: usize = 20_000;
 
-/// Adapts an owned disk-image reader to the ext4-view `Ext4Read` trait,
-/// translating filesystem-relative offsets to the partition's byte range.
+/// Adapts an owned disk-image reader to the `ext4` crate's `positioned_io::
+/// ReadAt` trait, translating filesystem-relative offsets to the partition's
+/// byte range. `ReadAt::read_at` takes `&self` (positional reads may be
+/// issued through a shared reference), but our underlying image reader is a
+/// stateful `Read + Seek`, so the seek cursor is guarded behind a `RefCell`.
+/// This is sound because each `Ext4ImageReader` is opened fresh per request
+/// and never shared across threads.
 struct Ext4ImageReader {
-    reader: Box<dyn disk_forensic::container::ReadSeek>,
+    reader: RefCell<Box<dyn disk_forensic::container::ReadSeek>>,
     partition_start: u64,
 }
 
-impl ext4_view::Ext4Read for Ext4ImageReader {
-    fn read(
-        &mut self,
-        start_byte: u64,
-        dst: &mut [u8],
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        self.reader.seek(SeekFrom::Start(
-            self.partition_start.saturating_add(start_byte),
-        ))?;
-        self.reader.read_exact(dst)?;
-        Ok(())
+impl positioned_io::ReadAt for Ext4ImageReader {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let mut reader = self.reader.borrow_mut();
+        reader.seek(SeekFrom::Start(self.partition_start.saturating_add(pos)))?;
+        reader.read(buf)
     }
+}
+
+fn open_ext4_superblock(
+    source_path: &Path,
+    partition_start: u64,
+) -> Result<ext4::SuperBlock<Ext4ImageReader>> {
+    let opened = open_disk_image(source_path)?;
+    let reader = Ext4ImageReader {
+        reader: RefCell::new(opened.reader),
+        partition_start,
+    };
+    // `Checksums::Required` (the crate default) refuses to open any
+    // filesystem without the metadata_csum feature, which is common on
+    // older/minimal ext2/ext3/ext4 filesystems - a forensic reader must not
+    // refuse to open real evidence just because it predates that feature.
+    // `Enabled` validates checksums when present but doesn't require them.
+    let options = ext4::Options {
+        checksums: ext4::Checksums::Enabled,
+    };
+    ext4::SuperBlock::new_with_options(reader, &options)
+        .map_err(|err| anyhow!("opening ext filesystem at image offset {partition_start}: {err:?}"))
+}
+
+/// One child of a directory listing, with full stat metadata already loaded
+/// (the ext4 crate has no lazy per-entry metadata call - listing a directory
+/// only returns name/inode/type hints, so callers that need size or times
+/// always end up loading the child inode anyway; this does it once, up
+/// front, for every caller instead of duplicating that pattern seven times).
+struct ExtChild {
+    name: String,
+    inode_number: u32,
+    inode_filesystem_offset: Option<u64>,
+    data_location: Option<ext4::DataLocation>,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    atime_utc: Option<String>,
+    mtime_utc: Option<String>,
+    ctime_utc: Option<String>,
+    btime_utc: Option<String>,
+}
+
+/// Converts an ext4 on-disk timestamp (32-bit Unix seconds, optional
+/// sub-second nanos) to RFC 3339. A zero epoch means "never set" on ext-family
+/// filesystems, so it is reported as absent rather than as the 1970 epoch.
+fn ext4_time_to_rfc3339(time: &ext4::Time) -> Option<String> {
+    if time.epoch_secs == 0 {
+        return None;
+    }
+    DateTime::<Utc>::from_timestamp(i64::from(time.epoch_secs), time.nanos.unwrap_or(0))
+        .map(|value| value.to_rfc3339())
+}
+
+fn ext4_children_of_inode(
+    fs: &ext4::SuperBlock<Ext4ImageReader>,
+    dir_inode: &ext4::Inode,
+    ext_path: &str,
+) -> Result<Vec<ExtChild>> {
+    let enhanced = fs
+        .enhance(dir_inode)
+        .map_err(|err| anyhow!("reading ext directory {ext_path}: {err}"))?;
+    let ext4::Enhanced::Directory(entries) = enhanced else {
+        bail!("ext path {ext_path} is not a directory");
+    };
+    let mut children = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        // A directory entry that fails to load (corrupt/unallocated inode) is
+        // skipped rather than aborting the whole listing - matches the old
+        // ext4-view behavior of silently dropping unreadable entries.
+        let Ok(inode) = fs.load_inode(entry.inode) else {
+            continue;
+        };
+        let inode_filesystem_offset = fs.inode_disk_offset(entry.inode).ok();
+        let data_location = fs.first_data_location(&inode).ok().flatten();
+        let stat = &inode.stat;
+        children.push(ExtChild {
+            name: entry.name,
+            inode_number: entry.inode,
+            inode_filesystem_offset,
+            data_location,
+            is_dir: matches!(stat.extracted_type, ext4::FileType::Directory),
+            is_symlink: matches!(stat.extracted_type, ext4::FileType::SymbolicLink),
+            size: stat.size,
+            uid: stat.uid,
+            gid: stat.gid,
+            mode: stat.file_mode,
+            atime_utc: ext4_time_to_rfc3339(&stat.atime),
+            mtime_utc: ext4_time_to_rfc3339(&stat.mtime),
+            ctime_utc: ext4_time_to_rfc3339(&stat.ctime),
+            btime_utc: stat.btime.as_ref().and_then(ext4_time_to_rfc3339),
+        });
+    }
+    Ok(children)
+}
+
+/// Resolves an absolute ext path ("/" or "/foo/bar") to its inode.
+fn ext4_resolve_inode(
+    fs: &ext4::SuperBlock<Ext4ImageReader>,
+    ext_path: &str,
+) -> Result<ext4::Inode> {
+    if ext_path == "/" || ext_path.is_empty() {
+        return fs
+            .root()
+            .map_err(|err| anyhow!("loading ext root inode: {err}"));
+    }
+    let entry = fs
+        .resolve_path(ext_path)
+        .map_err(|err| anyhow!("resolving ext path {ext_path}: {err}"))?;
+    fs.load_inode(entry.inode)
+        .map_err(|err| anyhow!("loading inode for {ext_path}: {err}"))
+}
+
+/// Lists one directory's children by absolute ext path.
+fn ext4_list_dir(fs: &ext4::SuperBlock<Ext4ImageReader>, ext_path: &str) -> Result<Vec<ExtChild>> {
+    let dir_inode = ext4_resolve_inode(fs, ext_path)?;
+    ext4_children_of_inode(fs, &dir_inode, ext_path)
+}
+
+/// Reads the full contents of a regular file by absolute ext path.
+fn ext4_read_file_bytes(fs: &ext4::SuperBlock<Ext4ImageReader>, ext_path: &str) -> Result<Vec<u8>> {
+    let entry = fs
+        .resolve_path(ext_path)
+        .map_err(|err| anyhow!("resolving ext path {ext_path}: {err}"))?;
+    let inode = fs
+        .load_inode(entry.inode)
+        .map_err(|err| anyhow!("loading inode for {ext_path}: {err}"))?;
+    // Symlinks (common on any merged-usr Linux install - /bin, /lib, /sbin
+    // etc.) need `enhance()` rather than the regular extent reader. Return
+    // the target's literal bytes: adding a display prefix here makes the File
+    // byte view differ from both inode size and source bytes.
+    if matches!(inode.stat.extracted_type, ext4::FileType::SymbolicLink) {
+        let enhanced = fs
+            .enhance(&inode)
+            .map_err(|err| anyhow!("reading symlink target for {ext_path}: {err}"))?;
+        return match enhanced {
+            ext4::Enhanced::SymbolicLink(target) => Ok(target.into_bytes()),
+            _ => Ok(Vec::new()),
+        };
+    }
+    let mut reader = fs
+        .open(&inode)
+        .map_err(|err| anyhow!("opening ext file {ext_path}: {err}"))?;
+    let mut data = Vec::with_capacity(usize::try_from(inode.stat.size).unwrap_or(0));
+    reader
+        .read_to_end(&mut data)
+        .map_err(|err| anyhow!("reading ext file {ext_path}: {err}"))?;
+    Ok(data)
+}
+
+#[derive(Clone)]
+struct IndexedBrowserSourceFile {
+    entry_id: i64,
+    exact_path: String,
+    size_bytes: Option<i64>,
+    metadata: serde_json::Value,
+}
+
+struct BrowserDerivedImportContext<'a> {
+    evidence_id: i64,
+    derivation_key: &'a str,
+    logical_prefix: &'a str,
+    source_profile_path: &'a str,
+    volume_index_zero_based: Option<usize>,
+    staging_path: &'a Path,
+    source_files: &'a HashMap<String, IndexedBrowserSourceFile>,
+}
+
+fn normalized_browser_source_path(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn join_browser_source_path(profile_path: &str, relative_path: &str) -> String {
+    let profile = profile_path.replace('\\', "/");
+    let relative = relative_path.replace('\\', "/");
+    if profile.trim_matches('/').is_empty() {
+        relative.trim_start_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            profile.trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        )
+    }
+}
+
+fn load_indexed_browser_source_files(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    source_profile_path: &str,
+) -> Result<HashMap<String, IndexedBrowserSourceFile>> {
+    let profile_key = normalized_browser_source_path(source_profile_path);
+    let mut stmt = conn.prepare(
+        "SELECT id, size_bytes, metadata_json
+         FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+           AND name IN ('History', 'History.db', 'places.sqlite', 'downloads.sqlite',
+                        'formhistory.sqlite', 'cookies.sqlite', 'logins.json', 'Login Data', 'Cookies',
+                        'Bookmarks', 'Preferences')",
+    )?;
+    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut files = HashMap::new();
+    for row in rows {
+        let (entry_id, size_bytes, metadata_json) = row?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+            .with_context(|| format!("parsing browser source metadata for entry {entry_id}"))?;
+        let Some(exact_path) = source_path_exact_from_metadata(&metadata) else {
+            continue;
+        };
+        let exact_key = normalized_browser_source_path(&exact_path);
+        if exact_key == profile_key || exact_key.starts_with(&format!("{profile_key}/")) {
+            files.insert(
+                exact_key,
+                IndexedBrowserSourceFile {
+                    entry_id,
+                    exact_path,
+                    size_bytes,
+                    metadata,
+                },
+            );
+        }
+    }
+    Ok(files)
+}
+
+fn browser_record_source_file<'a>(
+    metadata: &serde_json::Value,
+    context: &'a BrowserDerivedImportContext<'_>,
+) -> (String, Option<&'a IndexedBrowserSourceFile>) {
+    let artifact = metadata
+        .get("source_artifact")
+        .and_then(|value| value.as_str())
+        .unwrap_or("browser source");
+    let mut relative_candidates = vec![artifact.to_string()];
+    if artifact.eq_ignore_ascii_case("Cookies") {
+        relative_candidates.insert(0, "Network/Cookies".to_string());
+    }
+    for relative in &relative_candidates {
+        let exact = join_browser_source_path(context.source_profile_path, relative);
+        if let Some(source) = context
+            .source_files
+            .get(&normalized_browser_source_path(&exact))
+        {
+            return (source.exact_path.clone(), Some(source));
+        }
+    }
+    (
+        join_browser_source_path(context.source_profile_path, &relative_candidates[0]),
+        None,
+    )
+}
+
+fn first_metadata_value(metadata: &serde_json::Value, keys: &[&str]) -> Option<serde_json::Value> {
+    keys.iter()
+        .filter_map(|key| metadata.get(*key))
+        .find(|value| json_has_display_value(Some(*value)))
+        .cloned()
+}
+
+fn move_staging_source_metadata(object: &mut serde_json::Map<String, serde_json::Value>) {
+    for (source, staging) in [
+        ("source_artifact_path", "source_artifact_staging_path"),
+        ("source_file_size_bytes", "staging_file_size_bytes"),
+        ("source_file_created_utc", "staging_file_created_utc"),
+        ("source_file_modified_utc", "staging_file_modified_utc"),
+        ("source_file_accessed_utc", "staging_file_accessed_utc"),
+    ] {
+        if let Some(value) = object.remove(source) {
+            object.insert(staging.to_string(), value);
+        }
+    }
+    object.remove("source_file_time_basis");
+}
+
+fn apply_browser_derived_provenance(
+    metadata: &mut serde_json::Value,
+    context: &BrowserDerivedImportContext<'_>,
+) {
+    let (source_exact_path, source_file) = browser_record_source_file(metadata, context);
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    move_staging_source_metadata(object);
+    object.insert(
+        "browser_derivation_key".to_string(),
+        serde_json::json!(context.derivation_key),
+    );
+    object.insert(
+        "source_evidence_id".to_string(),
+        serde_json::json!(context.evidence_id),
+    );
+    object.insert("derived_artifact".to_string(), serde_json::json!(true));
+    object.insert(
+        "source_profile_path_exact".to_string(),
+        serde_json::json!(context.source_profile_path),
+    );
+    object.insert(
+        "volume_index_zero_based".to_string(),
+        serde_json::json!(context.volume_index_zero_based),
+    );
+    object.insert(
+        "browser_profile_staging_path".to_string(),
+        serde_json::json!(context.staging_path.to_string_lossy()),
+    );
+    object.insert(
+        "source_artifact_path".to_string(),
+        serde_json::json!(source_exact_path),
+    );
+    object.insert(
+        "source_artifact_path_exact".to_string(),
+        serde_json::json!(source_exact_path),
+    );
+    object.insert(
+        "source_path_exact".to_string(),
+        serde_json::json!(source_exact_path),
+    );
+
+    if let Some(source) = source_file {
+        object.insert(
+            "source_entry_id".to_string(),
+            serde_json::json!(source.entry_id),
+        );
+        object.insert(
+            "source_file_time_basis".to_string(),
+            serde_json::json!("original_evidence_filesystem"),
+        );
+        for (target, keys) in [
+            (
+                "source_file_created_utc",
+                &[
+                    "ntfs_creation_time_utc",
+                    "ntfs_standard_creation_time_utc",
+                    "standard_information_created_utc",
+                    "created_utc",
+                    "fat_created",
+                ][..],
+            ),
+            (
+                "source_file_modified_utc",
+                &[
+                    "ntfs_modification_time_utc",
+                    "ntfs_standard_modification_time_utc",
+                    "standard_information_modified_utc",
+                    "modified_utc",
+                    "fat_modified",
+                ][..],
+            ),
+            (
+                "source_file_accessed_utc",
+                &[
+                    "ntfs_access_time_utc",
+                    "ntfs_standard_access_time_utc",
+                    "standard_information_accessed_utc",
+                    "accessed_utc",
+                    "fat_accessed",
+                ][..],
+            ),
+            (
+                "source_file_mft_modified_utc",
+                &[
+                    "ntfs_mft_record_modification_time_utc",
+                    "ntfs_standard_mft_record_modification_time_utc",
+                    "standard_information_mft_modified_utc",
+                    "mft_modified_utc",
+                ][..],
+            ),
+        ] {
+            if let Some(value) = first_metadata_value(&source.metadata, keys) {
+                object.insert(target.to_string(), value);
+            }
+        }
+        if let Some(value) = first_metadata_value(&source.metadata, &["file_sha256"]) {
+            object.insert("source_file_sha256".to_string(), value);
+        }
+        if let Some(value) = source.size_bytes {
+            object.insert(
+                "source_file_size_bytes".to_string(),
+                serde_json::json!(value),
+            );
+        }
+    } else {
+        object.insert(
+            "source_file_time_basis".to_string(),
+            serde_json::json!("original_evidence_path_resolved_times_unavailable"),
+        );
+    }
+}
+
+/// Inserts a browser-history parse result's records directly into an
+/// ALREADY-EXISTING evidence source (not a new one) - shares the insert loop
+/// shape with `persist_browser_history_import`, but that function always
+/// creates/reuses its own dedicated `browser_history` evidence row via
+/// `upsert_browser_history_evidence`, which is wrong for auto-detected
+/// profiles found mid-walk: those belong under the SAME evidence_id as the
+/// disk image they were found on, so the examiner sees them as part of one
+/// unified case view (via the case-wide Categories fix), not as a mystery
+/// second evidence source they have to go find.
+fn insert_browser_history_records_into_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    job_id: i64,
+    import_data: &BrowserHistoryImportData,
+    derived_context: Option<&BrowserDerivedImportContext<'_>>,
+) -> Result<usize> {
+    let mut inserted = 0_usize;
+    for record in import_data
+        .visit_records
+        .iter()
+        .chain(import_data.bookmark_records.iter())
+        .chain(import_data.preference_records.iter())
+        .chain(import_data.url_records.iter())
+        .chain(import_data.search_records.iter())
+        .chain(import_data.download_records.iter())
+        .chain(import_data.login_records.iter())
+        .chain(import_data.cookie_records.iter())
+    {
+        let mut metadata_json: serde_json::Value = serde_json::from_str(&record.metadata_json)
+            .with_context(|| format!("parsing browser metadata for {}", record.logical_path))?;
+        let logical_path = if let Some(context) = derived_context {
+            apply_browser_derived_provenance(&mut metadata_json, context);
+            format!("{}{}", context.logical_prefix, record.logical_path)
+        } else {
+            record.logical_path.clone()
+        };
+        if let Some(object) = metadata_json.as_object_mut() {
+            object.insert(
+                "parsed_record_logical_path".to_string(),
+                serde_json::json!(record.logical_path),
+            );
+        }
+        let metadata_json = metadata_json.to_string();
+        upsert_filesystem_entry(
+            conn,
+            case_id,
+            evidence_id,
+            &logical_path,
+            &record.display_name,
+            "record",
+            None,
+            &metadata_json,
+            job_id,
+        )?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Checks one just-listed EXT directory for the top-level marker file of a
+/// Firefox (`places.sqlite`) or Chromium (`History`) browser profile, and if
+/// found, stages the profile's top-level files to a persistent local copy
+/// (same convention as the manual "Import as browser history" feature - next
+/// to the case file, kept permanently so the byte viewer can later resolve
+/// real bytes) and parses+inserts the resulting records under the SAME
+/// evidence_id as the enclosing filesystem walk. This only stages
+/// TOP-LEVEL files (not subdirectories), which covers every file the
+/// Firefox/Chromium parsers actually read except Chromium's newer
+/// `Network/Cookies` layout - profiles using that layout still get history/
+/// bookmarks/logins, just not cookies, from this automatic path (the manual
+/// per-folder import, which uses the full recursive export, still handles
+/// that correctly if needed).
+#[allow(clippy::too_many_arguments)]
+fn maybe_auto_import_browser_profile(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    job_id: i64,
+    image_fs: &ext4::SuperBlock<Ext4ImageReader>,
+    ext_dir_path: &str,
+    children: &[ExtChild],
+    indexed: &mut usize,
+) -> Result<()> {
+    let has_firefox_marker = children
+        .iter()
+        .any(|child| !child.is_dir && child.name.eq_ignore_ascii_case("places.sqlite"));
+    let has_chromium_marker = children
+        .iter()
+        .any(|child| !child.is_dir && child.name == "History");
+    if !has_firefox_marker && !has_chromium_marker {
+        return Ok(());
+    }
+    let Some(case_path) = conn.path() else {
+        return Ok(());
+    };
+    let case_path = PathBuf::from(case_path);
+    let case_stem = case_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "case".to_string());
+    let imports_root = case_path
+        .parent()
+        .map(|parent| parent.join(format!("{case_stem}-history-imports")))
+        .unwrap_or_else(|| PathBuf::from(format!("{case_stem}-history-imports")));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let profile_name = ext_dir_path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("profile");
+    let staging_root = imports_root.join(format!(
+        "{}-{unique}",
+        sanitize_logical_segment(profile_name)
+    ));
+    fs::create_dir_all(&staging_root)
+        .with_context(|| format!("creating staging folder {}", staging_root.display()))?;
+    let mut staged_any = false;
+    for child in children {
+        if child.is_dir || child.is_symlink {
+            continue;
+        }
+        let child_ext_path = if ext_dir_path == "/" {
+            format!("/{}", child.name)
+        } else {
+            format!("{ext_dir_path}/{}", child.name)
+        };
+        if let Ok(bytes) = ext4_read_file_bytes(image_fs, &child_ext_path) {
+            if fs::write(staging_root.join(&child.name), &bytes).is_ok() {
+                staged_any = true;
+            }
+        }
+    }
+    // Chromium's Cookies file has moved under Network/ on newer profiles -
+    // stage that one extra file too, if present, so cookie parsing still
+    // works for those without a full recursive export.
+    if has_chromium_marker {
+        if let Ok(network_children) = ext4_list_dir(
+            image_fs,
+            &format!("{}/Network", ext_dir_path.trim_end_matches('/')),
+        ) {
+            if let Some(cookies) = network_children
+                .iter()
+                .find(|child| child.name == "Cookies")
+            {
+                let cookies_ext_path =
+                    format!("{}/Network/Cookies", ext_dir_path.trim_end_matches('/'));
+                if let Ok(bytes) = ext4_read_file_bytes(image_fs, &cookies_ext_path) {
+                    let network_dir = staging_root.join("Network");
+                    if fs::create_dir_all(&network_dir).is_ok()
+                        && fs::write(network_dir.join(&cookies.name), &bytes).is_ok()
+                    {
+                        staged_any = true;
+                    }
+                }
+            }
+        }
+    }
+    if !staged_any {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Ok(());
+    }
+    let family = detect_browser_family(&staging_root)?;
+    // collect_*_history_import take an already-resolved row cap, not "0 means
+    // unlimited" - that conversion normally happens in import_browser_history
+    // (via unlimited_if_zero) before reaching these functions. Passing a bare
+    // 0 through here silently asked for zero rows of everything, which is
+    // exactly why this returned successfully but inserted nothing.
+    let max_visits = unlimited_if_zero(0);
+    let import_data = match family {
+        BrowserFamily::Chromium => collect_chromium_history_import(&staging_root, max_visits)?,
+        BrowserFamily::Firefox => collect_firefox_history_import(&staging_root, max_visits)?,
+        BrowserFamily::Safari => collect_safari_history_import(&staging_root, max_visits)?,
+    };
+    let derivation_key = browser_profile_derivation_key(ext_dir_path, None);
+    let logical_prefix = browser_profile_logical_prefix(ext_dir_path, None, &derivation_key);
+    let source_files = HashMap::new();
+    let context = BrowserDerivedImportContext {
+        evidence_id,
+        derivation_key: &derivation_key,
+        logical_prefix: &logical_prefix,
+        source_profile_path: ext_dir_path,
+        volume_index_zero_based: None,
+        staging_path: &staging_root,
+        source_files: &source_files,
+    };
+    let inserted = insert_browser_history_records_into_evidence(
+        conn,
+        case_id,
+        evidence_id,
+        job_id,
+        &import_data,
+        Some(&context),
+    )?;
+    *indexed += inserted;
+    Ok(())
 }
 
 /// Indexes an ext2/3/4 volume via the read-only ext4-view crate. Opens its own
@@ -10161,13 +17711,7 @@ fn process_ext_partition_entries(
     indexed: &mut usize,
     max_entries: usize,
 ) -> Result<bool> {
-    let opened = open_disk_image(Path::new(source_path))?;
-    let reader = Ext4ImageReader {
-        reader: opened.reader,
-        partition_start: start_offset,
-    };
-    let fs = ext4_view::Ext4::load(Box::new(reader))
-        .map_err(|err| anyhow!("opening ext filesystem at image offset {start_offset}: {err}"))?;
+    let fs = open_ext4_superblock(Path::new(source_path), start_offset)?;
 
     upsert_filesystem_entry(
         conn,
@@ -10209,35 +17753,43 @@ fn process_ext_partition_entries(
             break;
         }
         dirs_walked += 1;
-        let read_dir = match fs.read_dir(ext_path.as_str()) {
-            Ok(read_dir) => read_dir,
+        let children = match ext4_list_dir(&fs, &ext_path) {
+            Ok(children) => children,
             Err(_) => continue,
         };
+        if *indexed < max_entries && processing_profile().parse_browsers {
+            if let Err(err) = maybe_auto_import_browser_profile(
+                conn,
+                case_id,
+                evidence_id,
+                job_id,
+                &fs,
+                &ext_path,
+                &children,
+                indexed,
+            ) {
+                // Auto-import is a bonus on top of the regular filesystem
+                // walk, not a required step - a parse failure here (e.g. a
+                // corrupt or locked profile database) must not abort
+                // indexing the rest of the volume.
+                eprintln!("auto browser-history import skipped for {ext_path}: {err:#}");
+            }
+        }
         let mut used_paths = HashSet::new();
-        for entry in read_dir {
+        for child in children {
             if *indexed >= max_entries {
                 truncated = true;
                 break;
             }
-            let Ok(entry) = entry else { continue };
-            let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
-            if name == "." || name == ".." {
-                continue;
-            }
-            let file_type = entry.file_type().ok();
-            let is_dir = file_type.map(|ft| ft.is_dir()).unwrap_or(false);
-            let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
-            let metadata = entry.metadata().ok();
-            let size = metadata.as_ref().map(|meta| meta.len());
-            let entry_kind = if is_dir { "directory" } else { "file" };
+            let name = child.name;
+            let entry_kind = if child.is_dir { "directory" } else { "file" };
 
-            let segment = sanitize_logical_segment(&name);
-            let mut logical_path = format!("{parent_logical}/{segment}");
-            let mut suffix = 2;
-            while !used_paths.insert(logical_path.clone()) {
-                logical_path = format!("{parent_logical}/{segment}-{suffix}");
-                suffix += 1;
-            }
+            let logical_path = unique_internal_child_path(
+                &parent_logical,
+                &name,
+                &format!("ext-inode-{}", child.inode_number),
+                &mut used_paths,
+            );
             let child_ext_path = if ext_path == "/" {
                 format!("/{name}")
             } else {
@@ -10253,12 +17805,28 @@ fn process_ext_partition_entries(
                 "storage_area": "allocated_file",
                 "source_entry_name": name,
                 "ext_path": child_ext_path,
-                "ext_is_symlink": is_symlink,
-                "ext_mode_octal": metadata.as_ref().map(|meta| format!("{:o}", meta.mode())),
-                "ext_uid": metadata.as_ref().map(|meta| meta.uid()),
-                "ext_gid": metadata.as_ref().map(|meta| meta.gid()),
+                "ext_inode_number": child.inode_number,
+                "ext_inode_logical_offset": child.inode_filesystem_offset,
+                "ext_inode_physical_offset": child.inode_filesystem_offset.map(|offset| start_offset.saturating_add(offset)),
+                "file_data_logical_offset": child.data_location.map(|location| location.filesystem_offset),
+                "file_data_physical_offset": child.data_location.map(|location| start_offset.saturating_add(location.filesystem_offset)),
+                "file_data_file_offset": child.data_location.map(|location| location.file_offset),
+                "file_data_contiguous_bytes": child.data_location.map(|location| location.contiguous_bytes),
+                "physical_offset_basis": child.data_location.map(|location| match location.storage {
+                    ext4::DataLocationStorage::Extent => "ext first allocated extent",
+                    ext4::DataLocationStorage::InlineSymlink => "ext inline symlink target in inode record",
+                }),
+                "ext_is_symlink": child.is_symlink,
+                "ext_mode_octal": format!("{:o}", child.mode),
+                "ext_uid": child.uid,
+                "ext_gid": child.gid,
+                "created_utc": child.btime_utc.clone().or_else(|| child.ctime_utc.clone()),
+                "modified_utc": child.mtime_utc,
+                "accessed_utc": child.atime_utc,
             });
             add_entry_category(&mut entry_metadata, &logical_path, &name, entry_kind);
+            let is_dir = child.is_dir;
+            let size = i64::try_from(child.size).unwrap_or(i64::MAX);
             upsert_filesystem_entry(
                 conn,
                 case_id,
@@ -10266,7 +17834,7 @@ fn process_ext_partition_entries(
                 &logical_path,
                 &name,
                 entry_kind,
-                size.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                if is_dir { None } else { Some(size) },
                 &entry_metadata.to_string(),
                 job_id,
             )?;
@@ -10355,16 +17923,55 @@ fn scan_lost_partitions(
             let Some(filesystem) = detect_volume_filesystem_at(reader, candidate)? else {
                 continue;
             };
-            let volume_size = recovered_volume_size(reader, candidate, filesystem)?
-                .unwrap_or(gap_end - candidate)
-                .min(gap_end - candidate);
+            let bitlocker_locked = filesystem == BITLOCKER_LOCKED_FILESYSTEM;
+            let volume_size = if bitlocker_locked {
+                gap_end - candidate
+            } else {
+                recovered_volume_size(reader, candidate, filesystem)?
+                    .unwrap_or(gap_end - candidate)
+                    .min(gap_end - candidate)
+            };
             recovered += 1;
             resume_after = candidate.saturating_add(volume_size);
-            let fs_lower = filesystem.to_ascii_lowercase();
-            let name = format!("recovered-{recovered:02}-{fs_lower}");
+            let fs_slug = if bitlocker_locked {
+                "bitlocker-locked".to_string()
+            } else {
+                filesystem.to_ascii_lowercase()
+            };
+            let name = format!("recovered-{recovered:02}-{fs_slug}");
             let volume_prefix = format!("/Image Analysis/Volumes/{name}");
             if *indexed >= max_entries {
                 return Ok(true);
+            }
+            let bitlocker_inspection = if bitlocker_locked {
+                bitlocker_inspection_at(reader, candidate, Some(volume_size))?
+            } else {
+                None
+            };
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "recovered_partition",
+                "recovery_source": "boot_sector_scan",
+                "recovery_status": "orphaned boot sector found in unpartitioned gap",
+                "filesystem": filesystem,
+                "detected_filesystem": filesystem,
+                "start_offset": candidate,
+                "size_bytes": volume_size,
+                "end_offset_exclusive": candidate.saturating_add(volume_size),
+                "gap_start": gap_start,
+                "gap_end": gap_end,
+                "filesystem_parser": if bitlocker_locked { "locked" } else { "pending" },
+                "filesystem_browsing_status": if bitlocker_locked {
+                    bitlocker_status_message(bitlocker_inspection.as_ref())
+                } else {
+                    "filesystem parser pending"
+                },
+                "volume_entry_prefix": volume_prefix,
+            });
+            if bitlocker_locked {
+                merge_json_object(
+                    &mut metadata,
+                    &bitlocker_metadata_value(bitlocker_inspection.as_ref()),
+                );
             }
             insert_image_record(
                 conn,
@@ -10373,23 +17980,15 @@ fn scan_lost_partitions(
                 &format!("/Image Analysis/Partitions/{name}.record"),
                 &name,
                 Some(i64::try_from(volume_size).unwrap_or(i64::MAX)),
-                &serde_json::json!({
-                    "artifact_kind": "recovered_partition",
-                    "recovery_source": "boot_sector_scan",
-                    "recovery_status": "orphaned boot sector found in unpartitioned gap",
-                    "detected_filesystem": filesystem,
-                    "start_offset": candidate,
-                    "size_bytes": volume_size,
-                    "end_offset_exclusive": candidate.saturating_add(volume_size),
-                    "gap_start": gap_start,
-                    "gap_end": gap_end,
-                    "volume_entry_prefix": volume_prefix,
-                }),
+                &metadata,
                 job_id,
             )?;
             *indexed += 1;
             if *indexed >= max_entries {
                 return Ok(true);
+            }
+            if bitlocker_locked {
+                continue;
             }
             let parse_result = if filesystem == "FAT" {
                 process_fat_partition_entries(
@@ -10422,6 +18021,7 @@ fn scan_lost_partitions(
                     max_entries,
                 )
             };
+            let fs_lower = filesystem.to_ascii_lowercase();
             match parse_result {
                 Ok(parse_truncated) => truncated |= parse_truncated,
                 Err(err) => {
@@ -10499,6 +18099,22 @@ fn detect_volume_filesystem_at(
     // ext2/3/4: s_magic == 0xEF53 at superblock offset 0x38 (absolute 0x438).
     if bytes_read >= 0x43A && header[0x438] == 0x53 && header[0x439] == 0xEF {
         return Ok(Some("EXT"));
+    }
+
+    // Fixed-disk BitLocker/FVE encrypted volumes advertise a locked volume
+    // header instead of a plaintext filesystem boot sector.
+    if bytes_read >= 11 && &header[3..11] == BITLOCKER_FVE_SIGNATURE {
+        return Ok(Some(BITLOCKER_LOCKED_FILESYSTEM));
+    }
+
+    // BitLocker-To-Go can use an MSWIN4.1-looking header, which is also common
+    // on ordinary FAT media. Only label it as BitLocker when the FVE metadata
+    // itself parses; otherwise continue with normal FAT detection below.
+    if bytes_read >= 11
+        && &header[3..11] == b"MSWIN4.1"
+        && bitlocker_inspection_at(reader, start_offset, None)?.is_some()
+    {
+        return Ok(Some(BITLOCKER_LOCKED_FILESYSTEM));
     }
 
     if bytes_read < 512 || header[510] != 0x55 || header[511] != 0xAA {
@@ -10912,16 +18528,20 @@ fn scan_fat_deleted_entries(
                     ),
                 });
                 add_entry_category(&mut metadata, &logical_path, &name, "file");
-                let content_head = data_physical_offset.and_then(|offset| {
-                    let mut head = vec![0_u8; CONTENT_INDEX_BYTES.min(file_size as usize)];
-                    if head.is_empty() {
-                        return None;
-                    }
-                    reader.seek(SeekFrom::Start(offset)).ok()?;
-                    let read = reader.read(&mut head).ok()?;
-                    head.truncate(read);
-                    Some(head)
-                });
+                let content_head = if processing_profile().capture_content {
+                    data_physical_offset.and_then(|offset| {
+                        let mut head = vec![0_u8; CONTENT_INDEX_BYTES.min(file_size as usize)];
+                        if head.is_empty() {
+                            return None;
+                        }
+                        reader.seek(SeekFrom::Start(offset)).ok()?;
+                        let read = reader.read(&mut head).ok()?;
+                        head.truncate(read);
+                        Some(head)
+                    })
+                } else {
+                    None
+                };
                 upsert_deleted_filesystem_entry_with_content(
                     conn,
                     case_id,
@@ -11265,7 +18885,13 @@ fn walk_ntfs_volume<T: Read + Seek>(
                     extension_lower(&child.name).or_else(|| extension_lower(&logical_path))
                 {
                     if ext == "eml" {
-                        if child.size_bytes <= EMAIL_PARSE_MAX_BYTES {
+                        if !processing_profile().parse_emails {
+                            mark_email_parse_skipped(
+                                &mut metadata,
+                                "eml",
+                                EMAIL_PARSE_DISABLED_NOTE,
+                            );
+                        } else if child.size_bytes <= EMAIL_PARSE_MAX_BYTES {
                             match read_ntfs_file_record_bytes(
                                 ntfs,
                                 fs,
@@ -11289,7 +18915,9 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             );
                         }
                     } else if is_text_rfc822_email_candidate(&ext, &logical_path, &child.name) {
-                        if child.size_bytes <= EMAIL_PARSE_MAX_BYTES {
+                        if processing_profile().parse_emails
+                            && child.size_bytes <= EMAIL_PARSE_MAX_BYTES
+                        {
                             if let Ok(bytes) = read_ntfs_file_record_bytes(
                                 ntfs,
                                 fs,
@@ -11340,7 +18968,10 @@ fn walk_ntfs_volume<T: Read + Seek>(
                         }
 
                         let stream_display_name = format!("{}:{}", child.name, stream.name);
-                        let stream_logical_path = format!("{logical_path}:{}", stream.name);
+                        let stream_logical_path = format!(
+                            "{logical_path}~{}",
+                            internal_source_segment(&format!("ads:{}", stream.name))
+                        );
                         let stream_ntfs_path = format!("{ntfs_path}:{}", stream.name);
                         let stream_physical_offset = stream
                             .file_data_logical_offset
@@ -11531,7 +19162,9 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
                 extension_lower(&name.name).or_else(|| extension_lower(&logical_path))
             {
                 if ext == "eml" {
-                    if name.data_size <= EMAIL_PARSE_MAX_BYTES {
+                    if !processing_profile().parse_emails {
+                        mark_email_parse_skipped(&mut metadata, "eml", EMAIL_PARSE_DISABLED_NOTE);
+                    } else if name.data_size <= EMAIL_PARSE_MAX_BYTES {
                         match read_ntfs_file_record_bytes(
                             ntfs,
                             fs,
@@ -11555,7 +19188,8 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
                         );
                     }
                 } else if is_text_rfc822_email_candidate(&ext, &logical_path, &name.name) {
-                    if name.data_size <= EMAIL_PARSE_MAX_BYTES {
+                    if processing_profile().parse_emails && name.data_size <= EMAIL_PARSE_MAX_BYTES
+                    {
                         if let Ok(bytes) = read_ntfs_file_record_bytes(
                             ntfs,
                             fs,
@@ -12121,20 +19755,12 @@ fn unique_child_logical_path(
     child: &NtfsDirChild,
     used_child_paths: &mut HashSet<String>,
 ) -> String {
-    let segment = sanitize_logical_segment(&child.name);
-    let mut logical_path = format!("{parent_path}/{segment}");
-    if used_child_paths.insert(logical_path.clone()) {
-        return logical_path;
-    }
-
-    let mut suffix = format!("mft{}", child.file_record_number);
-    loop {
-        logical_path = format!("{parent_path}/{segment}-{suffix}");
-        if used_child_paths.insert(logical_path.clone()) {
-            return logical_path;
-        }
-        suffix.push('_');
-    }
+    unique_internal_child_path(
+        parent_path,
+        &child.name,
+        &format!("ntfs-mft-{}", child.file_record_number),
+        used_child_paths,
+    )
 }
 
 fn ntfs_time_to_rfc3339(value: ntfs::NtfsTime) -> Option<String> {
@@ -12236,15 +19862,8 @@ fn read_image_ext_entry_bytes(
         return Ok(None);
     };
     let start_offset = image_partition_start_offset(entry, "EXT")?;
-    let opened = open_disk_image(Path::new(&entry.source_path))?;
-    let reader = Ext4ImageReader {
-        reader: opened.reader,
-        partition_start: start_offset,
-    };
-    let fs = ext4_view::Ext4::load(Box::new(reader))
-        .map_err(|err| anyhow!("opening ext filesystem for {}: {err}", entry.logical_path))?;
-    let data = fs
-        .read(ext_path)
+    let fs = open_ext4_superblock(Path::new(&entry.source_path), start_offset)?;
+    let data = ext4_read_file_bytes(&fs, ext_path)
         .map_err(|err| anyhow!("reading ext entry {}: {err}", entry.logical_path))?;
     let total_size = data.len() as u64;
     let start = offset.min(total_size) as usize;
@@ -12536,6 +20155,91 @@ fn read_ntfs_unallocated_stream_bytes<T: Read + Seek>(
     Ok((bytes, total_size))
 }
 
+/// Rewrites a legacy Debug-formatted FAT timestamp (`DateTime { date: Date {
+/// year: 2022, .. }, .. }` / `Date { year: 2022, .. }`) into the same
+/// ISO-8601 form `fat_datetime_iso`/`fat_date_iso` produce. Older cases
+/// stored `format!("{:?}")` text, which neither SQL date-range filters nor
+/// the UI could interpret. Returns `None` when the value is not in the
+/// legacy debug shape (already normalized, or a zero/unset date).
+fn normalize_legacy_fat_timestamp(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let is_datetime = trimmed.starts_with("DateTime {");
+    let is_date = trimmed.starts_with("Date {");
+    if !is_datetime && !is_date {
+        return None;
+    }
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            numbers.push(current.parse::<u16>().ok()?);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current.parse::<u16>().ok()?);
+    }
+    match (is_datetime, numbers.as_slice()) {
+        (true, [year, month, day, hour, min, sec, millis]) => {
+            if *year == 0 {
+                return None;
+            }
+            let base = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}");
+            Some(if *millis != 0 {
+                format!("{base}.{millis:03}Z")
+            } else {
+                format!("{base}Z")
+            })
+        }
+        (false, [year, month, day]) => {
+            if *year == 0 {
+                return None;
+            }
+            Some(format!("{year:04}-{month:02}-{day:02}"))
+        }
+        _ => None,
+    }
+}
+
+/// Repairs legacy Debug-formatted `fat_*` timestamps in one entry's stored
+/// metadata (see `normalize_legacy_fat_timestamp`). Returns true when any
+/// value was rewritten.
+fn repair_legacy_fat_timestamps(metadata: &mut serde_json::Value) -> bool {
+    let Some(object) = metadata.as_object_mut() else {
+        return false;
+    };
+    let mut repaired = false;
+    for key in ["fat_created", "fat_accessed", "fat_modified"] {
+        let Some(serde_json::Value::String(value)) = object.get(key) else {
+            continue;
+        };
+        if let Some(normalized) = normalize_legacy_fat_timestamp(value) {
+            object.insert(key.to_string(), serde_json::Value::String(normalized));
+            repaired = true;
+        } else if value.trim().starts_with("DateTime {") || value.trim().starts_with("Date {") {
+            // Legacy zero/unset dates decode to nothing meaningful: store the
+            // same "absent" the current parser would (null).
+            object.insert(key.to_string(), serde_json::Value::Null);
+            repaired = true;
+        }
+    }
+    if repaired && !object.contains_key("fat_time_basis") {
+        object.insert(
+            "fat_time_basis".to_string(),
+            serde_json::Value::String(FAT_TIME_BASIS_NOTE.to_string()),
+        );
+    }
+    repaired
+}
+
+/// FAT stores device-local wall-clock time with no timezone; the nominal `Z`
+/// in rendered values only marks the string as unadjusted. Recorded on every
+/// FAT entry so reports and the inspector keep that limitation visible.
+const FAT_TIME_BASIS_NOTE: &str =
+    "FAT device local time (filesystem records no timezone; Z suffix is nominal)";
+
 fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
     conn: &Connection,
     case_id: i64,
@@ -12551,6 +20255,7 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
     max_entries: usize,
     truncated: &mut bool,
 ) -> Result<()> {
+    let mut used_child_paths = HashSet::new();
     for entry_result in dir.iter() {
         if *indexed >= max_entries {
             *truncated = true;
@@ -12561,13 +20266,17 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
         if raw_name == "." || raw_name == ".." {
             continue;
         }
-        let segment = sanitize_logical_segment(&raw_name);
-        let logical_path = format!("{parent_path}/{segment}");
         let fat_path = if parent_fat_path.is_empty() {
             raw_name.clone()
         } else {
             format!("{parent_fat_path}/{raw_name}")
         };
+        let logical_path = unique_internal_child_path(
+            parent_path,
+            &raw_name,
+            &format!("fat:{fat_path}"),
+            &mut used_child_paths,
+        );
         let entry_kind = if entry.is_dir() { "directory" } else { "file" };
         let size_bytes = entry
             .is_file()
@@ -12580,15 +20289,18 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
             "partition_size_bytes": partition_size_bytes,
             "source_entry_name": raw_name,
             "fat_path": fat_path,
-            "fat_created": format!("{:?}", entry.created()),
-            "fat_accessed": format!("{:?}", entry.accessed()),
-            "fat_modified": format!("{:?}", entry.modified()),
+            "fat_created": fat_datetime_iso(entry.created()),
+            "fat_accessed": fat_date_iso(entry.accessed()),
+            "fat_modified": fat_datetime_iso(entry.modified()),
+            "fat_time_basis": FAT_TIME_BASIS_NOTE,
         });
         if entry.is_file() {
             if let Some(ext) = extension_lower(&raw_name).or_else(|| extension_lower(&logical_path))
             {
                 if ext == "eml" {
-                    if entry.len() <= EMAIL_PARSE_MAX_BYTES {
+                    if !processing_profile().parse_emails {
+                        mark_email_parse_skipped(&mut metadata, "eml", EMAIL_PARSE_DISABLED_NOTE);
+                    } else if entry.len() <= EMAIL_PARSE_MAX_BYTES {
                         let mut file = entry.to_file();
                         let mut bytes = Vec::new();
                         match file.read_to_end(&mut bytes) {
@@ -12609,7 +20321,7 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
                         );
                     }
                 } else if is_text_rfc822_email_candidate(&ext, &logical_path, &raw_name) {
-                    if entry.len() <= EMAIL_PARSE_MAX_BYTES {
+                    if processing_profile().parse_emails && entry.len() <= EMAIL_PARSE_MAX_BYTES {
                         let mut file = entry.to_file();
                         let mut bytes = Vec::new();
                         if file.read_to_end(&mut bytes).is_ok() {
@@ -12852,6 +20564,7 @@ fn upsert_filesystem_entry_with_deleted(
     job_id: i64,
     content_head: Option<&[u8]>,
 ) -> Result<()> {
+    let metadata_json = metadata_json_with_path_identity(logical_path, metadata_json)?;
     conn.execute(
         "INSERT INTO filesystem_entries(
              case_id, evidence_id, logical_path, name, entry_kind, size_bytes, is_deleted,
@@ -12924,6 +20637,9 @@ fn path_search_results(
         .into_iter()
         .map(
             |(entry_id, evidence_id, logical_path, name, entry_kind, metadata_json)| {
+                let source_path_exact = serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .ok()
+                    .and_then(|metadata| source_path_exact_from_metadata(&metadata));
                 // A hit can come from the path/name text or from parsed metadata (e.g. an email
                 // subject/body a parser extracted). Report which one actually matched instead of
                 // always labeling it "path", and show the real matching text for metadata hits
@@ -12934,20 +20650,24 @@ fn path_search_results(
                     return DeepSearchResult {
                         evidence_id,
                         entry_id,
+                        internal_path_key: logical_path.clone(),
                         logical_path: logical_path.clone(),
+                        source_path_exact: source_path_exact.clone(),
                         display_name: name,
                         entry_kind,
                         match_kind: "path".to_string(),
                         selection_offset: None,
                         selection_length: None,
-                        data_preview: Some(logical_path),
+                        data_preview: source_path_exact.or(Some(logical_path)),
                     };
                 }
                 if let Some(offset) = metadata_json.to_ascii_lowercase().find(query_lower) {
                     return DeepSearchResult {
                         evidence_id,
                         entry_id,
+                        internal_path_key: logical_path.clone(),
                         logical_path,
+                        source_path_exact,
                         display_name: name,
                         entry_kind,
                         match_kind: "metadata".to_string(),
@@ -12962,13 +20682,15 @@ fn path_search_results(
                 DeepSearchResult {
                     evidence_id,
                     entry_id,
+                    internal_path_key: logical_path.clone(),
                     logical_path: logical_path.clone(),
+                    source_path_exact: source_path_exact.clone(),
                     display_name: name,
                     entry_kind,
                     match_kind: "path".to_string(),
                     selection_offset: None,
                     selection_length: None,
-                    data_preview: Some(logical_path),
+                    data_preview: source_path_exact.or(Some(logical_path)),
                 }
             },
         )
@@ -12991,7 +20713,8 @@ fn content_search_results(
     // non-media file. Matches beyond that window, media files, and entries from existing cases that
     // have not been reprocessed are not indexed and therefore keep content_head NULL.
     let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.content_head
+        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
+                fe.content_head, fe.metadata_json
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
@@ -13010,6 +20733,7 @@ fn content_search_results(
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     )?;
@@ -13017,8 +20741,15 @@ fn content_search_results(
         if results.len() >= max_results {
             break;
         }
-        let (entry_id, evidence_id, logical_path, display_name, entry_kind, content_head) =
-            row.context("reading content search candidate")?;
+        let (
+            entry_id,
+            evidence_id,
+            logical_path,
+            display_name,
+            entry_kind,
+            content_head,
+            metadata_json,
+        ) = row.context("reading content search candidate")?;
         let Some(content_head) = content_head else {
             continue;
         };
@@ -13033,6 +20764,9 @@ fn content_search_results(
                 &logical_path,
                 &display_name,
                 &entry_kind,
+                serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .ok()
+                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
                 hit,
                 results,
             );
@@ -13056,7 +20790,8 @@ fn content_hex_search_results(
 ) -> Result<()> {
     const CONTENT_SEARCH_MAX_FILES: usize = 100_000;
     let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.content_head
+        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
+                fe.content_head, fe.metadata_json
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
@@ -13076,6 +20811,7 @@ fn content_hex_search_results(
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     )?;
@@ -13083,8 +20819,15 @@ fn content_hex_search_results(
         if results.len() >= max_results {
             break;
         }
-        let (entry_id, evidence_id, logical_path, display_name, entry_kind, content_head) =
-            row.context("reading hex search candidate")?;
+        let (
+            entry_id,
+            evidence_id,
+            logical_path,
+            display_name,
+            entry_kind,
+            content_head,
+            metadata_json,
+        ) = row.context("reading hex search candidate")?;
         let Some(content_head) = content_head else {
             continue;
         };
@@ -13096,7 +20839,11 @@ fn content_hex_search_results(
             results.push(DeepSearchResult {
                 evidence_id,
                 entry_id,
+                internal_path_key: logical_path.clone(),
                 logical_path,
+                source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .ok()
+                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
                 display_name,
                 entry_kind,
                 match_kind: "content".to_string(),
@@ -13124,13 +20871,16 @@ fn push_content_search_result(
     logical_path: &str,
     display_name: &str,
     entry_kind: &str,
+    source_path_exact: Option<String>,
     hit: ContentSearchHit,
     results: &mut Vec<DeepSearchResult>,
 ) {
     results.push(DeepSearchResult {
         evidence_id,
         entry_id,
+        internal_path_key: logical_path.to_string(),
         logical_path: logical_path.to_string(),
+        source_path_exact,
         display_name: display_name.to_string(),
         entry_kind: entry_kind.to_string(),
         match_kind: "content".to_string(),
@@ -14135,6 +21885,8 @@ fn report_category_entry_item(
 ) -> BookmarkItem {
     let item_ref_json = report_entry_item_ref_json(&entry);
     let display_name = report_entry_display_name(&entry);
+    let internal_path_key = entry.internal_path_key.clone();
+    let source_path_exact = entry.source_path_exact.clone();
     let item_order = base_order.saturating_add(i64::try_from(index + 1).unwrap_or(i64::MAX));
     BookmarkItem {
         id: -item_order,
@@ -14144,6 +21896,8 @@ fn report_category_entry_item(
         item_order,
         display_name: Some(display_name),
         logical_path: Some(entry.logical_path),
+        internal_path_key: Some(internal_path_key),
+        source_path_exact,
         selection_offset: None,
         selection_length: None,
         data_preview: report_entry_preview(&item_ref_json),
@@ -14153,8 +21907,11 @@ fn report_category_entry_item(
 }
 
 fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
-    let mut object = entry
-        .metadata_json
+    let mut metadata_for_report = entry.metadata_json.clone();
+    if let Some(metadata_object) = metadata_for_report.as_object_mut() {
+        metadata_object.remove("search_text");
+    }
+    let mut object = metadata_for_report
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
@@ -14172,12 +21929,24 @@ fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
     );
     object.insert("entry_id".to_string(), serde_json::json!(entry.id));
     object.insert(
+        "index_job_id".to_string(),
+        serde_json::json!(entry.discovered_by_job_id),
+    );
+    object.insert(
         "entry_kind".to_string(),
         serde_json::json!(entry.entry_kind),
     );
     object.insert(
         "logical_path".to_string(),
         serde_json::json!(entry.logical_path),
+    );
+    object.insert(
+        "internal_path_key".to_string(),
+        serde_json::json!(entry.internal_path_key),
+    );
+    object.insert(
+        "source_path_exact".to_string(),
+        serde_json::json!(entry.source_path_exact),
     );
     object.insert(
         "display_name".to_string(),
@@ -14191,10 +21960,6 @@ fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
         "is_deleted".to_string(),
         serde_json::json!(entry.is_deleted),
     );
-    let mut metadata_for_report = entry.metadata_json.clone();
-    if let Some(metadata_object) = metadata_for_report.as_object_mut() {
-        metadata_object.remove("search_text");
-    }
     object.insert("metadata".to_string(), metadata_for_report);
     if let Some(kind) = artifact_kind.filter(|kind| is_browser_activity_artifact_kind(kind)) {
         object.insert("kind".to_string(), serde_json::json!("browser_activity"));
@@ -14203,6 +21968,139 @@ fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
         object.insert("kind".to_string(), serde_json::json!("category_entry"));
     }
     serde_json::Value::Object(object)
+}
+
+fn enrich_entry_path_identity(entry: &FilesystemEntry, item_ref: &mut serde_json::Value) {
+    let Some(object) = item_ref.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "internal_path_key".to_string(),
+        serde_json::json!(entry.internal_path_key),
+    );
+    object.insert(
+        "source_path_exact".to_string(),
+        serde_json::json!(entry.source_path_exact),
+    );
+}
+
+fn enrich_bookmark_partition_numbering(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    item_ref: &mut serde_json::Value,
+) -> Result<()> {
+    let Some(object) = item_ref.as_object_mut() else {
+        return Ok(());
+    };
+    if object.contains_key("volume_index_zero_based")
+        || object.contains_key("partition_number_one_based")
+    {
+        return Ok(());
+    }
+    let Some(requested_volume_index) = ["volume", "volume_index", "partition_index"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(|value| value.as_u64()))
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return Ok(());
+    };
+    let Some(evidence_id) = evidence_id else {
+        return Ok(());
+    };
+    let (source_kind, source_path): (String, String) = conn.query_row(
+        "SELECT source_kind, source_path FROM evidence_sources
+         WHERE case_id = ?1 AND id = ?2",
+        params![case_id, evidence_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (volume_index_zero_based, partition_number_one_based) =
+        live_volume_numbering(&source_kind, &source_path, requested_volume_index)?;
+    object.insert(
+        "volume_index_zero_based".to_string(),
+        serde_json::json!(volume_index_zero_based),
+    );
+    object.insert(
+        "partition_number_one_based".to_string(),
+        serde_json::json!(partition_number_one_based),
+    );
+    Ok(())
+}
+
+fn enrich_index_job_provenance(
+    conn: &Connection,
+    entry: &FilesystemEntry,
+    item_ref: &mut serde_json::Value,
+) -> Result<()> {
+    let Some(job_id) = entry.discovered_by_job_id else {
+        return Ok(());
+    };
+    let provenance = conn
+        .query_row(
+            "SELECT job_type, status,
+                    CAST(COALESCE(
+                        json_extract(parameters_json, '$.max_entries'),
+                        json_extract(parameters_json, '$.max_visits')
+                    ) AS INTEGER),
+                    COALESCE(
+                        CAST(json_extract(parameters_json, '$.entries_indexed') AS INTEGER),
+                        (SELECT COUNT(*) FROM filesystem_entries
+                         WHERE discovered_by_job_id = evidence_jobs.id)
+                    ),
+                    error
+             FROM evidence_jobs
+             WHERE id = ?1",
+            params![job_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((job_type, status, requested_limit, entries_indexed, reason)) = provenance else {
+        return Ok(());
+    };
+    let Some(object) = item_ref.as_object_mut() else {
+        return Ok(());
+    };
+    let coverage = processing_coverage_text(
+        Some(&job_type),
+        Some(&status),
+        requested_limit,
+        entries_indexed,
+        reason.as_deref(),
+    );
+    object.insert("index_job_id".to_string(), serde_json::json!(job_id));
+    object.insert(
+        "index_job_type".to_string(),
+        serde_json::json!(job_type.as_str()),
+    );
+    object.insert(
+        "index_job_status".to_string(),
+        serde_json::json!(status.as_str()),
+    );
+    object.insert(
+        "index_requested_entry_limit".to_string(),
+        serde_json::json!(requested_limit),
+    );
+    object.insert(
+        "index_entries_indexed".to_string(),
+        serde_json::json!(entries_indexed),
+    );
+    object.insert(
+        "index_truncation_reason".to_string(),
+        serde_json::json!(reason.as_deref()),
+    );
+    object.insert(
+        "index_processing_coverage".to_string(),
+        serde_json::json!(coverage),
+    );
+    Ok(())
 }
 
 fn is_browser_activity_artifact_kind(kind: &str) -> bool {
@@ -14388,7 +22286,12 @@ fn ensure_evidence_hash_columns(conn: &Connection) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("collecting evidence_sources columns")?;
-    for column in ["sha256_hex", "hashed_at"] {
+    for column in [
+        "sha256_hex",
+        "hashed_at",
+        "sha256_scope",
+        "acquisition_manifest_json",
+    ] {
         if !existing.iter().any(|name| name == column) {
             conn.execute(
                 &format!("ALTER TABLE evidence_sources ADD COLUMN {column} TEXT"),
@@ -14396,6 +22299,36 @@ fn ensure_evidence_hash_columns(conn: &Connection) -> Result<()> {
             )
             .with_context(|| format!("adding evidence_sources.{column} column"))?;
         }
+    }
+    // Existing hashes retain their original semantics. Before this column was
+    // added, hash_evidence always hashed decoded media for images and the file
+    // bytes for ordinary file evidence. Backfill that known scope only; a
+    // missing acquisition manifest stays NULL because those files were never
+    // independently hashed by the old implementation.
+    let needs_scope_backfill = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM evidence_sources
+                 WHERE sha256_hex IS NOT NULL AND sha256_scope IS NULL
+                 LIMIT 1
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("checking whether existing evidence hashes need a scope")?
+        != 0;
+    if needs_scope_backfill {
+        conn.execute(
+            "UPDATE evidence_sources
+             SET sha256_scope = CASE source_kind
+                 WHEN 'image' THEN 'logical_media'
+                 WHEN 'file' THEN 'file'
+                 ELSE NULL
+             END
+             WHERE sha256_hex IS NOT NULL AND sha256_scope IS NULL",
+            [],
+        )
+        .context("backfilling the known scope of existing evidence hashes")?;
     }
     Ok(())
 }
@@ -14920,6 +22853,12 @@ fn read_bookmark_item(conn: &Connection, case_id: i64, item_id: i64) -> Result<B
 
 fn bookmark_item_from_raw(raw: RawBookmarkItem) -> Result<BookmarkItem> {
     let item_ref_json = parse_stored_item_json(&raw.item_ref_json, "item_ref_json", raw.id)?;
+    let source_path_exact = bookmark_item_exact_source_path(&item_ref_json);
+    let internal_path_key = item_ref_json
+        .get("internal_path_key")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| raw.logical_path.clone());
     Ok(BookmarkItem {
         id: raw.id,
         bookmark_id: raw.bookmark_id,
@@ -14928,6 +22867,8 @@ fn bookmark_item_from_raw(raw: RawBookmarkItem) -> Result<BookmarkItem> {
         item_order: raw.item_order,
         display_name: raw.display_name,
         logical_path: raw.logical_path,
+        internal_path_key,
+        source_path_exact,
         selection_offset: raw.selection_offset,
         selection_length: raw.selection_length,
         data_preview: raw.data_preview,
@@ -14957,22 +22898,61 @@ fn display_entry_path(path: &str) -> String {
     path.to_string()
 }
 
-fn render_report_items_html(html: &mut String, items: &[BookmarkItem]) {
+fn bookmark_item_exact_source_path(item_ref: &serde_json::Value) -> Option<String> {
+    source_path_exact_from_metadata(item_ref)
+        .or_else(|| {
+            item_ref
+                .get("metadata")
+                .and_then(source_path_exact_from_metadata)
+        })
+        .or_else(|| {
+            matches!(
+                item_ref.get("kind").and_then(|value| value.as_str()),
+                Some("live_file" | "live_dir")
+            )
+            .then(|| {
+                item_ref
+                    .get("relative_path")
+                    .or_else(|| item_ref.get("path"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .flatten()
+        })
+}
+
+fn render_report_items_html(
+    html: &mut String,
+    items: &[BookmarkItem],
+    evidence_by_id: &HashMap<i64, &ReportEvidence>,
+) {
     if items.is_empty() {
         html.push_str("<p class=\"meta\">No bookmark items.</p>");
         return;
     }
 
-    html.push_str("<table class=\"items\"><thead><tr><th>Order</th><th>Name</th><th>Path</th><th>Selection</th><th>Preview</th><th>Reference</th></tr></thead><tbody>");
-    for item in items {
+    html.push_str("<table class=\"items bookmark-items\"><thead><tr><th>Position</th><th>Name</th><th>Source path / KDFT internal path</th><th>Selection</th><th>Artifact</th><th>Reference</th></tr></thead><tbody>");
+    for (index, item) in items.iter().enumerate() {
         html.push_str("<tr><td>");
-        html.push_str(&item.item_order.to_string());
+        html.push_str(&(index + 1).to_string());
         html.push_str("</td><td>");
         html.push_str(&escape_html(item.display_name.as_deref().unwrap_or("")));
         html.push_str("</td><td>");
-        html.push_str(&escape_html(&display_entry_path(
-            item.logical_path.as_deref().unwrap_or(""),
-        )));
+        if let Some(source_path_exact) = bookmark_item_exact_source_path(&item.item_ref_json) {
+            html.push_str("<strong>Exact source path:</strong> ");
+            html.push_str(&escape_html(&source_path_exact));
+            if let Some(internal_path) = item.logical_path.as_deref() {
+                html.push_str("<br><span class=\"meta\">KDFT internal path: ");
+                html.push_str(&escape_html(&display_entry_path(internal_path)));
+                html.push_str("</span>");
+            }
+        } else if let Some(internal_path) = item.logical_path.as_deref() {
+            html.push_str(
+                "<span class=\"meta\">Exact source path unavailable; KDFT internal path: ",
+            );
+            html.push_str(&escape_html(&display_entry_path(internal_path)));
+            html.push_str("</span>");
+        }
         html.push_str("</td><td>");
         if let Some(offset) = item.selection_offset {
             html.push_str("offset ");
@@ -14986,7 +22966,10 @@ fn render_report_items_html(html: &mut String, items: &[BookmarkItem]) {
             html.push_str(&length.to_string());
         }
         html.push_str("</td><td>");
-        render_report_item_preview_html(html, item);
+        let evidence = item
+            .evidence_id
+            .and_then(|evidence_id| evidence_by_id.get(&evidence_id).copied());
+        render_report_item_preview_html(html, item, evidence);
         html.push_str("</td><td>");
         render_report_item_reference_html(html, item);
         html.push_str("</td></tr>");
@@ -14994,12 +22977,16 @@ fn render_report_items_html(html: &mut String, items: &[BookmarkItem]) {
     html.push_str("</tbody></table>");
 }
 
-fn render_report_item_preview_html(html: &mut String, item: &BookmarkItem) {
+fn render_report_item_preview_html(
+    html: &mut String,
+    item: &BookmarkItem,
+    evidence: Option<&ReportEvidence>,
+) {
     if render_email_details_html(html, &item.item_ref_json) {
         // Email bookmarks still carry forensic context (MAC times, deleted/recovered state,
         // offsets, size, extension) when the item ref has it, so append it after the
         // email-specific fields instead of stopping here.
-        render_forensic_context_details_html(html, item);
+        render_forensic_context_details_html(html, item, evidence);
         return;
     }
     if render_browser_activity_details_html(html, &item.item_ref_json) {
@@ -15014,7 +23001,7 @@ fn render_report_item_preview_html(html: &mut String, item: &BookmarkItem) {
         }
         return;
     }
-    if render_forensic_context_details_html(html, item) {
+    if render_forensic_context_details_html(html, item, evidence) {
         if let Some(preview) = item
             .data_preview
             .as_deref()
@@ -15047,6 +23034,15 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
         html.push_str("<span class=\"meta\">search_result</span>");
         return;
     }
+    if item
+        .item_ref_json
+        .get("kind")
+        .and_then(|value| value.as_str())
+        == Some("highlighted_bytes")
+    {
+        html.push_str("<span class=\"meta\">highlighted_bytes</span>");
+        return;
+    }
     html.push_str("<pre>");
     let mut item_ref_value = item.item_ref_json.clone();
     if let Some(object) = item_ref_value.as_object_mut() {
@@ -15064,9 +23060,16 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
     html.push_str("</pre>");
 }
 
-fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) -> bool {
+fn render_forensic_context_details_html(
+    html: &mut String,
+    item: &BookmarkItem,
+    evidence: Option<&ReportEvidence>,
+) -> bool {
     let item_ref = &item.item_ref_json;
     let kind = item_ref.get("kind").and_then(|value| value.as_str());
+    let source = item_ref.get("source").and_then(|value| value.as_str());
+    let is_raw_whole_disk_hit =
+        kind == Some("highlighted_bytes") && source == Some("raw_image_whole_disk_scan");
     let has_context = matches!(
         kind,
         Some("search_result")
@@ -15074,6 +23077,7 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
             | Some("filesystem_folder")
             | Some("live_file")
             | Some("live_dir")
+            | Some("highlighted_bytes")
     ) || item_ref.get("mft_record_physical_offset").is_some()
         || item_ref.get("file_data_physical_offset").is_some()
         || item_ref.get("is_deleted").is_some()
@@ -15084,6 +23088,8 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
     }
     html.push_str("<dl class=\"activity-details\"><dt>Artifact</dt><dd>");
     html.push_str(match kind {
+        Some("highlighted_bytes") if is_raw_whole_disk_hit => "Whole-Disk Bitwise Hit",
+        Some("highlighted_bytes") => "Highlighted Bytes",
         Some("live_file") => "Live Browse File",
         Some("live_dir") => "Live Browse Folder",
         Some("filesystem_folder") => "Filesystem Folder",
@@ -15092,20 +23098,144 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
         _ => "Forensic Finding",
     });
     html.push_str("</dd>");
+    if let Some(path) = bookmark_item_exact_source_path(item_ref) {
+        push_detail_value(html, "Source Path (exact)", &path);
+    }
     if let Some(path) = item_ref
-        .get("logical_path")
+        .get("internal_path_key")
         .and_then(|value| value.as_str())
         .or_else(|| {
             item_ref
-                .get("relative_path")
+                .get("logical_path")
                 .and_then(|value| value.as_str())
         })
-        .or_else(|| item_ref.get("path").and_then(|value| value.as_str()))
+        .or(item.logical_path.as_deref())
     {
-        html.push_str("<dt>Path</dt><dd>");
-        html.push_str(&escape_html(&display_entry_path(path)));
-        html.push_str("</dd>");
+        push_detail_value(html, "KDFT Internal Path", &display_entry_path(path));
     }
+    if let Some(value) = activity_value_string(
+        item_ref,
+        &[
+            "evidence_source",
+            "evidence_display_name",
+            "source_evidence_name",
+        ],
+    )
+    .or_else(|| evidence.map(|evidence| evidence.display_name.clone()))
+    {
+        push_detail_value(html, "Evidence Source", &value);
+    }
+    if let Some(value) = activity_value_string(item_ref, &["source_path", "evidence_source_path"])
+        .or_else(|| evidence.map(|evidence| evidence.source_path.clone()))
+    {
+        push_detail_value(html, "Evidence Path", &value);
+    }
+    // EA-001 / EA-004: for an image source the stored evidence digest is the
+    // DECODED logical-media hash, not a hash of the acquisition/container file,
+    // so it must never be labeled "Acquisition SHA-256" - a verifier hashing the
+    // supplied E01/VMDK/VDI file cannot reproduce it. And a finding's scan-time
+    // identity is immutable: render only the hash captured in THIS finding's
+    // item_ref and never backfill it from the current evidence row, so a later
+    // hash job cannot silently rewrite an earlier finding's provenance.
+    let evidence_source_kind = evidence.map(|evidence| evidence.source_kind.as_str());
+    let media_hash_label = match evidence_source_kind {
+        Some("image") => "Logical media SHA-256 (decoded image stream)",
+        Some("file") => "SHA-256 (evidence file)",
+        _ => "Evidence SHA-256",
+    };
+    let scan_time_hash =
+        activity_value_string(item_ref, &["evidence_sha256_hex", "evidence_sha256"]);
+    if let Some(value) = &scan_time_hash {
+        push_detail_value(html, media_hash_label, value);
+    } else if is_raw_whole_disk_hit {
+        push_detail_value(
+            html,
+            media_hash_label,
+            "evidence not hashed at search time - compute the hash before relying on these results in court",
+        );
+    }
+    push_activity_detail(
+        html,
+        item_ref,
+        "Evidence Hashed At",
+        &["evidence_hashed_at"],
+    );
+    // A hash that is NOT part of this finding's captured provenance is shown as
+    // a separate, clearly qualified line - never backfilled into the scan-time
+    // slot above - so a later evidence hash cannot masquerade as scan-time
+    // identity (EA-004).
+    if scan_time_hash.is_none() {
+        if let Some(current) = evidence.and_then(|evidence| evidence.sha256.clone()) {
+            push_detail_value(
+                html,
+                &format!(
+                    "{media_hash_label} (current evidence value, not captured with this finding)"
+                ),
+                &current,
+            );
+        }
+    }
+    // Acquisition/container hashes are a separate identity from the decoded
+    // media hash above. Historical item references do not yet carry this
+    // manifest, so qualify it as the current evidence manifest rather than
+    // implying it was captured with the finding (EA-001/EA-004).
+    if let Some(manifest) =
+        evidence.and_then(|evidence| evidence.acquisition_manifest_json.as_ref())
+    {
+        push_detail_value(
+            html,
+            "Acquisition manifest (current evidence value)",
+            &format!(
+                "{}; {}; {} segment(s); {} acquisition-file bytes",
+                manifest.scheme,
+                if manifest.complete {
+                    "complete"
+                } else {
+                    "partial"
+                },
+                manifest.segment_count,
+                manifest.total_size
+            ),
+        );
+        for (index, segment) in manifest.segments.iter().enumerate() {
+            push_detail_value(
+                html,
+                &format!(
+                    "Acquisition/container file SHA-256 (current evidence manifest, segment {})",
+                    index + 1
+                ),
+                &format!(
+                    "{} — {} bytes — {}",
+                    segment.path, segment.size, segment.sha256
+                ),
+            );
+        }
+        push_detail_value(html, "Acquisition manifest note", &manifest.note);
+    }
+    if let Some(warning) = bookmark_item_processing_warning(item, evidence) {
+        push_detail_value(html, "Processing Coverage Warning", &warning);
+    }
+    push_activity_detail(html, item_ref, "Index Job ID", &["index_job_id"]);
+    push_activity_detail(html, item_ref, "Index Job Status", &["index_job_status"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Requested Index Entry Limit",
+        &["index_requested_entry_limit"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Index Entries Recorded",
+        &["index_entries_indexed"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Index Truncation Reason",
+        &["index_truncation_reason"],
+    );
+    push_activity_detail(html, item_ref, "Source", &["source"]);
     push_activity_detail(html, item_ref, "Display Name", &["display_name"]);
     push_activity_detail(html, item_ref, "Entry Kind", &["entry_kind"]);
     push_activity_detail(html, item_ref, "Filesystem", &["filesystem"]);
@@ -15114,8 +23244,31 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
         html,
         item_ref,
         "Volume Start Offset",
-        &["volume_start_offset"],
+        &["volume_start_offset", "partition_start_offset"],
     );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Volume Index (zero-based)",
+        &["volume_index_zero_based"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Partition Number (one-based)",
+        &["partition_number_one_based"],
+    );
+    if item_ref.get("volume_index_zero_based").is_none()
+        && item_ref.get("partition_number_one_based").is_none()
+    {
+        push_activity_detail(
+            html,
+            item_ref,
+            "Legacy Partition Field (ambiguous historical convention)",
+            &["partition_index"],
+        );
+    }
+    push_activity_detail(html, item_ref, "Region", &["region"]);
     push_activity_detail(html, item_ref, "Volume Size", &["volume_size_bytes"]);
     push_activity_detail(html, item_ref, "Extension", &["file_extension"]);
     push_activity_detail(html, item_ref, "Detected Type", &["detected_signature"]);
@@ -15135,7 +23288,45 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
         "Finding Offset",
         &["finding_logical_offset", "selection_offset"],
     );
-    push_activity_detail(html, item_ref, "Selection Length", &["selection_length"]);
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Byte Offset",
+        &[
+            "byte_offset",
+            "offset",
+            "selection_physical_offset_start",
+            "selection_logical_offset_start",
+        ],
+    );
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Byte Offset End",
+        &[
+            "selection_physical_offset_end",
+            "selection_logical_offset_end",
+        ],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Selection Length",
+        &[
+            "selection_length",
+            "selection_length_bytes",
+            "matched_length",
+        ],
+    );
+    push_activity_detail(html, item_ref, "Sector", &["sector"]);
+    push_activity_detail(html, item_ref, "Sector Size", &["sector_size"]);
+    push_activity_detail(html, item_ref, "Encoding", &["encoding"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Physical Offset Basis",
+        &["physical_offset_basis"],
+    );
     push_activity_detail(html, item_ref, "Storage Area", &["storage_area"]);
     push_activity_detail(
         html,
@@ -15163,71 +23354,37 @@ fn render_forensic_context_details_html(html: &mut String, item: &BookmarkItem) 
     );
     push_activity_detail(html, item_ref, "In File Slack", &["is_file_slack"]);
     push_activity_detail(html, item_ref, "In Unallocated Space", &["is_unallocated"]);
-    push_activity_detail(html, item_ref, "Created", &["created_utc"]);
-    push_activity_detail(html, item_ref, "Modified", &["modified_utc"]);
-    push_activity_detail(html, item_ref, "Accessed", &["accessed_utc"]);
     push_activity_detail(
         html,
         item_ref,
+        "Hex Preview",
+        &["hex_preview", "data_preview"],
+    );
+    push_activity_detail(html, item_ref, "ASCII Preview", &["ascii_preview"]);
+    push_activity_detail(html, item_ref, "Search Query", &["query", "search_query"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Search Encodings",
+        &["encodings", "search_encodings"],
+    );
+    push_activity_detail(html, item_ref, "Search Started", &["searched_at"]);
+    push_activity_detail(html, item_ref, "Search Examiner", &["actor", "examiner"]);
+    push_activity_detail(html, item_ref, "Scan Start", &["scan_start"]);
+    push_activity_detail(html, item_ref, "Max Scan Bytes", &["max_scan_bytes"]);
+    push_activity_detail(html, item_ref, "Bytes Scanned", &["bytes_scanned"]);
+    push_activity_detail(html, item_ref, "Evidence Total Size", &["total_size"]);
+    push_time_detail(html, item_ref, "Created", ForensicTimeRole::Created);
+    push_time_detail(html, item_ref, "Modified", ForensicTimeRole::Modified);
+    push_time_detail(html, item_ref, "Accessed", ForensicTimeRole::Accessed);
+    push_time_detail(
+        html,
+        item_ref,
         "MFT Modified",
-        &["ntfs_mft_record_modification_time_utc"],
+        ForensicTimeRole::MftModified,
     );
     push_activity_detail(html, item_ref, "Symlink", &["symlink"]);
     if let Some(metadata) = item_ref.get("metadata") {
-        push_activity_detail(
-            html,
-            metadata,
-            "Created",
-            &[
-                "created_utc",
-                "ntfs_creation_time_utc",
-                "ntfs_standard_creation_time_utc",
-                "file_name_created_utc",
-                "standard_information_created_utc",
-                "fat_created",
-                "source_file_created_utc",
-            ],
-        );
-        push_activity_detail(
-            html,
-            metadata,
-            "Modified",
-            &[
-                "modified_utc",
-                "ntfs_modification_time_utc",
-                "ntfs_standard_modification_time_utc",
-                "file_name_modified_utc",
-                "standard_information_modified_utc",
-                "fat_modified",
-                "source_file_modified_utc",
-            ],
-        );
-        push_activity_detail(
-            html,
-            metadata,
-            "Accessed",
-            &[
-                "accessed_utc",
-                "ntfs_access_time_utc",
-                "ntfs_standard_access_time_utc",
-                "file_name_accessed_utc",
-                "standard_information_accessed_utc",
-                "fat_accessed",
-                "source_file_accessed_utc",
-            ],
-        );
-        push_activity_detail(
-            html,
-            metadata,
-            "MFT Modified",
-            &[
-                "ntfs_mft_record_modification_time_utc",
-                "ntfs_standard_mft_record_modification_time_utc",
-                "mft_modified_utc",
-                "file_name_mft_modified_utc",
-                "standard_information_mft_modified_utc",
-            ],
-        );
         push_activity_detail(html, metadata, "Source Path", &["source_path"]);
         push_activity_detail(html, metadata, "Source Kind", &["source_kind"]);
         push_activity_detail(html, metadata, "Recovery Source", &["recovery_source"]);
@@ -15270,15 +23427,27 @@ fn render_email_details_html(html: &mut String, item_ref: &serde_json::Value) ->
     push_activity_detail(html, item_ref, "Reply-To", &["email_reply_to"]);
     push_activity_detail(html, item_ref, "In Reply To", &["email_in_reply_to"]);
     push_activity_detail(html, item_ref, "Body Preview", &["email_body_preview"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Attachment Names",
+        &["email_attachment_names"],
+    );
+    push_activity_detail(html, item_ref, "PST Folder", &["pst_folder_path"]);
+    push_activity_detail(html, item_ref, "PST Parser Scope", &["pst_parser_scope"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "PST Attachment Content",
+        &["pst_attachment_content_extraction"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "PST Deleted Recovery",
+        &["pst_deleted_recovery"],
+    );
     push_activity_detail(html, item_ref, "Parser Error", &["email_parser_error"]);
-    if let Some(path) = item_ref
-        .get("logical_path")
-        .and_then(|value| value.as_str())
-    {
-        html.push_str("<dt>Path</dt><dd>");
-        html.push_str(&escape_html(&display_entry_path(path)));
-        html.push_str("</dd>");
-    }
     html.push_str("</dl>");
     true
 }
@@ -15327,26 +23496,7 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             );
             push_activity_detail(html, item_ref, "Firefox PRTime", &["visit_time_prtime"]);
             push_activity_detail(html, item_ref, "Safari Time", &["visit_time_safari"]);
-            push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
-            push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Created",
-                &["source_file_created_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Modified",
-                &["source_file_modified_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Accessed",
-                &["source_file_accessed_utc"],
-            );
+            push_browser_source_details(html, item_ref);
         }
         "browser_url" => {
             push_activity_detail(html, item_ref, "URL", &["url"]);
@@ -15430,26 +23580,7 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["date_last_used_chrome"],
             );
             push_activity_detail(html, item_ref, "GUID", &["guid"]);
-            push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
-            push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Created",
-                &["source_file_created_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Modified",
-                &["source_file_modified_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Accessed",
-                &["source_file_accessed_utc"],
-            );
+            push_browser_source_details(html, item_ref);
         }
         "browser_login" => {
             push_activity_detail(html, item_ref, "Host", &["host"]);
@@ -15497,6 +23628,27 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Value Note", &["value_note"]);
             push_browser_source_details(html, item_ref);
         }
+        "browser_cache_entry" => {
+            push_activity_detail(html, item_ref, "URL", &["url", "cache_key"]);
+            push_activity_detail(html, item_ref, "Host", &["host"]);
+            push_activity_detail(html, item_ref, "Created", &["created_utc", "creation_utc"]);
+            push_activity_detail(html, item_ref, "HTTP Status", &["http_status_code"]);
+            push_activity_detail(html, item_ref, "Status Line", &["http_status_line"]);
+            push_activity_detail(html, item_ref, "Content Type", &["content_type"]);
+            push_activity_detail(html, item_ref, "Content Encoding", &["content_encoding"]);
+            push_activity_detail(html, item_ref, "Last Modified", &["last_modified"]);
+            push_activity_detail(html, item_ref, "Expires", &["expires"]);
+            push_activity_detail(html, item_ref, "Cache Control", &["cache_control"]);
+            push_activity_detail(html, item_ref, "Body Bytes", &["cache_body_size_bytes"]);
+            push_activity_detail(html, item_ref, "Cache State", &["cache_entry_state"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Parser Scope",
+                &["browser_cache_parser_scope"],
+            );
+            push_browser_source_details(html, item_ref);
+        }
         "browser_preference" => {
             push_activity_detail(html, item_ref, "Category", &["category"]);
             push_activity_detail(html, item_ref, "Profile Name", &["name", "display_name"]);
@@ -15516,26 +23668,7 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["created_by_version"],
             );
             push_activity_detail(html, item_ref, "Last Used", &["last_used"]);
-            push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
-            push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Created",
-                &["source_file_created_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Modified",
-                &["source_file_modified_utc"],
-            );
-            push_activity_detail(
-                html,
-                item_ref,
-                "Source Accessed",
-                &["source_file_accessed_utc"],
-            );
+            push_browser_source_details(html, item_ref);
         }
         _ => {
             push_activity_detail(html, item_ref, "Name", &["display_name", "name", "title"]);
@@ -15548,33 +23681,80 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
 
 fn push_browser_source_details(html: &mut String, item_ref: &serde_json::Value) {
     push_activity_detail(html, item_ref, "Source Artifact", &["source_artifact"]);
-    push_activity_detail(html, item_ref, "Source Path", &["source_artifact_path"]);
     push_activity_detail(
         html,
         item_ref,
-        "Source Created",
+        "Source Path",
+        &["source_artifact_path_exact", "source_artifact_path"],
+    );
+    let basis = activity_value_string(item_ref, &["source_file_time_basis"])
+        .unwrap_or_else(|| "basis_not_recorded".to_string());
+    let prefix = match basis.as_str() {
+        "original_evidence_filesystem" => "Original Source File",
+        "local_source_filesystem" => "Imported Local Source File",
+        "original_evidence_path_resolved_times_unavailable" => "Original Source File",
+        _ => "Source File (timestamp basis not recorded)",
+    };
+    push_activity_detail(
+        html,
+        item_ref,
+        &format!("{prefix} Created"),
         &["source_file_created_utc"],
     );
     push_activity_detail(
         html,
         item_ref,
-        "Source Modified",
+        &format!("{prefix} Modified"),
         &["source_file_modified_utc"],
     );
     push_activity_detail(
         html,
         item_ref,
-        "Source Accessed",
+        &format!("{prefix} Accessed"),
         &["source_file_accessed_utc"],
     );
-    push_activity_detail(html, item_ref, "Source Size", &["source_file_size_bytes"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        &format!("{prefix} MFT Modified"),
+        &["source_file_mft_modified_utc"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        &format!("{prefix} Size"),
+        &["source_file_size_bytes"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Staging Copy Path (not evidence source path)",
+        &["source_artifact_staging_path"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Staging Copy Created (not evidence MACB)",
+        &["staging_file_created_utc"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Staging Copy Modified (not evidence MACB)",
+        &["staging_file_modified_utc"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Staging Copy Accessed (not evidence MACB)",
+        &["staging_file_accessed_utc"],
+    );
 }
 
 fn browser_activity_kind(item_ref: &serde_json::Value) -> Option<&str> {
-    if item_ref.get("kind").and_then(|value| value.as_str()) != Some("browser_activity") {
-        return None;
-    }
-    item_ref
+    let explicit_browser_activity =
+        item_ref.get("kind").and_then(|value| value.as_str()) == Some("browser_activity");
+    let kind = item_ref
         .get("activity_kind")
         .and_then(|value| value.as_str())
         .or_else(|| {
@@ -15582,7 +23762,8 @@ fn browser_activity_kind(item_ref: &serde_json::Value) -> Option<&str> {
                 .get("metadata")
                 .and_then(|value| value.get("artifact_kind"))
                 .and_then(|value| value.as_str())
-        })
+        })?;
+    (explicit_browser_activity || kind.starts_with("browser_")).then_some(kind)
 }
 
 fn browser_activity_label(kind: &str) -> &'static str {
@@ -15594,8 +23775,31 @@ fn browser_activity_label(kind: &str) -> &'static str {
         "browser_bookmark" => "Bookmark",
         "browser_login" => "Saved Login",
         "browser_cookie" => "Cookie",
+        "browser_cache_entry" => "Cache Entry",
         "browser_preference" => "Preference",
         _ => "Browser Activity",
+    }
+}
+
+fn push_detail_value(html: &mut String, label: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    html.push_str("<dt>");
+    html.push_str(&escape_html(label));
+    html.push_str("</dt><dd>");
+    html.push_str(&escape_html(value));
+    html.push_str("</dd>");
+}
+
+fn push_dec_hex_detail(
+    html: &mut String,
+    item_ref: &serde_json::Value,
+    label: &str,
+    keys: &[&str],
+) {
+    if let Some(value) = activity_u64(item_ref, keys) {
+        push_detail_value(html, label, &format!("{value} (0x{value:X})"));
     }
 }
 
@@ -15606,12 +23810,60 @@ fn push_activity_detail(
     keys: &[&str],
 ) {
     if let Some(value) = activity_value_string(item_ref, keys) {
-        html.push_str("<dt>");
-        html.push_str(&escape_html(label));
-        html.push_str("</dt><dd>");
-        html.push_str(&escape_html(&value));
-        html.push_str("</dd>");
+        push_detail_value(html, label, &value);
     }
+}
+
+#[derive(Clone, Copy)]
+enum ForensicTimeRole {
+    Created,
+    Modified,
+    Accessed,
+    MftModified,
+}
+
+fn resolved_forensic_time(item_ref: &serde_json::Value, role: ForensicTimeRole) -> Option<String> {
+    let metadata = item_ref.get("metadata").unwrap_or(item_ref);
+    let keys = match role {
+        ForensicTimeRole::Created => {
+            report_display_time_keys(metadata, BrowserDisplayTimeRole::Created)
+        }
+        ForensicTimeRole::Modified => {
+            report_display_time_keys(metadata, BrowserDisplayTimeRole::Modified)
+        }
+        ForensicTimeRole::Accessed => {
+            report_display_time_keys(metadata, BrowserDisplayTimeRole::Accessed)
+        }
+        ForensicTimeRole::MftModified => vec![
+            "ntfs_standard_mft_record_modification_time_utc",
+            "standard_information_mft_modified_utc",
+            "mft_modified_utc",
+            "ntfs_mft_record_modification_time_utc",
+            "file_name_mft_modified_utc",
+        ],
+    };
+    activity_value_string(item_ref, &keys)
+}
+
+/// Resolve one MACB role across all authoritative top-level and nested
+/// candidates, then emit exactly one row. Absence is reported only after the
+/// complete candidate set has been checked.
+fn push_time_detail(
+    html: &mut String,
+    item_ref: &serde_json::Value,
+    label: &str,
+    role: ForensicTimeRole,
+) {
+    html.push_str("<dt>");
+    html.push_str(&escape_html(label));
+    html.push_str("</dt><dd>");
+    match resolved_forensic_time(item_ref, role) {
+        Some(value) => html.push_str(&escape_html(&value)),
+        None => html.push_str(
+            "<span class=\"meta\">Not set on source filesystem (verified absent, not unchecked)</span>",
+        ),
+    }
+    html.push_str("</dd>");
 }
 
 fn activity_value_string(item_ref: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -15628,6 +23880,32 @@ fn activity_value_string(item_ref: &serde_json::Value, keys: &[&str]) -> Option<
         }
     }
     None
+}
+
+fn activity_u64(item_ref: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(value) = item_ref.get(*key).and_then(json_report_u64) {
+            return Some(value);
+        }
+        if let Some(value) = item_ref
+            .get("metadata")
+            .and_then(|metadata| metadata.get(*key))
+            .and_then(json_report_u64)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn json_report_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|signed| u64::try_from(signed).ok())),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn json_report_value(value: &serde_json::Value) -> Option<String> {
@@ -15887,6 +24165,7 @@ fn firefox_profile_paths(input_path: &Path) -> Result<FirefoxProfilePaths> {
         );
     }
     Ok(FirefoxProfilePaths {
+        downloads_path: profile_dir.join("downloads.sqlite"),
         formhistory_path: profile_dir.join("formhistory.sqlite"),
         cookies_path: profile_dir.join("cookies.sqlite"),
         logins_path: profile_dir.join("logins.json"),
@@ -16091,6 +24370,7 @@ fn source_artifact_metadata(path: &Path, artifact: &str) -> serde_json::Value {
     let mut metadata = serde_json::json!({
         "source_artifact": artifact,
         "source_artifact_path": path.to_string_lossy(),
+        "source_file_time_basis": "local_source_filesystem",
     });
     if let Ok(file_metadata) = fs::metadata(path) {
         if let Some(object) = metadata.as_object_mut() {
@@ -16130,6 +24410,58 @@ fn merge_json_object(target: &mut serde_json::Value, source: &serde_json::Value)
     }
 }
 
+#[derive(Clone, Copy)]
+enum BrowserDisplayTimeRole {
+    Created,
+    Accessed,
+    Modified,
+}
+
+fn report_display_time_keys(
+    _metadata: &serde_json::Value,
+    role: BrowserDisplayTimeRole,
+) -> Vec<&'static str> {
+    generic_display_time_keys(role).to_vec()
+}
+
+fn generic_display_time_keys(role: BrowserDisplayTimeRole) -> &'static [&'static str] {
+    match role {
+        BrowserDisplayTimeRole::Created => &[
+            "created_utc",
+            "ntfs_standard_creation_time_utc",
+            "standard_information_created_utc",
+            "ntfs_creation_time_utc",
+            "file_name_created_utc",
+            "creation_utc",
+            "fat_created",
+        ],
+        BrowserDisplayTimeRole::Accessed => &[
+            "accessed_utc",
+            "ntfs_standard_access_time_utc",
+            "standard_information_accessed_utc",
+            "ntfs_access_time_utc",
+            "file_name_accessed_utc",
+            "fat_accessed",
+        ],
+        BrowserDisplayTimeRole::Modified => &[
+            "modified_utc",
+            "ntfs_standard_modification_time_utc",
+            "standard_information_modified_utc",
+            "ntfs_modification_time_utc",
+            "file_name_modified_utc",
+            "fat_modified",
+        ],
+    }
+}
+
+fn json_has_display_value(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
 fn chrome_json_time_value(value: Option<&serde_json::Value>) -> Option<i64> {
     match value {
         Some(serde_json::Value::String(value)) => value.parse().ok(),
@@ -16144,14 +24476,15 @@ fn host_from_url(url: &str) -> String {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(trimmed);
-    let without_credentials = without_scheme
-        .rsplit_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
-    let host_port = without_credentials
+    let authority = without_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or("")
+        .trim();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(authority)
         .trim();
     let host = host_port
         .strip_prefix('[')
@@ -16178,12 +24511,47 @@ fn sanitize_logical_segment(value: &str) -> String {
             break;
         }
     }
-    let segment = segment.trim_matches('_').trim_matches('.').to_string();
-    if segment.is_empty() {
+    let segment = segment.trim_matches('_');
+    let segment = segment.trim_end_matches('.');
+    if segment.is_empty() || segment == "." || segment == ".." {
         "unnamed".to_string()
     } else {
-        segment
+        segment.to_string()
     }
+}
+
+/// Builds a deterministic collision-resistant segment for KDFT's internal
+/// navigation key. If sanitizing would change, drop, or truncate any source
+/// character, a digest of the exact UTF-8 name is appended. The exact source
+/// name/path is stored separately and is never reconstructed from this key.
+fn internal_source_segment(value: &str) -> String {
+    let base = sanitize_logical_segment(value);
+    if base == value {
+        return base;
+    }
+    let digest = sha256_hex(value.as_bytes());
+    format!("{base}~{}", &digest[..12])
+}
+
+fn unique_internal_child_path(
+    parent_path: &str,
+    exact_name: &str,
+    stable_discriminator: &str,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    let segment = internal_source_segment(exact_name);
+    let base = format!("{parent_path}/{segment}");
+    if used_paths.insert(base.clone()) {
+        return base;
+    }
+    let digest = sha256_hex(stable_discriminator.as_bytes());
+    let mut candidate = format!("{base}~{}", &digest[..12]);
+    let mut suffix = 2_usize;
+    while !used_paths.insert(candidate.clone()) {
+        candidate = format!("{base}~{}-{suffix}", &digest[..12]);
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
 }
 
 fn chromium_bookmark_root_label(root_name: &str) -> &'static str {
@@ -16466,6 +24834,65 @@ mod tests {
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
+    }
+
+    #[test]
+    fn host_from_url_limits_at_sign_to_authority() {
+        assert_eq!(
+            host_from_url(
+                "https://www.google.com/maps/place/X/@50.7371286,-2.049258912,15z/data=!3m1"
+            ),
+            "google.com"
+        );
+        assert_eq!(
+            sanitize_logical_segment(&host_from_url(
+                "https://www.google.com/maps/place/X/@50.7371286,-2.049258912,15z/data=!3m1"
+            )),
+            "google.com"
+        );
+        assert_eq!(
+            host_from_url("https://user:pass@example.com/"),
+            "example.com"
+        );
+        assert_eq!(host_from_url("example.com/@handle"), "example.com");
+        assert_eq!(
+            host_from_url("/maps/place/@50.7371286,-2.049258912,15z"),
+            "unknown-host"
+        );
+    }
+
+    #[test]
+    fn sanitize_logical_segment_preserves_unix_dotfile_names() {
+        assert_eq!(sanitize_logical_segment(".ssh"), ".ssh");
+        assert_eq!(sanitize_logical_segment(".bashrc"), ".bashrc");
+        assert_eq!(sanitize_logical_segment(".mozilla"), ".mozilla");
+        assert_eq!(sanitize_logical_segment("config."), "config");
+        assert_eq!(sanitize_logical_segment(".face.icon"), ".face.icon");
+        assert_eq!(sanitize_logical_segment("."), "unnamed");
+        assert_eq!(sanitize_logical_segment(".."), "unnamed");
+        assert_eq!(sanitize_logical_segment("Documents"), "Documents");
+        assert_eq!(
+            sanitize_logical_segment("Alpha/Beta\tGamma"),
+            "Alpha_Beta_Gamma"
+        );
+
+        // Internal keys may sanitize, but distinct exact source names must
+        // never collapse because punctuation, Unicode, or the 96-byte display
+        // bound differs outside the retained prefix.
+        let question = internal_source_segment("report?.txt");
+        let hash = internal_source_segment("report#.txt");
+        assert_ne!(question, hash);
+        assert_eq!(question, internal_source_segment("report?.txt"));
+        assert_ne!(
+            internal_source_segment("résumé.txt"),
+            internal_source_segment("rsum.txt")
+        );
+        let long_a = format!("{}A.txt", "x".repeat(110));
+        let long_b = format!("{}B.txt", "x".repeat(110));
+        assert_ne!(
+            internal_source_segment(&long_a),
+            internal_source_segment(&long_b)
+        );
     }
 
     #[test]
@@ -16804,6 +25231,859 @@ mod tests {
     }
 
     #[test]
+    fn pst_filetime_to_rfc3339_converts_known_reference_values() {
+        // Windows FILETIME epoch is 1601-01-01; the constant below is exactly the number of
+        // 100ns intervals between 1601-01-01 and the Unix epoch (1970-01-01), i.e. filetime 0
+        // maps to the FILETIME epoch itself and this value maps to the Unix epoch.
+        assert_eq!(
+            pst_filetime_to_rfc3339(116_444_736_000_000_000),
+            Some("1970-01-01T00:00:00+00:00".to_string())
+        );
+        // 132223104000000000 is the well-known FILETIME reference value for 2020-01-01T00:00:00Z
+        // ((1577836800 unix seconds + 11644473600 epoch offset) * 10_000_000).
+        assert_eq!(
+            pst_filetime_to_rfc3339(132_223_104_000_000_000),
+            Some("2020-01-01T00:00:00+00:00".to_string())
+        );
+        assert_eq!(
+            pst_filetime_to_rfc3339(0),
+            Some("1601-01-01T00:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_pst_header_classifies_unicode_ansi_and_unsupported_variants() -> Result<()> {
+        let dir = unique_temp_dir("pst-header-detect");
+
+        let mut unicode_header = vec![0_u8; 12];
+        unicode_header[0..4].copy_from_slice(b"!BDN");
+        unicode_header[10..12].copy_from_slice(&23_u16.to_le_bytes());
+        let unicode_path = dir.join("unicode.pst");
+        fs::write(&unicode_path, &unicode_header)?;
+        assert_eq!(
+            detect_pst_header(&unicode_path)?.kind,
+            PstHeaderKind::Unicode { version: 23 }
+        );
+
+        let mut ansi_header = vec![0_u8; 12];
+        ansi_header[0..4].copy_from_slice(b"!BDN");
+        ansi_header[10..12].copy_from_slice(&14_u16.to_le_bytes());
+        let ansi_path = dir.join("ansi.pst");
+        fs::write(&ansi_path, &ansi_header)?;
+        let ansi_status = detect_pst_header(&ansi_path)?;
+        assert_eq!(ansi_status.kind, PstHeaderKind::Ansi { version: 14 });
+        assert!(ansi_status.reason.unwrap_or_default().contains("ANSI"));
+
+        let wrong_magic_path = dir.join("wrong-magic.pst");
+        fs::write(&wrong_magic_path, b"NOTAPSTFILE!")?;
+        let wrong_magic_status = detect_pst_header(&wrong_magic_path)?;
+        assert_eq!(wrong_magic_status.kind, PstHeaderKind::Unsupported);
+        assert!(wrong_magic_status
+            .reason
+            .unwrap_or_default()
+            .contains("magic"));
+
+        let short_path = dir.join("short.pst");
+        fs::write(&short_path, b"short")?;
+        let short_status = detect_pst_header(&short_path)?;
+        assert_eq!(short_status.kind, PstHeaderKind::Unsupported);
+        assert!(short_status
+            .reason
+            .unwrap_or_default()
+            .contains("shorter than 12 bytes"));
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn mailbox_logical_path_and_unique_segment_helpers_behave() {
+        assert_eq!(mailbox_logical_path(&[]), "/Mailbox");
+        assert_eq!(
+            mailbox_logical_path(&["Inbox".to_string(), "msg.record".to_string()]),
+            "/Mailbox/Inbox/msg.record"
+        );
+
+        let mut used = HashSet::new();
+        let first = unique_mailbox_segment("Invoice", 0x10, &mut used);
+        let second = unique_mailbox_segment("Invoice", 0x11, &mut used);
+        assert_eq!(first, "Invoice");
+        assert_ne!(second, first);
+        assert!(second.starts_with("Invoice-"));
+    }
+
+    #[test]
+    fn detect_registry_hive_header_classifies_valid_and_invalid_files() -> Result<()> {
+        let dir = unique_temp_dir("registry-header-detect");
+
+        let valid_path = dir.join("NTUSER.DAT");
+        let mut valid_bytes = vec![0_u8; 32];
+        valid_bytes[0..4].copy_from_slice(b"regf");
+        fs::write(&valid_path, &valid_bytes)?;
+        assert_eq!(
+            detect_registry_hive_header(&valid_path)?.kind,
+            RegistryHiveHeaderKind::Regf
+        );
+
+        let wrong_magic_path = dir.join("wrong-magic.dat");
+        fs::write(&wrong_magic_path, b"NOTAHIVE")?;
+        let wrong_magic_status = detect_registry_hive_header(&wrong_magic_path)?;
+        assert_eq!(wrong_magic_status.kind, RegistryHiveHeaderKind::Unsupported);
+        assert!(wrong_magic_status
+            .reason
+            .unwrap_or_default()
+            .contains("regf"));
+
+        let short_path = dir.join("short.dat");
+        fs::write(&short_path, b"re")?;
+        let short_status = detect_registry_hive_header(&short_path)?;
+        assert_eq!(short_status.kind, RegistryHiveHeaderKind::Unsupported);
+        assert!(short_status
+            .reason
+            .unwrap_or_default()
+            .contains("shorter than 4 bytes"));
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn registry_render_value_formats_every_cell_value_variant() {
+        let string_val = registry_render_value(
+            RegistryValueDataType::REG_SZ,
+            &RegistryCellValue::String("C:\\Windows\\notepad.exe\u{0}\u{0}".to_string()),
+        );
+        assert_eq!(string_val.text, "C:\\Windows\\notepad.exe");
+        assert!(!string_val.truncated);
+
+        let multi = registry_render_value(
+            RegistryValueDataType::REG_MULTI_SZ,
+            &RegistryCellValue::MultiString(vec!["one".to_string(), "two".to_string()]),
+        );
+        assert_eq!(multi.text, "one | two");
+        assert_eq!(
+            multi.items,
+            Some(vec!["one".to_string(), "two".to_string()])
+        );
+
+        let binary_small = registry_render_value(
+            RegistryValueDataType::REG_BIN,
+            &RegistryCellValue::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        );
+        assert_eq!(binary_small.text, "DE AD BE EF");
+        assert!(!binary_small.truncated);
+
+        let big_bytes = vec![0xAB_u8; REGISTRY_BINARY_PREVIEW_BYTES + 10];
+        let binary_big = registry_render_value(
+            RegistryValueDataType::REG_BIN,
+            &RegistryCellValue::Binary(big_bytes),
+        );
+        assert!(binary_big.truncated);
+        assert!(binary_big.text.contains(&format!(
+            "{} bytes total",
+            REGISTRY_BINARY_PREVIEW_BYTES + 10
+        )));
+
+        let dword = registry_render_value(
+            RegistryValueDataType::REG_DWORD,
+            &RegistryCellValue::U32(305_419_896),
+        );
+        assert_eq!(dword.text, "305419896 (0x12345678)");
+
+        // FILETIME rendering must append the decoded UTC timestamp, not just the raw integer -
+        // this is the field examiners actually care about for a REG_FILETIME value.
+        let filetime = registry_render_value(
+            RegistryValueDataType::REG_FILETIME,
+            &RegistryCellValue::U64(132_223_104_000_000_000),
+        );
+        assert!(filetime.text.contains("132223104000000000"));
+        assert!(filetime.text.contains("2020-01-01T00:00:00+00:00"));
+
+        let none_val =
+            registry_render_value(RegistryValueDataType::REG_NONE, &RegistryCellValue::None);
+        assert_eq!(none_val.text, "");
+
+        let error_val =
+            registry_render_value(RegistryValueDataType::REG_SZ, &RegistryCellValue::Error);
+        assert!(error_val.text.contains("could not be decoded"));
+    }
+
+    #[test]
+    fn registry_value_type_label_maps_common_types() {
+        assert_eq!(
+            registry_value_type_label(RegistryValueDataType::REG_SZ),
+            "REG_SZ"
+        );
+        assert_eq!(
+            registry_value_type_label(RegistryValueDataType::REG_DWORD),
+            "REG_DWORD"
+        );
+        assert_eq!(
+            registry_value_type_label(RegistryValueDataType::REG_BIN),
+            "REG_BINARY"
+        );
+        assert_eq!(
+            registry_value_type_label(RegistryValueDataType::REG_QWORD),
+            "REG_QWORD"
+        );
+    }
+
+    #[test]
+    fn registry_path_helpers_build_stable_unique_paths() {
+        assert_eq!(
+            registry_root_logical_path("NTUSER.DAT"),
+            "/Registry/NTUSER.DAT"
+        );
+        assert_eq!(
+            registry_key_display_path("ROOT\\Software\\Microsoft\\Windows"),
+            "ROOT\\Software\\Microsoft\\Windows"
+        );
+        assert_eq!(registry_key_display_path(""), "\\");
+
+        let mut used = HashSet::new();
+        let key_path = registry_key_logical_path(
+            "/Registry/NTUSER.DAT",
+            "ROOT\\Software\\Run",
+            0x100,
+            &mut used,
+        );
+        assert_eq!(key_path, "/Registry/NTUSER.DAT/ROOT/Software/Run");
+
+        let value_path = registry_value_logical_path(&key_path, "OneDrive", 0x200, &mut used);
+        assert_eq!(
+            value_path,
+            "/Registry/NTUSER.DAT/ROOT/Software/Run/OneDrive.value"
+        );
+
+        // Two keys that normalize to the same logical path (e.g. differing only by case/
+        // whitespace quirks upstream) must not collide silently - the offset-based suffix keeps
+        // both entries distinguishable and queryable.
+        let colliding = registry_key_logical_path(
+            "/Registry/NTUSER.DAT",
+            "ROOT\\Software\\Run",
+            0x300,
+            &mut used,
+        );
+        assert_ne!(colliding, key_path);
+        assert!(colliding.starts_with(&key_path));
+    }
+
+    fn write_registry_fixture(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = dir.join(name);
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn process_registry_hive_evidence_reports_wrong_magic_as_unsupported() -> Result<()> {
+        let case_path = unique_case_path("registry-wrong-magic");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("registry-wrong-magic-source");
+        let path = write_registry_fixture(&dir, "NTUSER.DAT", b"NOT-A-REGISTRY-HIVE-AT-ALL")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let entry = entries
+            .into_iter()
+            .next()
+            .expect("registry evidence should produce at least one entry");
+        assert_eq!(
+            entry.metadata_json["artifact_kind"].as_str(),
+            Some("registry_hive")
+        );
+        assert_eq!(
+            entry.metadata_json["registry_parser_status"].as_str(),
+            Some("unsupported")
+        );
+        assert!(entry.metadata_json["registry_parser_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("regf"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn process_registry_hive_evidence_reports_corrupt_regf_gracefully() -> Result<()> {
+        // A file that passes the cheap 4-byte "regf" magic sniff but is not a structurally valid
+        // hive. notatin cannot open it, and process_registry_hive_evidence must fall back to the
+        // same "detected, not parsed" status used elsewhere rather than crashing or hanging.
+        let case_path = unique_case_path("registry-corrupt-regf");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("registry-corrupt-regf-source");
+        let mut bytes = vec![0_u8; 512];
+        bytes[0..4].copy_from_slice(b"regf");
+        let path = write_registry_fixture(&dir, "SOFTWARE", &bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let entry = entries
+            .into_iter()
+            .next()
+            .expect("registry evidence should produce at least one entry");
+        assert_eq!(
+            entry.metadata_json["registry_parser_status"].as_str(),
+            Some("unsupported")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn evtx_level_label_maps_known_and_unknown_codes() {
+        assert_eq!(
+            evtx_level_label(Some(0), None),
+            Some("Information".to_string())
+        );
+        assert_eq!(
+            evtx_level_label(Some(1), None),
+            Some("Critical".to_string())
+        );
+        assert_eq!(evtx_level_label(Some(2), None), Some("Error".to_string()));
+        assert_eq!(evtx_level_label(Some(3), None), Some("Warning".to_string()));
+        assert_eq!(
+            evtx_level_label(Some(4), None),
+            Some("Information".to_string())
+        );
+        assert_eq!(evtx_level_label(Some(5), None), Some("Verbose".to_string()));
+        assert_eq!(
+            evtx_level_label(Some(99), None),
+            Some("Unknown (99)".to_string())
+        );
+        assert_eq!(
+            evtx_level_label(None, Some("Custom")),
+            Some("Custom".to_string())
+        );
+        assert_eq!(evtx_level_label(None, None), None);
+    }
+
+    #[test]
+    fn evtx_channel_hint_decodes_windows_percent_encoding() {
+        assert_eq!(
+            evtx_channel_hint("Microsoft-Windows-TaskScheduler%4Operational.evtx"),
+            Some("Microsoft-Windows-TaskScheduler/Operational".to_string())
+        );
+        assert_eq!(
+            evtx_channel_hint("Security.evtx"),
+            Some("Security".to_string())
+        );
+    }
+
+    #[test]
+    fn evtx_json_path_helpers_navigate_and_coerce() {
+        let system = serde_json::json!({
+            "EventID": 4624,
+            "Level": "4",
+            "Nested": { "#text": "778" }
+        });
+        assert_eq!(evtx_json_path_u64(&system, &["EventID"]), Some(4624));
+        assert_eq!(
+            evtx_json_path_string(&system, &["Level"]),
+            Some("4".to_string())
+        );
+        assert_eq!(evtx_scalar_u64(&system["Nested"]), Some(778));
+        assert_eq!(evtx_json_path_u64(&system, &["Missing"]), None);
+    }
+
+    #[test]
+    fn evtx_find_user_sid_prefers_known_fields_and_recurses() {
+        let event = serde_json::json!({
+            "EventData": {
+                "SubjectUserSid": "S-1-5-21-111-222-333-1001",
+                "TargetUserName": "alice"
+            }
+        });
+        assert_eq!(
+            evtx_find_user_sid(&event),
+            Some("S-1-5-21-111-222-333-1001".to_string())
+        );
+        assert_eq!(
+            evtx_find_user_sid(&serde_json::json!({"x": "not-a-sid"})),
+            None
+        );
+    }
+
+    #[test]
+    fn evtx_logical_path_helpers_build_stable_unique_paths() {
+        assert_eq!(
+            evtx_root_logical_path("Security.evtx"),
+            "/Event Logs/Security.evtx"
+        );
+        let mut used = HashSet::new();
+        let first = evtx_record_logical_path("/Event Logs/Security.evtx", 42, &mut used);
+        assert_eq!(first, "/Event Logs/Security.evtx/42.record");
+        let second = evtx_record_logical_path("/Event Logs/Security.evtx", 42, &mut used);
+        assert_ne!(second, first);
+        assert!(second.starts_with("/Event Logs/Security.evtx/42-"));
+    }
+
+    #[test]
+    fn process_evtx_event_log_evidence_reports_corrupt_file_gracefully() -> Result<()> {
+        // Not a valid EVTX container at all (real EVTX files start with an "ElfFile\0" magic) -
+        // the evtx crate must fail to open it, and process_evtx_event_log_evidence must fall back
+        // to the same "detected, not parsed" status used by every other parser in this codebase
+        // rather than crashing or hanging.
+        let case_path = unique_case_path("evtx-corrupt");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("evtx-corrupt-source");
+        let path = dir.join("Application.evtx");
+        fs::write(&path, b"NOT-A-VALID-EVTX-FILE-AT-ALL")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let entry = entries
+            .into_iter()
+            .next()
+            .expect("EVTX evidence should produce at least one entry");
+        assert_eq!(
+            entry.metadata_json["artifact_kind"].as_str(),
+            Some("evtx_log")
+        );
+        assert_eq!(
+            entry.metadata_json["evtx_parser_status"].as_str(),
+            Some("unsupported")
+        );
+        assert!(entry.metadata_json["evtx_parser_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn has_chromium_blockfile_cache_layout_requires_index_and_data_file() -> Result<()> {
+        let dir = unique_temp_dir("chrome-cache-layout-detect");
+
+        let empty_dir = dir.join("empty");
+        fs::create_dir_all(&empty_dir)?;
+        assert!(!has_chromium_blockfile_cache_layout(&empty_dir));
+
+        let index_only = dir.join("index-only");
+        fs::create_dir_all(&index_only)?;
+        fs::write(index_only.join("index"), b"idx")?;
+        assert!(!has_chromium_blockfile_cache_layout(&index_only));
+
+        let data_only = dir.join("data-only");
+        fs::create_dir_all(&data_only)?;
+        fs::write(data_only.join("data_0"), b"blk")?;
+        assert!(!has_chromium_blockfile_cache_layout(&data_only));
+
+        let real_cache = dir.join("real-cache");
+        fs::create_dir_all(&real_cache)?;
+        fs::write(real_cache.join("index"), b"idx")?;
+        fs::write(real_cache.join("data_1"), b"blk")?;
+        assert!(has_chromium_blockfile_cache_layout(&real_cache));
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chrome_cache_effective_max_entries_clamps_zero_and_max_to_safe_default() {
+        // This must never silently mean "unlimited" for a one-click processing trigger - see the
+        // 2026-07-11 00:45 near-miss where an unbounded "process now" almost filled the disk
+        // against a real 311GB image. A real Chrome profile's Cache directory routinely holds
+        // tens of thousands of entries.
+        assert_eq!(
+            chrome_cache_effective_max_entries(0),
+            CHROME_CACHE_DEFAULT_MAX_ENTRIES
+        );
+        assert_eq!(
+            chrome_cache_effective_max_entries(usize::MAX),
+            CHROME_CACHE_DEFAULT_MAX_ENTRIES
+        );
+        assert_eq!(chrome_cache_effective_max_entries(250), 250);
+    }
+
+    #[test]
+    fn parse_chrome_cache_http_metadata_extracts_status_and_headers() {
+        let raw = b"HTTP/1.1 200 OK\0Content-Type: text/html; charset=utf-8\0Cache-Control: max-age=3600\0ETag: \"abc123\"\0\0garbage-after-blank-line";
+        let parsed = parse_chrome_cache_http_metadata(raw);
+        assert_eq!(parsed.status_line.as_deref(), Some("HTTP/1.1 200 OK"));
+        assert_eq!(parsed.status_code, Some(200));
+        assert_eq!(
+            chrome_cache_header_value(&parsed.headers, "content-type").as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            chrome_cache_header_value(&parsed.headers, "Cache-Control").as_deref(),
+            Some("max-age=3600")
+        );
+        assert_eq!(
+            chrome_cache_header_value(&parsed.headers, "missing-header"),
+            None
+        );
+
+        let empty = parse_chrome_cache_http_metadata(b"");
+        assert_eq!(empty.status_line, None);
+        assert!(empty.headers.is_empty());
+    }
+
+    #[test]
+    fn chrome_cache_entry_state_label_maps_all_variants() {
+        assert_eq!(
+            chrome_cache_entry_state_label(BlockCacheEntryState::Normal),
+            "normal"
+        );
+        assert_eq!(
+            chrome_cache_entry_state_label(BlockCacheEntryState::Evicted),
+            "evicted"
+        );
+        assert_eq!(
+            chrome_cache_entry_state_label(BlockCacheEntryState::Doomed),
+            "doomed"
+        );
+        assert_eq!(
+            chrome_cache_entry_state_label(BlockCacheEntryState::Unknown),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn chrome_cache_logical_path_helpers_build_stable_unique_paths() {
+        assert_eq!(
+            chrome_cache_root_logical_path("Cache"),
+            "/Browser Cache/Cache"
+        );
+        let mut used = HashSet::new();
+        let first = chrome_cache_entry_logical_path(
+            "/Browser Cache/Cache",
+            "example.com",
+            "DEADBEEF",
+            5,
+            &mut used,
+        );
+        assert_eq!(
+            first,
+            "/Browser Cache/Cache/example.com/00000005-DEADBEEF.record"
+        );
+        let second = chrome_cache_entry_logical_path(
+            "/Browser Cache/Cache",
+            "example.com",
+            "DEADBEEF",
+            5,
+            &mut used,
+        );
+        assert_ne!(second, first);
+        assert!(second.starts_with(&first[..first.len() - ".record".len()]));
+    }
+
+    #[test]
+    fn process_chromium_blockfile_cache_evidence_reports_corrupt_index_gracefully() -> Result<()> {
+        // A directory with the right FILE NAMES (index + data_0) but no valid blockfile content -
+        // the chrome-cache-parser crate must fail to open it, and this must fall back to the same
+        // "detected, not parsed" status used by every other parser in this codebase rather than
+        // crashing or hanging.
+        let case_path = unique_case_path("chrome-cache-corrupt");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("chrome-cache-corrupt-source");
+        let cache_dir = dir.join("Cache");
+        fs::create_dir_all(&cache_dir)?;
+        fs::write(cache_dir.join("index"), b"NOT-A-VALID-BLOCKFILE-INDEX")?;
+        fs::write(cache_dir.join("data_0"), b"NOT-A-VALID-DATA-BLOCK-FILE")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: cache_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let entry = entries
+            .into_iter()
+            .next()
+            .expect("Chrome cache evidence should produce at least one entry");
+        assert_eq!(
+            entry.metadata_json["artifact_kind"].as_str(),
+            Some("browser_cache_store")
+        );
+        assert_eq!(
+            entry.metadata_json["browser_cache_parser_status"].as_str(),
+            Some("unsupported")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn detect_volume_filesystem_at_recognizes_bitlocker_fve_signature() -> Result<()> {
+        // Real BitLocker/FVE volumes carry "-FVE-FS-" at the exact byte offset (3) where a
+        // plaintext NTFS volume carries its "NTFS    " OEM ID - this must be detected BEFORE
+        // falling through to the 0x55AA MBR-signature/OEM-ID checks, and must never be
+        // misidentified as a parseable NTFS/FAT volume (that would mean attempting to walk
+        // encrypted bytes as a plaintext filesystem).
+        let mut header = vec![0_u8; 512];
+        header[3..11].copy_from_slice(BITLOCKER_FVE_SIGNATURE);
+        header[510] = 0x55;
+        header[511] = 0xAA;
+        let mut cursor = std::io::Cursor::new(header);
+        let detected = detect_volume_filesystem_at(&mut cursor, 0)?;
+        assert_eq!(detected, Some(BITLOCKER_LOCKED_FILESYSTEM));
+
+        // A real NTFS header (no FVE signature) must still be detected normally - this fix must
+        // not have broken ordinary NTFS detection.
+        let mut ntfs_header = vec![0_u8; 512];
+        ntfs_header[3..11].copy_from_slice(b"NTFS    ");
+        ntfs_header[510] = 0x55;
+        ntfs_header[511] = 0xAA;
+        let mut ntfs_cursor = std::io::Cursor::new(ntfs_header);
+        assert_eq!(
+            detect_volume_filesystem_at(&mut ntfs_cursor, 0)?,
+            Some("NTFS")
+        );
+        Ok(())
+    }
+
+    fn bitlocker_test_entry(entry_type: u16, value_type: u16, data: &[u8]) -> Vec<u8> {
+        let size = (8 + data.len()) as u16;
+        let mut entry = Vec::with_capacity(usize::from(size));
+        entry.extend_from_slice(&size.to_le_bytes());
+        entry.extend_from_slice(&entry_type.to_le_bytes());
+        entry.extend_from_slice(&value_type.to_le_bytes());
+        entry.extend_from_slice(&1u16.to_le_bytes());
+        entry.extend_from_slice(data);
+        entry
+    }
+
+    fn bitlocker_metadata_only_image(method: u16, protectors: &[u16]) -> Vec<u8> {
+        let metadata_offset = 0x1000_u64;
+        let mut entries = Vec::new();
+        for protector in protectors {
+            let mut vmk = vec![0_u8; 28];
+            vmk[26..28].copy_from_slice(&protector.to_le_bytes());
+            entries.extend_from_slice(&bitlocker_test_entry(0x0002, 0x0008, &vmk));
+        }
+        let metadata_size = 48 + entries.len();
+        let mut image = vec![0_u8; 0x2000];
+        image[0..3].copy_from_slice(&[0xeb, 0x58, 0x90]);
+        image[3..11].copy_from_slice(BITLOCKER_FVE_SIGNATURE);
+        image[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        image[176..184].copy_from_slice(&metadata_offset.to_le_bytes());
+
+        let mb = metadata_offset as usize;
+        image[mb..mb + 8].copy_from_slice(BITLOCKER_FVE_SIGNATURE);
+        image[mb + 32..mb + 40].copy_from_slice(&metadata_offset.to_le_bytes());
+        image[mb + 64..mb + 68].copy_from_slice(&(metadata_size as u32).to_le_bytes());
+        image[mb + 64 + 36..mb + 64 + 38].copy_from_slice(&method.to_le_bytes());
+        image[mb + 64 + 48..mb + 64 + 48 + entries.len()].copy_from_slice(&entries);
+        image
+    }
+
+    #[test]
+    fn list_image_volumes_surfaces_bitlocker_metadata_summary() -> Result<()> {
+        let evidence_dir = unique_temp_dir("bitlocker-live-summary");
+        let image_path = evidence_dir.join("locked.img");
+        fs::write(
+            &image_path,
+            bitlocker_metadata_only_image(0x8002, &[0x0100]),
+        )?;
+
+        let volumes = list_image_volumes(&image_path)?;
+        assert_eq!(volumes.len(), 1);
+        let volume = &volumes[0];
+        assert_eq!(volume.filesystem, BITLOCKER_LOCKED_FILESYSTEM);
+        assert!(!volume.browsable);
+        let bitlocker = volume
+            .bitlocker
+            .as_ref()
+            .expect("locked volume should include BitLocker inspection summary");
+        assert_eq!(bitlocker.metadata_state, "parsed");
+        assert_eq!(bitlocker.variant, "Windows 7 or later");
+        assert_eq!(bitlocker.encryption_method.as_deref(), Some("AES-128-CBC"));
+        assert_eq!(bitlocker.encryption_method_raw.as_deref(), Some("0x8002"));
+        assert_eq!(bitlocker.protectors.len(), 1);
+        assert_eq!(bitlocker.protectors[0].kind, "TPM");
+        assert!(bitlocker.tpm_only);
+        assert_eq!(
+            bitlocker.status,
+            "BitLocker volume detected; cannot decrypt without recovery key/password"
+        );
+
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    fn write_pst_fixture(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = dir.join(name);
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    fn pst_evidence_entry(case_path: &Path, path: PathBuf) -> Result<FilesystemEntry> {
+        let evidence_id = add_evidence(
+            case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(case_path, Some(evidence_id))?;
+        Ok(entries
+            .into_iter()
+            .next()
+            .expect("mailbox evidence should produce at least one entry"))
+    }
+
+    #[test]
+    fn process_pst_mailbox_evidence_reports_wrong_magic_as_unsupported() -> Result<()> {
+        let case_path = unique_case_path("pst-wrong-magic");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("pst-wrong-magic-source");
+        let path = write_pst_fixture(&dir, "mail.pst", b"NOT-A-PST-FILE-AT-ALL")?;
+
+        let entry = pst_evidence_entry(&case_path, path)?;
+        assert_eq!(
+            entry.metadata_json["artifact_kind"].as_str(),
+            Some("email_store")
+        );
+        assert_eq!(
+            entry.metadata_json["email_parser_status"].as_str(),
+            Some("unsupported")
+        );
+        assert_eq!(
+            entry.metadata_json["pst_variant"].as_str(),
+            Some("unsupported")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn process_pst_mailbox_evidence_reports_ansi_variant_as_unsupported() -> Result<()> {
+        let case_path = unique_case_path("pst-ansi-variant");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("pst-ansi-variant-source");
+        let mut ansi_header = vec![0_u8; 12];
+        ansi_header[0..4].copy_from_slice(b"!BDN");
+        ansi_header[10..12].copy_from_slice(&14_u16.to_le_bytes());
+        let path = write_pst_fixture(&dir, "mail.pst", &ansi_header)?;
+
+        let entry = pst_evidence_entry(&case_path, path)?;
+        assert_eq!(
+            entry.metadata_json["email_parser_status"].as_str(),
+            Some("unsupported")
+        );
+        assert_eq!(entry.metadata_json["pst_variant"].as_str(), Some("ansi"));
+        assert!(entry.metadata_json["email_parser_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ANSI"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn process_pst_mailbox_evidence_reports_unicode_parse_failure_gracefully() -> Result<()> {
+        // A file that passes the cheap 12-byte Unicode-header sniff but is not a real,
+        // structurally valid PST/OST container. The outlook-pst crate cannot open it, and
+        // process_pst_mailbox_evidence must fall back to the same "detected, not parsed" status
+        // used for other unsupported mailbox variants rather than crashing or hanging.
+        let case_path = unique_case_path("pst-unicode-corrupt");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("pst-unicode-corrupt-source");
+        let mut bytes = vec![0_u8; 4096];
+        bytes[0..4].copy_from_slice(b"!BDN");
+        bytes[10..12].copy_from_slice(&23_u16.to_le_bytes());
+        let path = write_pst_fixture(&dir, "mail.pst", &bytes)?;
+
+        let entry = pst_evidence_entry(&case_path, path)?;
+        assert_eq!(
+            entry.metadata_json["artifact_kind"].as_str(),
+            Some("email_store")
+        );
+        assert_eq!(
+            entry.metadata_json["email_parser_status"].as_str(),
+            Some("unsupported")
+        );
+        assert_eq!(entry.metadata_json["pst_variant"].as_str(), Some("unicode"));
+        assert!(entry.metadata_json["email_parser_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not read"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
     fn evidence_process_assigns_forensic_categories() -> Result<()> {
         let case_path = unique_case_path("evidence-categories");
         create_test_case(&case_path)?;
@@ -16916,6 +26196,733 @@ mod tests {
     }
 
     #[test]
+    fn classifier_precision_known_answers() {
+        let metadata = serde_json::json!({});
+        let classify =
+            |logical_path: &str, name: &str| classify_entry(logical_path, name, "file", &metadata);
+
+        let password_icon = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Windows/WinSxS/.../PasswordExpiry.contrast-black_scale-100.png",
+            "PasswordExpiry.contrast-black_scale-100.png",
+        );
+        assert_eq!(
+            (password_icon.main, password_icon.sub),
+            ("Operating System", "System files")
+        );
+        assert_eq!(password_icon.confidence, "low");
+        assert_ne!(password_icon.main, "Accounts and Identity");
+
+        let credentials_dll = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Windows/WinSxS/.../Windows.Security.Credentials.UI.UserConsentVerifierManager.dll",
+            "Windows.Security.Credentials.UI.UserConsentVerifierManager.dll",
+        );
+        assert_eq!(
+            (credentials_dll.main, credentials_dll.sub),
+            ("Operating System", "System files")
+        );
+        assert_eq!(credentials_dll.confidence, "low");
+        assert_ne!(credentials_dll.main, "Accounts and Identity");
+
+        let credentials_schema = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Windows/schemas/.../EapGenericUserCredentials.xsd",
+            "EapGenericUserCredentials.xsd",
+        );
+        assert_eq!(
+            (credentials_schema.main, credentials_schema.sub),
+            ("Operating System", "System files")
+        );
+        assert_eq!(credentials_schema.confidence, "low");
+        assert_ne!(credentials_schema.main, "Accounts and Identity");
+
+        let chrome_login = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Users/john/AppData/Local/Google/Chrome/User Data/Default/Login Data",
+            "Login Data",
+        );
+        assert_eq!(
+            (chrome_login.main, chrome_login.sub),
+            ("Accounts and Identity", "Credentials and tokens")
+        );
+        assert_eq!(chrome_login.confidence, "high");
+
+        let firefox_key = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Users/john/AppData/Roaming/Mozilla/Firefox/Profiles/x.default/key4.db",
+            "key4.db",
+        );
+        assert_eq!(
+            (firefox_key.main, firefox_key.sub),
+            ("Accounts and Identity", "Credentials and tokens")
+        );
+        assert_eq!(firefox_key.confidence, "high");
+
+        let sam = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Windows/System32/config/SAM",
+            "SAM",
+        );
+        assert_eq!((sam.main, sam.sub), ("Operating System", "Registry hives"));
+        assert_eq!(sam.confidence, "high");
+        assert_ne!(sam.sub, "System files");
+
+        let security_evtx = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Windows/System32/winevt/Logs/Security.evtx",
+            "Security.evtx",
+        );
+        assert_eq!(
+            (security_evtx.main, security_evtx.sub),
+            ("Operating System", "Event logs")
+        );
+        assert_eq!(security_evtx.confidence, "high");
+    }
+
+    #[test]
+    fn classifier_type_gates_keywords_and_caps_fallback_confidence() {
+        let metadata = serde_json::json!({});
+        let password_icon = classify_entry(
+            "/Users/john/Pictures/PasswordExpiry.png",
+            "PasswordExpiry.png",
+            "file",
+            &metadata,
+        );
+        assert_eq!(
+            (password_icon.main, password_icon.sub),
+            ("Pictures and Media", "Pictures")
+        );
+        assert_eq!(password_icon.confidence, "medium");
+
+        let password_notes = classify_entry(
+            "/Users/john/Documents/password-notes.txt",
+            "password-notes.txt",
+            "file",
+            &metadata,
+        );
+        assert_eq!(
+            (password_notes.main, password_notes.sub),
+            ("Accounts and Identity", "Credentials and tokens")
+        );
+        assert_eq!(password_notes.confidence, "medium");
+
+        let source_file = classify_entry(
+            "/Users/john/projects/oauth_token.cs",
+            "oauth_token.cs",
+            "file",
+            &metadata,
+        );
+        assert_eq!(
+            (source_file.main, source_file.sub),
+            ("Development and Source Code", "Source code")
+        );
+        assert_eq!(source_file.confidence, "medium");
+    }
+
+    #[test]
+    fn timeline_date_range_matches_ntfs_and_fat_parser_timestamp_keys() -> Result<()> {
+        // Regression for the dead date-range Timeline on real image cases:
+        // image processing stores NTFS times under ntfs_*_time_utc and FAT
+        // times under fat_*, but TIMELINE_TIME_FIELD_KEYS only listed the
+        // generic/browser keys, so a range filter matched ~nothing.
+        let case_path = unique_case_path("timeline-range-keys");
+        create_test_case(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO evidence_sources(
+                 case_id, source_kind, source_path, display_name, read_file_system_requested
+             ) VALUES (?1, 'image', ?2, 'missing-image.raw', 1)",
+            params![case_id, "Z:/does/not/exist/missing-image.raw"],
+        )?;
+        let evidence_id = conn.last_insert_rowid();
+        let mut insert = |path: &str, name: &str, metadata: serde_json::Value| {
+            conn.execute(
+                "INSERT INTO filesystem_entries(
+                     case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+                 ) VALUES (?1, ?2, ?3, ?4, 'file', ?5)",
+                params![case_id, evidence_id, path, name, metadata.to_string()],
+            )
+        };
+        insert(
+            "/img/ntfs-in-range.txt",
+            "ntfs-in-range.txt",
+            serde_json::json!({
+                "ntfs_modification_time_utc": "2022-08-16T22:03:58.000335800+00:00"
+            }),
+        )?;
+        insert(
+            "/img/fat-in-range.txt",
+            "fat-in-range.txt",
+            serde_json::json!({ "fat_modified": "2022-08-20T05:47:40Z" }),
+        )?;
+        insert(
+            "/img/ntfs-out-of-range.txt",
+            "ntfs-out-of-range.txt",
+            serde_json::json!({
+                "ntfs_modification_time_utc": "2023-01-01T00:00:00+00:00"
+            }),
+        )?;
+        insert(
+            "/img/fat-legacy-debug-format.txt",
+            "fat-legacy-debug-format.txt",
+            // Pre-fix rows carry Debug-formatted text; they must simply not
+            // match (datetime() yields NULL), never error the whole query.
+            serde_json::json!({
+                "fat_modified": "DateTime { date: Date { year: 2022, month: 8, day: 16 }, time: Time { hour: 5, min: 47, sec: 40, millis: 0 } }"
+            }),
+        )?;
+        // Tool bookkeeping rows (image container etc.) carry tool-side
+        // timestamps like "when KDFT read the image"; they must NEVER appear
+        // as timeline events, even when their timestamp falls in the range.
+        insert(
+            "/img/Container",
+            "Container",
+            serde_json::json!({
+                "artifact_kind": "disk_image_container",
+                "source_file_accessed_utc": "2022-08-16T12:00:00Z"
+            }),
+        )?;
+        drop(conn);
+
+        let range = Some(("2022-08-01T00:00:00Z", "2022-08-31T23:59:59Z"));
+        let entries = list_filesystem_entries_for_timeline(&case_path, Some(100), range)?;
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["fat-in-range.txt", "ntfs-in-range.txt"]);
+        assert_eq!(count_filesystem_entries_for_timeline(&case_path, range)?, 2);
+
+        // Without a range every REAL entry is eligible, including legacy
+        // rows; the container stays excluded.
+        assert_eq!(
+            list_filesystem_entries_for_timeline(&case_path, Some(100), None)?.len(),
+            4
+        );
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_only_processing_skips_content_and_email_reads() -> Result<()> {
+        let case_path = unique_case_path("metadata-only-profile");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("metadata-only-source");
+        fs::create_dir_all(&evidence_dir)?;
+        fs::write(evidence_dir.join("note.txt"), b"searchable text body")?;
+        fs::write(
+            evidence_dir.join("message.eml"),
+            b"From: alice@example.test\r\nTo: bob@example.test\r\nSubject: quarterly\r\n\r\nbody",
+        )?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        // Metadata-only pass: no content capture, no email parsing.
+        let result = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+            ProcessingProfile {
+                capture_content: false,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+        assert_eq!(result.status, "completed");
+        {
+            let conn = open_existing_case(&case_path)?;
+            let with_content: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND content_head IS NOT NULL",
+                params![evidence_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(with_content, 0, "metadata-only index must read no content");
+            let params_json: String = conn.query_row(
+                "SELECT parameters_json FROM evidence_jobs
+                 WHERE evidence_id = ?1 AND job_type = 'filesystem_index'
+                 ORDER BY id DESC LIMIT 1",
+                params![evidence_id],
+                |row| row.get(0),
+            )?;
+            let params_json: serde_json::Value = serde_json::from_str(&params_json)?;
+            assert_eq!(params_json["capture_content"].as_bool(), Some(false));
+            assert_eq!(params_json["parse_emails"].as_bool(), Some(false));
+        }
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let eml = entries
+            .iter()
+            .find(|entry| entry.name == "message.eml")
+            .expect("eml indexed");
+        assert!(
+            eml.metadata_json.get("email_subject").is_none(),
+            "email must not be parsed when disabled"
+        );
+        assert_eq!(
+            eml.metadata_json["email_parser_status"].as_str(),
+            Some("skipped")
+        );
+        assert_eq!(
+            eml.metadata_json["email_parser_error"].as_str(),
+            Some(EMAIL_PARSE_DISABLED_NOTE),
+            "the .eml must disclose WHY it was not parsed: {:?}",
+            eml.metadata_json
+        );
+        // Metadata itself is complete: names, kinds, sizes are all indexed.
+        assert!(entries.iter().any(|entry| entry.name == "note.txt"
+            && entry.size_bytes == Some("searchable text body".len() as i64)));
+        // The evidence row tells the UI the index is metadata-only.
+        let evidence_rows = list_evidence(&case_path)?;
+        let row = evidence_rows
+            .iter()
+            .find(|row| row.id == evidence_id)
+            .expect("evidence listed");
+        assert_eq!(row.content_indexed, Some(false));
+
+        // Re-process with the default profile: content and email come back.
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        {
+            let conn = open_existing_case(&case_path)?;
+            let with_content: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND content_head IS NOT NULL",
+                params![evidence_id],
+                |row| row.get(0),
+            )?;
+            assert!(with_content >= 1, "full profile must capture content");
+        }
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let eml = entries
+            .iter()
+            .find(|entry| entry.name == "message.eml")
+            .expect("eml indexed");
+        assert_eq!(
+            eml.metadata_json["email_subject"].as_str(),
+            Some("quarterly")
+        );
+        let evidence_rows = list_evidence(&case_path)?;
+        assert_eq!(
+            evidence_rows
+                .iter()
+                .find(|row| row.id == evidence_id)
+                .and_then(|row| row.content_indexed),
+            Some(true)
+        );
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(&evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn create_bookmark_with_items_is_atomic() -> Result<()> {
+        let case_path = unique_case_path("atomic-bookmark");
+        create_test_case(&case_path)?;
+
+        // A failing item (nonexistent entry id) must roll back EVERYTHING:
+        // no folder, no bookmark, no audit rows from the aborted flow.
+        let error = create_bookmark_with_items(
+            &case_path,
+            "Atomic Findings",
+            CreateBookmarkOptions {
+                folder_id: 0,
+                bookmark_type: BookmarkType::NotableFile,
+                data_type: Some("File".to_string()),
+                title: Some("should roll back".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+            vec![CreateBookmarkItemOptions {
+                bookmark_id: 0,
+                evidence_id: None,
+                entry_id: Some(987_654_321),
+                item_order: None,
+                display_name: None,
+                logical_path: None,
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({}),
+            }],
+        );
+        assert!(error.is_err(), "nonexistent entry id must fail the flow");
+        assert!(
+            list_bookmark_folders(&case_path)?.is_empty(),
+            "rolled-back flow must not leave its folder"
+        );
+        assert!(list_bookmarks(&case_path)?.is_empty());
+        {
+            let conn = open_existing_case(&case_path)?;
+            let orphan_audit: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_events
+                 WHERE event_type IN ('bookmark.folder.create', 'bookmark.create')",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(orphan_audit, 0, "aborted flow must not leave audit rows");
+        }
+
+        // Happy path: folder + bookmark + item land together, and a second
+        // bookmark reuses the same root folder instead of duplicating it.
+        for round in 0..2 {
+            let result = create_bookmark_with_items(
+                &case_path,
+                "Atomic Findings",
+                CreateBookmarkOptions {
+                    folder_id: 0,
+                    bookmark_type: BookmarkType::HighlightedData,
+                    data_type: Some("Search Hit".to_string()),
+                    title: Some(format!("round {round}")),
+                    examiner_comment: None,
+                    in_report: true,
+                    source_ref_json: serde_json::json!({}),
+                    content_ref_json: serde_json::json!({}),
+                },
+                vec![CreateBookmarkItemOptions {
+                    bookmark_id: 0,
+                    evidence_id: None,
+                    entry_id: None,
+                    item_order: None,
+                    display_name: Some(format!("hit {round}")),
+                    logical_path: None,
+                    selection_offset: Some(16),
+                    selection_length: Some(4),
+                    data_preview: None,
+                    item_ref_json: serde_json::json!({}),
+                }],
+            )?;
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].bookmark_id, result.bookmark_id);
+        }
+        let folders = list_bookmark_folders(&case_path)?;
+        assert_eq!(
+            folders
+                .iter()
+                .filter(|folder| folder.name == "Atomic Findings")
+                .count(),
+            1,
+            "root folder must be reused, not duplicated"
+        );
+        assert_eq!(list_bookmarks(&case_path)?.len(), 2);
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_bookmark_folder_only_removes_empty_leaf_folders() -> Result<()> {
+        let case_path = unique_case_path("remove-bookmark-folder");
+        create_test_case(&case_path)?;
+
+        // Empty leaf folder: removable, and the removal is audited by name.
+        let empty_id = create_bookmark_folder(&case_path, None, "Accidental Empty", None, true)?;
+        let removed = remove_bookmark_folder(&case_path, empty_id)?;
+        assert_eq!(removed.folder_id, empty_id);
+        assert_eq!(removed.name, "Accidental Empty");
+        assert!(list_bookmark_folders(&case_path)?
+            .iter()
+            .all(|folder| folder.id != empty_id));
+        {
+            let conn = open_existing_case(&case_path)?;
+            let details: String = conn.query_row(
+                "SELECT details_json FROM audit_events
+                 WHERE event_type = 'bookmark.folder.delete'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(details.contains("Accidental Empty"));
+        }
+
+        // Folder holding a bookmark: refused.
+        let used_id = create_bookmark_folder(&case_path, None, "Has Bookmark", None, true)?;
+        create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id: used_id,
+                bookmark_type: BookmarkType::NotableFile,
+                data_type: Some("File".to_string()),
+                title: Some("keeps folder occupied".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        let error = remove_bookmark_folder(&case_path, used_id)
+            .expect_err("folder with bookmarks must be refused");
+        assert!(error.to_string().contains("bookmark(s)"), "{error}");
+
+        // Folder with a child folder: refused.
+        let parent_id = create_bookmark_folder(&case_path, None, "Parent", None, true)?;
+        create_bookmark_folder(&case_path, Some(parent_id), "Child", None, true)?;
+        let error = remove_bookmark_folder(&case_path, parent_id)
+            .expect_err("folder with children must be refused");
+        assert!(error.to_string().contains("child folder"), "{error}");
+
+        // Unknown folder id: clean error.
+        assert!(remove_bookmark_folder(&case_path, 987654).is_err());
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_legacy_fat_timestamp_known_answers() {
+        // Exact strings observed in case-20260712162603 (stored by the old
+        // format!("{:?}") serialization).
+        assert_eq!(
+            normalize_legacy_fat_timestamp(
+                "DateTime { date: Date { year: 2022, month: 8, day: 16 }, \
+                 time: Time { hour: 14, min: 53, sec: 22, millis: 990 } }"
+            )
+            .as_deref(),
+            Some("2022-08-16T14:53:22.990Z")
+        );
+        assert_eq!(
+            normalize_legacy_fat_timestamp(
+                "DateTime { date: Date { year: 2022, month: 8, day: 16 }, \
+                 time: Time { hour: 5, min: 47, sec: 40, millis: 0 } }"
+            )
+            .as_deref(),
+            Some("2022-08-16T05:47:40Z")
+        );
+        assert_eq!(
+            normalize_legacy_fat_timestamp("Date { year: 2022, month: 8, day: 16 }").as_deref(),
+            Some("2022-08-16")
+        );
+        // Zero/unset dates decode to no timestamp, matching fat_datetime_iso.
+        assert_eq!(
+            normalize_legacy_fat_timestamp(
+                "DateTime { date: Date { year: 0, month: 0, day: 0 }, \
+                 time: Time { hour: 0, min: 0, sec: 0, millis: 0 } }"
+            ),
+            None
+        );
+        // Already-normalized values must be left alone.
+        assert_eq!(normalize_legacy_fat_timestamp("2022-08-16T05:47:40Z"), None);
+        assert_eq!(normalize_legacy_fat_timestamp(""), None);
+    }
+
+    #[test]
+    fn recategorize_repairs_legacy_fat_timestamps_into_timeline_range() -> Result<()> {
+        let case_path = unique_case_path("fat-timestamp-repair");
+        create_test_case(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO evidence_sources(
+                 case_id, source_kind, source_path, display_name, read_file_system_requested
+             ) VALUES (?1, 'image', ?2, 'missing-image.raw', 1)",
+            params![case_id, "Z:/does/not/exist/missing-image.raw"],
+        )?;
+        let evidence_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+             ) VALUES (?1, ?2, '/img/legacy-fat.txt', 'legacy-fat.txt', 'file', ?3)",
+            params![
+                case_id,
+                evidence_id,
+                serde_json::json!({
+                    "filesystem_parser": "fatfs",
+                    "fat_created": "DateTime { date: Date { year: 2022, month: 8, day: 16 }, time: Time { hour: 14, min: 53, sec: 22, millis: 990 } }",
+                    "fat_accessed": "Date { year: 2022, month: 8, day: 16 }",
+                    "fat_modified": "DateTime { date: Date { year: 2022, month: 8, day: 16 }, time: Time { hour: 5, min: 47, sec: 40, millis: 0 } }"
+                })
+                .to_string(),
+            ],
+        )?;
+        drop(conn);
+
+        // Before repair the legacy text is invisible to a date-range build.
+        let range = Some(("2022-08-01T00:00:00Z", "2022-08-31T23:59:59Z"));
+        assert_eq!(count_filesystem_entries_for_timeline(&case_path, range)?, 0);
+
+        recategorize_case_entries(&case_path)?;
+
+        let conn = open_existing_case(&case_path)?;
+        let metadata: String = conn.query_row(
+            "SELECT metadata_json FROM filesystem_entries WHERE case_id = ?1",
+            params![case_id],
+            |row| row.get(0),
+        )?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+        assert_eq!(
+            metadata["fat_created"].as_str(),
+            Some("2022-08-16T14:53:22.990Z")
+        );
+        assert_eq!(metadata["fat_accessed"].as_str(), Some("2022-08-16"));
+        assert_eq!(
+            metadata["fat_modified"].as_str(),
+            Some("2022-08-16T05:47:40Z")
+        );
+        assert_eq!(
+            metadata["fat_time_basis"].as_str(),
+            Some(FAT_TIME_BASIS_NOTE)
+        );
+        let audit: String = conn.query_row(
+            "SELECT details_json FROM audit_events
+             WHERE event_type = 'recategorize.run'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let audit: serde_json::Value = serde_json::from_str(&audit)?;
+        assert_eq!(audit["fat_timestamps_repaired"].as_i64(), Some(1));
+        drop(conn);
+
+        // After repair the same entry is reachable by the Timeline range.
+        assert_eq!(count_filesystem_entries_for_timeline(&case_path, range)?, 1);
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn recategorize_case_entries_rewrites_stored_categories_without_evidence_read() -> Result<()> {
+        let case_path = unique_case_path("recategorize");
+        create_test_case(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO evidence_sources(
+                 case_id, source_kind, source_path, display_name, read_file_system_requested
+             ) VALUES (?1, 'image', ?2, 'missing-image.raw', 1)",
+            params![case_id, "Z:/this/source/does/not/exist/missing-image.raw"],
+        )?;
+        let evidence_id = conn.last_insert_rowid();
+        let wrong_system_category = serde_json::json!({
+            "analysis_category": "Accounts and Identity / Credentials and tokens",
+            "category_main": "Accounts and Identity",
+            "category_sub": "Credentials and tokens",
+            "category_source": "extension_path_rules_v1",
+            "sentinel": "preserve-system-metadata"
+        });
+        let wrong_login_category = serde_json::json!({
+            "analysis_category": "Documents and Office / Text and notes",
+            "category_main": "Documents and Office",
+            "category_sub": "Text and notes",
+            "category_source": "extension_path_rules_v1",
+            "sentinel": "preserve-login-metadata"
+        });
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, 'file', ?5)",
+            params![
+                case_id,
+                evidence_id,
+                "/Image Analysis/Volumes/003-Basic_data_partition/Windows/WinSxS/PasswordExpiry.png",
+                "PasswordExpiry.png",
+                wrong_system_category.to_string(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, 'file', ?5)",
+            params![
+                case_id,
+                evidence_id,
+                "/Image Analysis/Volumes/003-Basic_data_partition/Users/john/AppData/Local/Google/Chrome/User Data/Default/Login Data",
+                "Login Data",
+                wrong_login_category.to_string(),
+            ],
+        )?;
+        drop(conn);
+
+        assert_eq!(recategorize_case_entries(&case_path)?, 2);
+
+        let conn = open_existing_case(&case_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT name, metadata_json
+             FROM filesystem_entries
+             WHERE case_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![case_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let stored = rows
+            .into_iter()
+            .map(|(name, metadata)| {
+                Ok((name, serde_json::from_str::<serde_json::Value>(&metadata)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let system = &stored
+            .iter()
+            .find(|(name, _)| name == "PasswordExpiry.png")
+            .expect("system entry remains stored")
+            .1;
+        assert_eq!(
+            system["analysis_category"].as_str(),
+            Some("Operating System / System files")
+        );
+        assert_eq!(system["category_confidence"].as_str(), Some("low"));
+        assert_eq!(
+            system["category_source"].as_str(),
+            Some(ENTRY_CATEGORY_CLASSIFIER_VERSION)
+        );
+        assert_eq!(
+            system["sentinel"].as_str(),
+            Some("preserve-system-metadata")
+        );
+        let login = &stored
+            .iter()
+            .find(|(name, _)| name == "Login Data")
+            .expect("login entry remains stored")
+            .1;
+        assert_eq!(
+            login["analysis_category"].as_str(),
+            Some("Accounts and Identity / Credentials and tokens")
+        );
+        assert_eq!(login["category_confidence"].as_str(), Some("high"));
+        assert_eq!(
+            login["category_source"].as_str(),
+            Some(ENTRY_CATEGORY_CLASSIFIER_VERSION)
+        );
+        assert_eq!(login["sentinel"].as_str(), Some("preserve-login-metadata"));
+
+        let audit_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'recategorize.run'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(audit_count, 1);
+        let audit_details: String = conn.query_row(
+            "SELECT details_json
+             FROM audit_events
+             WHERE event_type = 'recategorize.run'
+             ORDER BY id DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let audit_details: serde_json::Value = serde_json::from_str(&audit_details)?;
+        assert_eq!(audit_details["entries_updated"].as_i64(), Some(2));
+        assert_eq!(
+            audit_details["classifier_version"].as_str(),
+            Some(ENTRY_CATEGORY_CLASSIFIER_VERSION)
+        );
+        let evidence_jobs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM evidence_jobs", [], |row| row.get(0))?;
+        assert_eq!(evidence_jobs, 0);
+
+        drop(stmt);
+        drop(conn);
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
     fn os_paths_with_generic_artifact_words_do_not_classify_as_browser() -> Result<()> {
         let classify = |logical_path: &str, name: &str| {
             let mut metadata = serde_json::json!({});
@@ -16927,26 +26934,20 @@ mod tests {
         };
 
         // The dllcache regression Cristina reported: system DLLs must be
-        // executables, not browser artifacts, despite "cache" in the path.
+        // demoted to system files, not browser or credential artifacts.
         assert_eq!(
             classify(
                 "/Volumes/001-part0/WINDOWS/system32/dllcache/acledit.dll",
                 "acledit.dll"
             ),
-            (
-                "Program Execution".to_string(),
-                "Executables and binaries".to_string()
-            )
+            ("Operating System".to_string(), "System files".to_string())
         );
         assert_eq!(
             classify(
                 "/Volumes/001-part0/WINDOWS/system32/dllcache/arp.exe",
                 "arp.exe"
             ),
-            (
-                "Program Execution".to_string(),
-                "Executables and binaries".to_string()
-            )
+            ("Operating System".to_string(), "System files".to_string())
         );
         // Driver .img under Windows is not a disk image.
         let (img_main, _) = classify(
@@ -17424,6 +27425,231 @@ mod tests {
     }
 
     #[test]
+    fn raw_search_location_helpers_classify_partitions_gaps_and_file_evidence() {
+        let volumes = vec![
+            LiveVolume {
+                index: 0,
+                volume_index_zero_based: 0,
+                partition_number_one_based: Some(1),
+                name: "001-system".to_string(),
+                filesystem: "FAT".to_string(),
+                start_offset: 1024,
+                size_bytes: 2048,
+                browsable: true,
+                bitlocker: None,
+            },
+            LiveVolume {
+                index: 1,
+                volume_index_zero_based: 1,
+                partition_number_one_based: Some(2),
+                name: "002-data".to_string(),
+                filesystem: "NTFS".to_string(),
+                start_offset: 8192,
+                size_bytes: 4096,
+                browsable: true,
+                bitlocker: None,
+            },
+        ];
+
+        assert_eq!(raw_search_sector(1536, RAW_SEARCH_SECTOR_SIZE), 3);
+
+        let in_partition = classify_raw_hit_location("image", 2048, &volumes);
+        assert_eq!(in_partition.partition_index, Some(0));
+        assert_eq!(in_partition.volume_index_zero_based, Some(0));
+        assert_eq!(in_partition.partition_number_one_based, Some(1));
+        assert_eq!(in_partition.volume_name.as_deref(), Some("001-system"));
+        assert_eq!(in_partition.partition_start_offset, Some(1024));
+        assert_eq!(in_partition.filesystem.as_deref(), Some("FAT"));
+        assert_eq!(in_partition.region, "in-partition");
+
+        let gap = classify_raw_hit_location("image", 4096, &volumes);
+        assert_eq!(gap.partition_index, None);
+        assert_eq!(gap.volume_index_zero_based, None);
+        assert_eq!(gap.partition_number_one_based, None);
+        assert_eq!(gap.volume_name, None);
+        assert_eq!(gap.region, "partition-gap/unpartitioned");
+
+        let file = classify_raw_hit_location("file", 2048, &volumes);
+        assert_eq!(file.partition_index, None);
+        assert_eq!(file.region, "not-applicable (file evidence)");
+    }
+
+    #[test]
+    fn raw_disk_search_records_audit_and_returns_provenance() -> Result<()> {
+        let case_path = unique_case_path("raw-search-audit");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("raw-search-audit-source");
+        let evidence_path = evidence_dir.join("bytes.bin");
+        fs::write(
+            &evidence_path,
+            b"prefix needle suffix with enough trailing bytes",
+        )?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path.clone(),
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let hash = hash_evidence(&case_path, evidence_id)?;
+
+        let result = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "needle".to_string(),
+                max_results: 5,
+                max_scan_bytes: 64,
+            },
+        )?;
+
+        assert_eq!(result.evidence_id, evidence_id);
+        assert_eq!(result.evidence_display_name, "bytes.bin");
+        assert_eq!(result.source_path, stable_path_string(&evidence_path));
+        assert_eq!(
+            result.evidence_sha256_hex.as_deref(),
+            Some(hash.sha256_hex.as_str())
+        );
+        assert_eq!(
+            result.evidence_hashed_at.as_deref(),
+            Some(hash.hashed_at.as_str())
+        );
+        assert_eq!(result.sector_size, 512);
+        assert_eq!(result.actor, "Codex");
+        assert_eq!(result.query, "needle");
+        assert_eq!(
+            result.encodings,
+            vec![
+                "ascii".to_string(),
+                "utf16le".to_string(),
+                "utf16be".to_string()
+            ]
+        );
+        assert_eq!(result.scan_start, 0);
+        assert_eq!(result.max_scan_bytes, 64);
+        assert_eq!(result.max_results, 5);
+        assert_eq!(result.hits.len(), 1);
+        assert!(result.searched_at.ends_with('Z'));
+        assert_eq!(result.hits[0].offset, 7);
+        assert_eq!(result.hits[0].sector, 0);
+        assert_eq!(result.hits[0].region, "not-applicable (file evidence)");
+        assert!(result.hits[0].data_preview.contains("6E 65 65 64 6C 65"));
+        assert!(result.hits[0].ascii_preview.contains("needle"));
+
+        let conn = open_existing_case(&case_path)?;
+        let (actor, object_id, details_json): (String, i64, String) = conn.query_row(
+            "SELECT actor, object_id, details_json
+             FROM audit_events
+             WHERE event_type = 'raw_search.run'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(actor, "Codex");
+        assert_eq!(object_id, evidence_id);
+        let details: serde_json::Value = serde_json::from_str(&details_json)?;
+        assert_eq!(details["query"], "needle");
+        assert_eq!(details["encodings"][0], "ascii");
+        assert_eq!(details["bytes_scanned"], result.bytes_scanned);
+        assert_eq!(details["total_size"], result.total_size);
+        assert_eq!(details["hit_count"], 1);
+        assert_eq!(details["truncated"], false);
+        assert_eq!(details["max_scan_bytes"], 64);
+        assert_eq!(details["sector_size"], 512);
+        assert_eq!(details["evidence_sha256_hex"], hash.sha256_hex);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_disk_search_finds_ascii_hits_starting_in_retained_overlap() -> Result<()> {
+        let case_path = unique_case_path("raw-search-boundary");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("raw-search-boundary-source");
+        let evidence_path = evidence_dir.join("bytes.bin");
+        let needle = b"KDFT_BOUNDARY_MARK";
+        let needle_len = needle.len();
+        let max_needle_len = needle_len * 2;
+        let overlap = max_needle_len - 1;
+        let first_window_safe_len = RAW_SEARCH_CHUNK_BYTES - overlap;
+        let old_miss_zone_start = first_window_safe_len - needle_len + 1;
+        let old_miss_zone_end = first_window_safe_len - 1;
+        let retained_overlap_offset = old_miss_zone_start + 5;
+        assert!(
+            retained_overlap_offset >= old_miss_zone_start
+                && retained_overlap_offset <= old_miss_zone_end,
+            "test offset must stay inside old miss zone"
+        );
+
+        let boundary_offset = RAW_SEARCH_CHUNK_BYTES - 7;
+        assert!(boundary_offset < RAW_SEARCH_CHUNK_BYTES);
+        assert!(boundary_offset + needle_len > RAW_SEARCH_CHUNK_BYTES);
+        let control_offset = 1000_usize;
+
+        let mut evidence = fs::File::create(&evidence_path)?;
+        evidence.set_len((RAW_SEARCH_CHUNK_BYTES + 4096) as u64)?;
+        for offset in [retained_overlap_offset, boundary_offset, control_offset] {
+            evidence.seek(SeekFrom::Start(offset as u64))?;
+            evidence.write_all(needle)?;
+        }
+        drop(evidence);
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path.clone(),
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let result = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: String::from_utf8_lossy(needle).into_owned(),
+                max_results: 20,
+                max_scan_bytes: 0,
+            },
+        )?;
+
+        let ascii_offsets = result
+            .hits
+            .iter()
+            .filter(|hit| hit.encoding == "ascii")
+            .map(|hit| hit.offset)
+            .collect::<Vec<_>>();
+        let expected_offsets = [
+            retained_overlap_offset as u64,
+            boundary_offset as u64,
+            control_offset as u64,
+        ];
+        assert_eq!(
+            ascii_offsets.len(),
+            expected_offsets.len(),
+            "unexpected ascii hits: {ascii_offsets:?}"
+        );
+        for expected in expected_offsets {
+            assert_eq!(
+                ascii_offsets
+                    .iter()
+                    .filter(|actual| **actual == expected)
+                    .count(),
+                1,
+                "missing or duplicate ascii hit at {expected}; got {ascii_offsets:?}"
+            );
+        }
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn indexed_directory_root_collapses_synthetic_image_containers() -> Result<()> {
         let case_path = unique_case_path("idx-collapse");
         create_test_case(&case_path)?;
@@ -17518,6 +27744,11 @@ mod tests {
                 notes: None,
             },
         )?;
+        let live_volumes = list_image_volumes(&image_path)?;
+        assert_eq!(live_volumes.len(), 1);
+        assert_eq!(live_volumes[0].index, 0);
+        assert_eq!(live_volumes[0].volume_index_zero_based, 0);
+        assert_eq!(live_volumes[0].partition_number_one_based, Some(1));
 
         let processed = process_evidence(
             &case_path,
@@ -17545,8 +27776,33 @@ mod tests {
         assert_eq!(note.entry_kind, "file");
         assert_eq!(note.size_bytes, Some(21));
         assert_eq!(
+            note.metadata_json["volume_index_zero_based"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            note.metadata_json["partition_number_one_based"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
             note.metadata_json["source_entry_name"].as_str(),
             Some("note.txt")
+        );
+        // Indexed FAT timestamps must be ISO-8601 text (sortable, range-
+        // filterable), never Debug-formatted struct dumps, and must carry the
+        // local-time basis note.
+        for key in ["fat_created", "fat_modified"] {
+            let value = note.metadata_json[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} should be stored as a string"));
+            assert!(
+                value.len() >= 20 && value[4..5] == *"-" && value[10..11] == *"T",
+                "{key} should be ISO-8601, got {value}"
+            );
+            assert!(!value.contains('{'), "{key} still Debug-formatted: {value}");
+        }
+        assert_eq!(
+            note.metadata_json["fat_time_basis"].as_str(),
+            Some(FAT_TIME_BASIS_NOTE)
         );
         let bytes = read_filesystem_entry_bytes(
             &case_path,
@@ -17560,13 +27816,23 @@ mod tests {
         assert_eq!(bytes.total_size, 21);
         let spaced = entries
             .iter()
-            .find(|entry| {
-                entry.logical_path == "/Image Analysis/Volumes/001-part0/Case_Files/note_1.txt"
-            })
-            .expect("FAT file with sanitized name should be indexed");
+            .find(|entry| entry.source_path_exact.as_deref() == Some("Case Files/note (1).txt"))
+            .expect("FAT file with an exact spaced source path should be indexed");
         assert_eq!(
             spaced.metadata_json["fat_path"].as_str(),
             Some("Case Files/note (1).txt")
+        );
+        assert_eq!(
+            spaced.metadata_json["source_path_exact"].as_str(),
+            Some("Case Files/note (1).txt")
+        );
+        assert_eq!(
+            spaced.metadata_json["internal_path_key"].as_str(),
+            Some(spaced.internal_path_key.as_str())
+        );
+        assert_ne!(
+            spaced.internal_path_key,
+            "/Image Analysis/Volumes/001-part0/Case Files/note (1).txt"
         );
         assert_eq!(
             spaced.metadata_json["partition_size_bytes"].as_u64(),
@@ -17581,6 +27847,207 @@ mod tests {
             },
         )?;
         assert_eq!(spaced_bytes.bytes, b"FAT spaced artifact");
+
+        // EA-005 known-answer collision corpus: these are two distinct source
+        // files with independently known bytes. The old sanitizer mapped both
+        // names to Nitroba_work.odt and silently upserted one over the other.
+        let nitroba_entries = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.source_path_exact.as_deref(),
+                    Some("Nitroba work.odt" | "Nitroba_work.odt")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nitroba_entries.len(), 2);
+        assert_ne!(
+            nitroba_entries[0].internal_path_key,
+            nitroba_entries[1].internal_path_key
+        );
+        let exact_spaced = nitroba_entries
+            .iter()
+            .copied()
+            .find(|entry| entry.source_path_exact.as_deref() == Some("Nitroba work.odt"))
+            .expect("spaced Nitroba oracle");
+        let exact_underscore = nitroba_entries
+            .iter()
+            .copied()
+            .find(|entry| entry.source_path_exact.as_deref() == Some("Nitroba_work.odt"))
+            .expect("underscore Nitroba oracle");
+        let exact_spaced_bytes = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: exact_spaced.id,
+                offset: 0,
+                length: 64,
+            },
+        )?;
+        let exact_underscore_bytes = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: exact_underscore.id,
+                offset: 0,
+                length: 64,
+            },
+        )?;
+        assert_eq!(exact_spaced_bytes.bytes, b"known spaced ODT payload");
+        assert_eq!(
+            exact_underscore_bytes.bytes,
+            b"known underscore ODT payload"
+        );
+
+        let nitroba_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "Nitroba".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64,
+            },
+        )?;
+        assert_eq!(nitroba_hits.len(), 2);
+        assert!(nitroba_hits.iter().any(|hit| {
+            hit.source_path_exact.as_deref() == Some("Nitroba work.odt")
+                && hit.internal_path_key == hit.logical_path
+        }));
+        assert!(nitroba_hits
+            .iter()
+            .any(|hit| hit.source_path_exact.as_deref() == Some("Nitroba_work.odt")));
+
+        let raw_result = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "known spaced ODT payload".to_string(),
+                max_results: 10,
+                max_scan_bytes: 0,
+            },
+        )?;
+        assert_eq!(raw_result.hits.len(), 1);
+        assert_eq!(raw_result.hits[0].partition_index, Some(0));
+        assert_eq!(raw_result.hits[0].volume_index_zero_based, Some(0));
+        assert_eq!(raw_result.hits[0].partition_number_one_based, Some(1));
+        record_live_export(
+            &case_path,
+            evidence_id,
+            0,
+            "Nitroba work.odt",
+            &LiveExportResult {
+                output_path: "known-answer-output.odt".to_string(),
+                bytes_written: 24,
+                total_size: 24,
+                sha256_hex: "test-only-known-answer".to_string(),
+            },
+        )?;
+        let conn = open_existing_case(&case_path)?;
+        let export_audit: String = conn.query_row(
+            "SELECT details_json FROM audit_events
+             WHERE event_type = 'live.export' AND object_id = ?1
+             ORDER BY id DESC LIMIT 1",
+            params![evidence_id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        let export_audit: serde_json::Value = serde_json::from_str(&export_audit)?;
+        assert_eq!(export_audit["volume_index_zero_based"], 0);
+        assert_eq!(export_audit["partition_number_one_based"], 1);
+
+        let internal_paths_before = nitroba_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.source_path_exact.clone().unwrap_or_default(),
+                    entry.internal_path_key.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let bookmarked = add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: Some(exact_spaced.id),
+                item_order: None,
+                display_name: None,
+                logical_path: None,
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({}),
+            },
+        )?;
+        assert_eq!(
+            bookmarked.item_ref_json["source_path_exact"].as_str(),
+            Some("Nitroba work.odt")
+        );
+        assert_eq!(
+            bookmarked.item_ref_json["internal_path_key"].as_str(),
+            Some(exact_spaced.internal_path_key.as_str())
+        );
+        assert_eq!(
+            bookmarked.item_ref_json["volume_index_zero_based"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            bookmarked.item_ref_json["partition_number_one_based"].as_u64(),
+            Some(1)
+        );
+        let conn = open_existing_case(&case_path)?;
+        let bookmark_audit: String = conn.query_row(
+            "SELECT details_json FROM audit_events
+             WHERE event_type = 'bookmark.item.add' AND object_id = ?1",
+            params![bookmarked.id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        let bookmark_audit: serde_json::Value = serde_json::from_str(&bookmark_audit)?;
+        assert_eq!(bookmark_audit["volume_index_zero_based"], 0);
+        assert_eq!(bookmark_audit["partition_number_one_based"], 1);
+
+        // Reprocessing must reproduce navigation keys exactly; the report must
+        // continue to present the immutable source path, not that key.
+        let reprocessed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        assert_eq!(reprocessed.status, "completed");
+        let reprocessed_entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let internal_paths_after = reprocessed_entries
+            .iter()
+            .filter_map(|entry| {
+                entry.source_path_exact.as_ref().and_then(|exact| {
+                    exact
+                        .starts_with("Nitroba")
+                        .then(|| (exact.clone(), entry.internal_path_key.clone()))
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(internal_paths_after, internal_paths_before);
+        let tree_report = report_data_with_directory_structure(&case_path, 100)?;
+        assert!(tree_report.directory_trees[0]
+            .lines
+            .iter()
+            .any(|line| line.name == "Case Files"));
+        assert!(!tree_report.directory_trees[0]
+            .lines
+            .iter()
+            .any(|line| line.name.starts_with("Case_Files")));
+        let report_html = render_report_html(&report_data(&case_path)?);
+        assert!(report_html.contains("Exact source path:</strong> Nitroba work.odt"));
+        assert!(report_html.contains("<dt>Source Path (exact)</dt><dd>Nitroba work.odt</dd>"));
+        assert!(report_html.contains("KDFT internal path:"));
+        assert!(report_html.contains("<dt>Volume Index (zero-based)</dt><dd>0</dd>"));
+        assert!(report_html.contains("<dt>Partition Number (one-based)</dt><dd>1</dd>"));
+        assert!(!report_html.contains("<dt>Partition Index</dt>"));
+
         let content_hits = deep_search(
             &case_path,
             DeepSearchOptions {
@@ -17746,17 +28213,39 @@ mod tests {
         Ok(())
     }
 
-    /// Builds a minimal, spec-correct ext2 image (block size 1024, one block
-    /// group) containing /hello.txt, for exercising the ext parser without an
-    /// external fixture or mke2fs.
+    /// Builds a minimal, spec-correct ext4 image (block size 1024, one block
+    /// group, extent-mapped inodes) containing /hello.txt and an inline
+    /// /hello-link symlink, for exercising the ext parser without an external
+    /// fixture or mke2fs. Regular-file inodes use the
+    /// extent tree format (not classic ext2 direct block pointers) because
+    /// real ext4 filesystems - and this crate's directory/file readers -
+    /// require the EXTENTS inode flag; mke2fs.ext4 sets it on every inode by
+    /// default, so this matches genuine evidence rather than legacy ext2.
     fn build_minimal_ext2_image(payload: &[u8]) -> Vec<u8> {
         const BS: usize = 1024;
+        const EXTENTS_FLAG: u32 = 0x0008_0000;
         let mut img = vec![0_u8; 64 * BS];
         let put_u32 = |img: &mut [u8], off: usize, value: u32| {
             img[off..off + 4].copy_from_slice(&value.to_le_bytes());
         };
         let put_u16 = |img: &mut [u8], off: usize, value: u16| {
             img[off..off + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        // Writes a single-entry, depth-0 extent tree into an inode's 60-byte
+        // i_block area (offset 40 within the inode), mapping logical block 0
+        // to physical `data_block` for `len` blocks.
+        let put_extent_header = |img: &mut [u8], inode_off: usize, data_block: u32, len: u16| {
+            let block = inode_off + 40;
+            img[block] = 0x0A; // eh_magic low byte
+            img[block + 1] = 0xF3; // eh_magic high byte
+            put_u16(img, block + 2, 1); // eh_entries
+            put_u16(img, block + 4, 4); // eh_max
+            put_u16(img, block + 6, 0); // eh_depth (0 = leaf, extents follow inline)
+            put_u32(img, block + 8, 0); // eh_generation
+            put_u32(img, block + 12, 0); // ee_block (logical block 0)
+            put_u16(img, block + 16, len); // ee_len
+            put_u16(img, block + 18, 0); // ee_start_hi
+            put_u32(img, block + 20, data_block); // ee_start_lo
         };
 
         // Superblock (block 1).
@@ -17775,7 +28264,7 @@ mod tests {
         put_u32(&mut img, sb + 76, 1); // s_rev_level = dynamic
         put_u32(&mut img, sb + 84, 11); // s_first_ino
         put_u16(&mut img, sb + 88, 128); // s_inode_size
-        put_u32(&mut img, sb + 96, 0x2); // s_feature_incompat = FILETYPE
+        put_u32(&mut img, sb + 96, 0x42); // s_feature_incompat = FILETYPE | EXTENTS
 
         // Block group descriptor (block 2).
         let gd = 2 * BS;
@@ -17789,14 +28278,23 @@ mod tests {
         put_u32(&mut img, root + 4, 1024); // i_size
         put_u16(&mut img, root + 26, 3); // i_links_count
         put_u32(&mut img, root + 28, 2); // i_blocks (512-byte units)
-        put_u32(&mut img, root + 40, 7); // i_block[0] -> block 7
+        put_u32(&mut img, root + 32, EXTENTS_FLAG); // i_flags
+        put_extent_header(&mut img, root, 7, 1); // i_block -> extent tree: block 7
 
         let hello = 5 * BS + 10 * 128; // inode 11
         put_u16(&mut img, hello, 0x81A4); // reg, 0644
         put_u32(&mut img, hello + 4, payload.len() as u32); // i_size
         put_u16(&mut img, hello + 26, 1); // i_links_count
         put_u32(&mut img, hello + 28, 2); // i_blocks
-        put_u32(&mut img, hello + 40, 8); // i_block[0] -> block 8
+        put_u32(&mut img, hello + 32, EXTENTS_FLAG); // i_flags
+        put_extent_header(&mut img, hello, 8, 1); // i_block -> extent tree: block 8
+
+        let hello_link = 5 * BS + 11 * 128; // inode 12
+        put_u16(&mut img, hello_link, 0xA1FF); // symlink, 0777
+        put_u32(&mut img, hello_link + 4, 9); // i_size: "hello.txt"
+        put_u16(&mut img, hello_link + 26, 1); // i_links_count
+        put_u32(&mut img, hello_link + 28, 0); // inline target consumes no data blocks
+        img[hello_link + 40..hello_link + 49].copy_from_slice(b"hello.txt");
 
         // Root directory data (block 7).
         let dir = 7 * BS;
@@ -17812,10 +28310,15 @@ mod tests {
         img[dir + 20] = b'.';
         img[dir + 21] = b'.';
         put_u32(&mut img, dir + 24, 11); // "hello.txt" -> inode 11
-        put_u16(&mut img, dir + 28, 1000); // rec_len fills the block
+        put_u16(&mut img, dir + 28, 20);
         img[dir + 30] = 9;
         img[dir + 31] = 1;
         img[dir + 32..dir + 41].copy_from_slice(b"hello.txt");
+        put_u32(&mut img, dir + 44, 12); // "hello-link" -> inode 12
+        put_u16(&mut img, dir + 48, 980); // rec_len fills the block
+        img[dir + 50] = 10;
+        img[dir + 51] = 7; // EXT4_FT_SYMLINK
+        img[dir + 52..dir + 62].copy_from_slice(b"hello-link");
 
         // File data (block 8).
         img[8 * BS..8 * BS + payload.len()].copy_from_slice(payload);
@@ -18245,6 +28748,58 @@ mod tests {
         assert_eq!(bytes.bytes, payload);
         assert!(bytes.eof);
 
+        // File view is reconstructed and file-relative, while the disk
+        // location identifies the same leading bytes in the decoded image.
+        let location = filesystem_entry_disk_location(&case_path, hello.id)?;
+        assert!(location.available && location.exact_start);
+        assert_eq!(location.file_relative_offset, Some(0));
+        assert_eq!(location.contiguous_bytes, Some(payload.len() as u64));
+        assert_eq!(location.decoded_media_offset, Some(8 * 1024));
+        let image = fs::read(&image_path)?;
+        let physical_start = location.decoded_media_offset.expect("physical offset") as usize;
+        assert_eq!(
+            &image[physical_start..physical_start + payload.len()],
+            payload
+        );
+
+        // A short ext symlink stores its literal target inside i_block. The
+        // logical file view must not prepend a synthetic display label, and
+        // the file-system view must point to those exact inline bytes.
+        let hello_link = entries
+            .iter()
+            .find(|entry| entry.name == "hello-link")
+            .expect("inline ext symlink should be indexed");
+        assert_eq!(hello_link.size_bytes, Some(9));
+        assert_eq!(
+            hello_link.metadata_json["ext_is_symlink"].as_bool(),
+            Some(true)
+        );
+        let link_bytes = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: hello_link.id,
+                offset: 0,
+                length: 64,
+            },
+        )?;
+        assert_eq!(link_bytes.total_size, 9);
+        assert_eq!(link_bytes.bytes, b"hello.txt");
+        let link_location = filesystem_entry_disk_location(&case_path, hello_link.id)?;
+        assert_eq!(
+            link_location.basis,
+            "ext inline symlink target in inode record"
+        );
+        assert_eq!(link_location.file_relative_offset, Some(0));
+        assert_eq!(link_location.contiguous_bytes, Some(9));
+        let link_physical = link_location
+            .decoded_media_offset
+            .expect("inline symlink physical offset") as usize;
+        assert_eq!(&image[link_physical..link_physical + 9], b"hello.txt");
+        assert_eq!(
+            hello_link.metadata_json["ext_inode_physical_offset"].as_u64(),
+            Some((link_physical - 40) as u64)
+        );
+
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
@@ -18269,8 +28824,13 @@ mod tests {
         let mut image = vec![0_u8; 512 * 1024];
         let jpeg_offset = 4096 + 17;
         let png_offset = 200_000;
+        // A GZIP header with no footer rule: its length cannot be measured,
+        // so the carve must say so instead of presenting the fallback bound
+        // as a real file size.
+        let gzip_offset = 400_000;
         image[jpeg_offset..jpeg_offset + jpeg.len()].copy_from_slice(&jpeg);
         image[png_offset..png_offset + png.len()].copy_from_slice(&png);
+        image[gzip_offset..gzip_offset + 3].copy_from_slice(&[0x1F, 0x8B, 0x08]);
         fs::write(&image_path, &image)?;
 
         let evidence_id = add_evidence(
@@ -18291,7 +28851,7 @@ mod tests {
                 max_files: 100,
             },
         )?;
-        assert_eq!(result.carved_files, 2);
+        assert_eq!(result.carved_files, 3);
         assert!(!result.truncated);
 
         let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
@@ -18299,7 +28859,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.metadata_json["artifact_kind"].as_str() == Some("carved_file"))
             .collect();
-        assert_eq!(carved.len(), 2);
+        assert_eq!(carved.len(), 3);
 
         let jpg = carved
             .iter()
@@ -18318,6 +28878,43 @@ mod tests {
             jpg.metadata_json["category_sub"].as_str(),
             Some("Carved files")
         );
+        // Footer-measured length: the entry says so, with no caveat.
+        assert_eq!(
+            jpg.metadata_json["carve_length_basis"].as_str(),
+            Some("format footer signature located")
+        );
+        assert_eq!(
+            jpg.metadata_json["carve_length_definitive"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            jpg.metadata_json["recovery_status"].as_str(),
+            Some("carved from image by file signature")
+        );
+
+        // Footerless format: the recorded size is only a bound and every
+        // examiner-facing field must say the end was never verified.
+        let gz = carved
+            .iter()
+            .find(|entry| entry.name.ends_with(".gz"))
+            .expect("carved GZIP present");
+        assert_eq!(
+            gz.metadata_json["file_data_physical_offset"].as_u64(),
+            Some(gzip_offset as u64)
+        );
+        assert_eq!(gz.size_bytes, Some((image.len() - gzip_offset) as i64));
+        assert_eq!(
+            gz.metadata_json["carve_length_basis"].as_str(),
+            Some("no footer found before end of scanned data; end not verified")
+        );
+        assert_eq!(
+            gz.metadata_json["carve_length_definitive"].as_bool(),
+            Some(false)
+        );
+        assert!(gz.metadata_json["recovery_status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("length not verified"));
 
         // Carved bytes are recoverable exactly via the physical-extent reader.
         let bytes = read_filesystem_entry_bytes(
@@ -18357,7 +28954,40 @@ mod tests {
         )?;
         let result = hash_evidence(&case_path, image_id)?;
         assert_eq!(result.bytes_hashed, 9);
-        assert_eq!(result.sha256_hex, sha256_hex(b"abcdefghi"));
+        assert_eq!(
+            result.sha256_hex,
+            "19cc02f26df43cc571bc9ed7b0c4d29224a3ec229529221725ef76d021c8326f"
+        );
+        assert_eq!(result.sha256_scope, "logical_media");
+        let manifest = result
+            .acquisition_manifest_json
+            .as_ref()
+            .expect("split acquisition manifest");
+        assert_eq!(manifest.scheme, "split_raw_segments");
+        assert!(manifest.complete);
+        assert_eq!(manifest.segment_count, 3);
+        assert_eq!(manifest.total_size, 9);
+        assert_eq!(
+            manifest
+                .segments
+                .iter()
+                .map(|segment| (segment.size, segment.sha256.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    3,
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                ),
+                (
+                    4,
+                    "4c8a43980498636e9c1d1595fa5d115af7937c2422dfe68a2520a52b7a5fb4de"
+                ),
+                (
+                    2,
+                    "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+                ),
+            ]
+        );
         assert!(!result.hashed_at.is_empty());
 
         let evidence = list_evidence(&case_path)?;
@@ -18366,6 +28996,11 @@ mod tests {
             Some(result.sha256_hex.as_str())
         );
         assert!(evidence[0].hashed_at.is_some());
+        assert_eq!(evidence[0].sha256_scope.as_deref(), Some("logical_media"));
+        assert_eq!(
+            evidence[0].acquisition_manifest_json.as_ref(),
+            Some(manifest)
+        );
 
         // The report's evidence table now carries the stored hash.
         let report = report_data(&case_path)?;
@@ -18389,7 +29024,112 @@ mod tests {
             },
         )?;
         let file_hash = hash_evidence(&case_path, file_id)?;
-        assert_eq!(file_hash.sha256_hex, sha256_hex(b"hello evidence"));
+        assert_eq!(
+            file_hash.sha256_hex,
+            "9af4c73b2a919f220f4b008e466b52808a1987122d95ff0f2dde00968e36e844"
+        );
+        assert_eq!(file_hash.sha256_scope, "file");
+        assert!(file_hash.acquisition_manifest_json.is_none());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_vhd_hash_reports_distinct_known_media_and_container_identities() -> Result<()> {
+        const DECODED_SHA256: &str =
+            "01a855a9f28f8531b73dddd9baac2b6bebfed515117fcf735f7779d19f28cf92";
+        const CONTAINER_SHA256: &str =
+            "ef4546a049acfd2d09f84721c908ec8afd9aabd74b6fbb81a8713b41eee03dd2";
+
+        let case_path = unique_case_path("hash-fixed-vhd-known-answer");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("hash-fixed-vhd-known-answer-source");
+        let image_path = dir.join("known.vhd");
+        create_test_fixed_vhd_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let result = hash_evidence(&case_path, evidence_id)?;
+        assert_eq!(result.bytes_hashed, 4_194_304);
+        assert_eq!(result.sha256_hex, DECODED_SHA256);
+        assert_eq!(result.sha256_scope, "logical_media");
+        let manifest = result
+            .acquisition_manifest_json
+            .as_ref()
+            .expect("fixed VHD acquisition manifest");
+        assert_eq!(manifest.scheme, "single_container_file");
+        assert!(manifest.complete);
+        assert_eq!(manifest.segment_count, 1);
+        assert_eq!(manifest.total_size, 4_194_816);
+        assert_eq!(manifest.segments[0].size, 4_194_816);
+        assert_eq!(manifest.segments[0].sha256, CONTAINER_SHA256);
+        assert_eq!(manifest.segments[0].path, stable_path_string(&image_path));
+
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("Known VHD finding".to_string()),
+                logical_path: Some("/known/finding.bin".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({
+                    "kind": "filesystem_entry",
+                    "logical_path": "/known/finding.bin",
+                    "evidence_sha256_hex": DECODED_SHA256,
+                }),
+            },
+        )?;
+
+        let report = report_data(&case_path)?;
+        assert_eq!(
+            report.evidence[0].sha256_scope.as_deref(),
+            Some("logical_media")
+        );
+        assert_eq!(
+            report.evidence[0]
+                .acquisition_manifest_json
+                .as_ref()
+                .and_then(|manifest| manifest.segments.first())
+                .map(|segment| segment.sha256.as_str()),
+            Some(CONTAINER_SHA256)
+        );
+        let html = render_report_html(&report);
+        assert!(html.contains("SHA-256 (decoded media for images; evidence file for files)"));
+        assert!(html.contains("Logical media SHA-256 (decoded image stream)"));
+        assert!(html.contains("Acquisition/container file SHA-256"));
+        assert!(html.contains(DECODED_SHA256));
+        assert!(html.contains(CONTAINER_SHA256));
+        assert_ne!(DECODED_SHA256, CONTAINER_SHA256);
+
+        let conn = open_existing_case(&case_path)?;
+        let audit: String = conn.query_row(
+            "SELECT details_json FROM audit_events
+             WHERE event_type = 'evidence.hash' AND object_id = ?1
+             ORDER BY id DESC LIMIT 1",
+            params![evidence_id],
+            |row| row.get(0),
+        )?;
+        let audit: serde_json::Value = serde_json::from_str(&audit)?;
+        assert_eq!(audit["logical_media_sha256"], DECODED_SHA256);
+        assert_eq!(
+            audit["acquisition_manifest_json"]["segments"][0]["sha256"],
+            CONTAINER_SHA256
+        );
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(&dir);
@@ -19756,6 +30496,20 @@ mod tests {
             url_entry.metadata_json["category_sub"].as_str(),
             Some("URLs")
         );
+        let url_event_time = url_entry.metadata_json["last_visit_time_utc"]
+            .as_str()
+            .expect("URL record should carry a last visit time");
+        assert!(url_entry.metadata_json["created_utc"].is_null());
+        assert!(url_entry.metadata_json["accessed_utc"].is_null());
+        assert!(url_entry.metadata_json["modified_utc"].is_null());
+        assert_eq!(
+            url_entry.metadata_json["source_file_time_basis"].as_str(),
+            Some("local_source_filesystem")
+        );
+        let url_source_modified = url_entry.metadata_json["source_file_modified_utc"]
+            .as_str()
+            .expect("URL record should retain source file modified time");
+        assert_ne!(url_source_modified, url_event_time);
         let search_entry = entries
             .iter()
             .find(|entry| {
@@ -19866,6 +30620,153 @@ mod tests {
     }
 
     #[test]
+    fn derived_browser_import_is_idempotent_retires_legacy_and_preserves_bookmark() -> Result<()> {
+        let case_path = unique_case_path("derived-browser-idempotent");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("derived-browser-idempotent-source");
+        let profile_dir = evidence_dir.join("Profile");
+        fs::create_dir_all(&profile_dir)?;
+        create_test_chromium_history(&profile_dir.join("History"))?;
+
+        let parent_evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id: parent_evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let base_entries = list_filesystem_entries(&case_path, Some(parent_evidence_id))?;
+        let history_source = base_entries
+            .iter()
+            .find(|entry| entry.name == "History")
+            .expect("indexed source History file");
+        let source_created = history_source.metadata_json["created_utc"]
+            .as_str()
+            .expect("local source created time")
+            .to_string();
+        let legacy_name = "History profile: Profile (auto-parsed from parent)".to_string();
+        let legacy = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: Some(legacy_name.clone()),
+            },
+        )?;
+        let legacy_url = list_filesystem_entries(&case_path, Some(legacy.evidence_id))?
+            .into_iter()
+            .find(|entry| entry.metadata_json["artifact_kind"].as_str() == Some("browser_url"))
+            .expect("legacy URL record");
+        let folder_id = create_bookmark_folder(&case_path, None, "Browser", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Browser URL".to_string()),
+                title: Some("Legacy URL".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(legacy.evidence_id),
+                entry_id: Some(legacy_url.id),
+                item_order: None,
+                display_name: Some(legacy_url.name.clone()),
+                logical_path: Some(legacy_url.logical_path.clone()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({
+                    "evidence_id": legacy.evidence_id,
+                    "entry_id": legacy_url.id,
+                    "logical_path": legacy_url.logical_path,
+                }),
+            },
+        )?;
+
+        let options = ImportBrowserArtifactsIntoEvidenceOptions {
+            evidence_id: parent_evidence_id,
+            history_path: profile_dir.clone(),
+            max_visits: 0,
+            source_profile_path: "Profile".to_string(),
+            volume_index_zero_based: None,
+            legacy_evidence_name: Some(legacy_name),
+        };
+        let first = import_browser_artifacts_into_evidence(&case_path, options.clone())?;
+        let second = import_browser_artifacts_into_evidence(&case_path, options)?;
+        assert_eq!(first.entries_indexed, 14);
+        assert_eq!(second.entries_indexed, 14);
+
+        let active_evidence = list_evidence(&case_path)?;
+        assert_eq!(active_evidence.len(), 1);
+        assert_eq!(active_evidence[0].id, parent_evidence_id);
+        let parent_entries = list_filesystem_entries(&case_path, Some(parent_evidence_id))?;
+        assert_eq!(parent_entries.len(), base_entries.len() + 14);
+        let derived_records: Vec<_> = parent_entries
+            .iter()
+            .filter(|entry| entry.metadata_json["browser_derivation_key"].is_string())
+            .collect();
+        assert_eq!(derived_records.len(), 14);
+        let derived_url = derived_records
+            .iter()
+            .find(|entry| entry.metadata_json["artifact_kind"].as_str() == Some("browser_url"))
+            .expect("derived URL record");
+        assert!(derived_url
+            .logical_path
+            .starts_with("/Parsed Artifacts/Browser/"));
+        assert_eq!(
+            derived_url.metadata_json["source_file_time_basis"].as_str(),
+            Some("original_evidence_filesystem")
+        );
+        assert_eq!(
+            derived_url.metadata_json["source_file_created_utc"].as_str(),
+            Some(source_created.as_str())
+        );
+        assert_eq!(
+            derived_url.metadata_json["source_entry_id"].as_i64(),
+            Some(history_source.id)
+        );
+        assert!(derived_url.metadata_json["staging_file_created_utc"].is_string());
+        assert!(derived_url.metadata_json["created_utc"].is_null());
+
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].evidence_id, Some(parent_evidence_id));
+        assert!(items[0].entry_id.is_some());
+        assert!(items[0]
+            .logical_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with("/Parsed Artifacts/Browser/")));
+        let conn = open_existing_case(&case_path)?;
+        let superseded: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_sources WHERE attach_status = 'superseded'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(superseded, 1);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn chromium_history_import_reads_pending_wal_rows() -> Result<()> {
         let case_path = unique_case_path("history-import-wal");
         create_test_case(&case_path)?;
@@ -19898,6 +30799,547 @@ mod tests {
         drop(writer);
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(history_dir);
+        Ok(())
+    }
+
+    /// Firefox 3.0-era (2008) profiles: places.sqlite has no
+    /// moz_places.last_visit_date, formhistory.sqlite has only
+    /// id/fieldname/value, and cookies.sqlite has no creationTime. Readers
+    /// must adapt to the era schema instead of failing (found on the
+    /// nps-2008-jean image, where both profiles imported zero visits).
+    #[test]
+    fn firefox3_era_profile_imports_visits_without_modern_columns() -> Result<()> {
+        let case_path = unique_case_path("firefox3-era-import");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox3-era-source");
+        fs::create_dir_all(&profile_dir)?;
+        let conn = Connection::open(profile_dir.join("places.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE moz_places(
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT,
+                rev_host TEXT,
+                visit_count INTEGER,
+                hidden INTEGER DEFAULT 0,
+                typed INTEGER DEFAULT 0,
+                favicon_id INTEGER,
+                frecency INTEGER DEFAULT -1
+             );
+             CREATE TABLE moz_historyvisits(
+                id INTEGER PRIMARY KEY,
+                from_visit INTEGER,
+                place_id INTEGER,
+                visit_date INTEGER,
+                visit_type INTEGER,
+                session INTEGER
+             );
+             CREATE TABLE moz_bookmarks(
+                id INTEGER PRIMARY KEY,
+                type INTEGER,
+                fk INTEGER,
+                parent INTEGER,
+                position INTEGER,
+                title TEXT,
+                keyword_id INTEGER,
+                folder_type TEXT,
+                dateAdded INTEGER,
+                lastModified INTEGER
+             );
+             INSERT INTO moz_places(id, url, title, rev_host, visit_count, typed, frecency)
+             VALUES (1, 'http://www.example2008.com/', 'Example 2008', 'moc.8002elpmaxe.www.', 2, 1, 100),
+                    (2, 'http://mail.example2008.com/inbox', 'Inbox', 'moc.8002elpmaxe.liam.', 1, 0, 50);
+             INSERT INTO moz_historyvisits(id, from_visit, place_id, visit_date, visit_type, session)
+             VALUES (1, 0, 1, 1210780800000000, 1, 1),
+                    (2, 1, 2, 1210784400000000, 1, 1);
+             INSERT INTO moz_bookmarks(id, type, fk, parent, position, title, dateAdded, lastModified)
+             VALUES (1, 1, 1, 0, 0, 'Example bookmark', 1210780800000000, 1210780800000000);",
+        )?;
+        drop(conn);
+        let conn = Connection::open(profile_dir.join("formhistory.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE moz_formhistory(
+                id INTEGER PRIMARY KEY,
+                fieldname TEXT NOT NULL,
+                value TEXT NOT NULL
+             );
+             INSERT INTO moz_formhistory(id, fieldname, value)
+             VALUES (1, 'searchbar-history', 'vintage search');",
+        )?;
+        drop(conn);
+        let conn = Connection::open(profile_dir.join("cookies.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE moz_cookies(
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                value TEXT,
+                host TEXT,
+                path TEXT,
+                expiry INTEGER,
+                lastAccessed INTEGER,
+                isSecure INTEGER,
+                isHttpOnly INTEGER
+             );
+             INSERT INTO moz_cookies(id, name, value, host, path, expiry, lastAccessed, isSecure, isHttpOnly)
+             VALUES (1, 'session2008', 'cookie-secret-2008', '.example2008.com', '/', 1893456000, 1210780800000000, 0, 0);",
+        )?;
+        drop(conn);
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 2, "FF3-era visits must import");
+        assert_eq!(imported.bookmarks_indexed, 1);
+        assert!(
+            imported.parse_errors.is_empty(),
+            "no reader may fail on the FF3-era schema: {:?}",
+            imported.parse_errors
+        );
+        assert_eq!(imported.status, "completed");
+
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_history_visit"), 2);
+        assert_eq!(artifact_count(&entries, "browser_url"), 2);
+        assert_eq!(artifact_count(&entries, "browser_search_term"), 1);
+        assert_eq!(artifact_count(&entries, "browser_cookie"), 1);
+        let cookie_json = entry_with_artifact(&entries, "browser_cookie")
+            .metadata_json
+            .to_string();
+        assert!(!cookie_json.contains("cookie-secret-2008"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox3_downloads_sqlite_imports_known_answer() -> Result<()> {
+        let case_path = unique_case_path("firefox3-downloads-known-answer");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox3-downloads-known-answer-source");
+        create_test_empty_firefox_places(&profile_dir)?;
+        create_test_firefox3_downloads(&profile_dir.join("downloads.sqlite"), true)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 0);
+        assert_eq!(imported.entries_indexed, 1);
+        assert!(
+            imported.parse_errors.is_empty(),
+            "FF3 downloads.sqlite must parse without errors: {:?}",
+            imported.parse_errors
+        );
+
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        assert_eq!(artifact_count(&entries, "browser_download"), 1);
+        let download = entry_with_artifact(&entries, "browser_download");
+        assert_eq!(
+            download.logical_path,
+            "/Browser Activities/Downloads/downloads-sqlite-1-install_flash_player.exe.record"
+        );
+        assert_eq!(download.name, "install_flash_player.exe");
+        assert_eq!(download.metadata_json["download_id"].as_i64(), Some(1));
+        assert_eq!(
+            download.metadata_json["file_name"].as_str(),
+            Some("install_flash_player.exe")
+        );
+        assert_eq!(
+            download.metadata_json["source_url"].as_str(),
+            Some(
+                "http://fpdownload.macromedia.com/get/flashplayer/current/install_flash_player.exe"
+            )
+        );
+        assert_eq!(
+            download.metadata_json["target_uri"].as_str(),
+            Some(
+                "file:///C:/Documents%20and%20Settings/Administrator/Desktop/install_flash_player.exe"
+            )
+        );
+        assert_eq!(download.metadata_json["temp_path"].as_str(), Some(""));
+        assert_eq!(
+            download.metadata_json["referrer"].as_str(),
+            Some(
+                "http://www.adobe.com/shockwave/download/download.cgi?P1_Prod_Version=ShockwaveFlash"
+            )
+        );
+        assert_eq!(
+            download.metadata_json["mime_type"].as_str(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            download.metadata_json["curr_bytes"].as_i64(),
+            Some(1_495_112)
+        );
+        assert_eq!(
+            download.metadata_json["max_bytes"].as_i64(),
+            Some(1_495_112)
+        );
+        assert_eq!(download.metadata_json["state"].as_i64(), Some(1));
+        assert_eq!(
+            download.metadata_json["state_label"].as_str(),
+            Some("finished")
+        );
+        assert_eq!(
+            download.metadata_json["host"].as_str(),
+            Some("fpdownload.macromedia.com")
+        );
+        assert_eq!(
+            download.metadata_json["start_time_prtime"].as_i64(),
+            Some(1_210_744_064_453_125)
+        );
+        assert_eq!(
+            download.metadata_json["start_time_utc"].as_str(),
+            Some("2008-05-14T05:47:44.453125+00:00")
+        );
+        assert_eq!(
+            download.metadata_json["end_time_prtime"].as_i64(),
+            Some(1_210_744_066_203_125)
+        );
+        assert_eq!(
+            download.metadata_json["end_time_utc"].as_str(),
+            Some("2008-05-14T05:47:46.203125+00:00")
+        );
+        assert_eq!(
+            download.metadata_json["source_artifact"].as_str(),
+            Some("downloads.sqlite")
+        );
+        assert!(download.metadata_json["source_artifact_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("downloads.sqlite")));
+        assert_eq!(
+            download.metadata_json["category_main"].as_str(),
+            Some("Web Activity")
+        );
+        assert_eq!(
+            download.metadata_json["category_sub"].as_str(),
+            Some("Downloads")
+        );
+        for key in [
+            "created_utc",
+            "modified_utc",
+            "accessed_utc",
+            "mft_modified_utc",
+        ] {
+            assert!(
+                download.metadata_json[key].is_null(),
+                "artifact event times must not populate generic MACB field {key}"
+            );
+        }
+
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![imported.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert!(parameters["downloads_file"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("downloads.sqlite")));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox_downloads_sqlite_empty_table_is_not_an_error() -> Result<()> {
+        let case_path = unique_case_path("firefox-downloads-empty");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-downloads-empty-source");
+        create_test_empty_firefox_places(&profile_dir)?;
+        create_test_firefox3_downloads(&profile_dir.join("downloads.sqlite"), false)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.entries_indexed, 0);
+        assert!(imported.parse_errors.is_empty());
+        assert!(list_filesystem_entries(&case_path, Some(imported.evidence_id))?.is_empty());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox_downloads_sqlite_missing_file_and_table_are_not_errors() -> Result<()> {
+        let case_path = unique_case_path("firefox-downloads-missing");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-downloads-missing-source");
+        create_test_empty_firefox_places(&profile_dir)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.entries_indexed, 0);
+        assert!(imported.parse_errors.is_empty());
+
+        let downloads_path = profile_dir.join("downloads.sqlite");
+        Connection::open(&downloads_path)?
+            .execute_batch("CREATE TABLE unrelated(id INTEGER PRIMARY KEY);")?;
+        assert!(
+            read_firefox_downloads_sqlite_records_inner(&downloads_path, usize::MAX)?.is_empty()
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox_downloads_sqlite_failure_is_disclosed_not_swallowed() -> Result<()> {
+        let case_path = unique_case_path("firefox-downloads-error-disclosure");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-downloads-error-source");
+        create_test_empty_firefox_places(&profile_dir)?;
+        fs::write(
+            profile_dir.join("downloads.sqlite"),
+            b"not a sqlite database",
+        )?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.entries_indexed, 0);
+        assert!(imported
+            .parse_errors
+            .iter()
+            .any(|error| error.starts_with("downloads (downloads.sqlite):")));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox_download_readers_coexist_without_logical_path_collision() -> Result<()> {
+        let case_path = unique_case_path("firefox-downloads-coexist");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-downloads-coexist-source");
+        create_test_empty_firefox_places(&profile_dir)?;
+        let places = Connection::open(profile_dir.join("places.sqlite"))?;
+        places.execute_batch(
+            "CREATE TABLE moz_places(
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT
+             );
+             CREATE TABLE moz_anno_attributes(
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+             );
+             CREATE TABLE moz_annos(
+                id INTEGER PRIMARY KEY,
+                place_id INTEGER NOT NULL,
+                anno_attribute_id INTEGER NOT NULL,
+                content TEXT,
+                dateAdded INTEGER,
+                lastModified INTEGER
+             );
+             INSERT INTO moz_places(id, url, title)
+             VALUES (1,
+                'http://fpdownload.macromedia.com/get/flashplayer/current/install_flash_player.exe',
+                'Flash Player');
+             INSERT INTO moz_anno_attributes(id, name)
+             VALUES (1, 'downloads/destinationFileURI');
+             INSERT INTO moz_annos(
+                id, place_id, anno_attribute_id, content, dateAdded, lastModified
+             ) VALUES (
+                1, 1, 1,
+                'file:///C:/Documents%20and%20Settings/Administrator/Desktop/install_flash_player.exe',
+                1210744064453125, 1210744066203125
+             );",
+        )?;
+        drop(places);
+        create_test_firefox3_downloads(&profile_dir.join("downloads.sqlite"), true)?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
+        let downloads = entries
+            .iter()
+            .filter(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("browser_download")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(downloads.len(), 2);
+        let logical_paths = downloads
+            .iter()
+            .map(|entry| entry.logical_path.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(logical_paths.len(), 2);
+        assert!(logical_paths
+            .contains("/Browser Activities/Downloads/1-install_flash_player.exe.record"));
+        assert!(logical_paths.contains(
+            "/Browser Activities/Downloads/downloads-sqlite-1-install_flash_player.exe.record"
+        ));
+        assert!(downloads.iter().any(|entry| {
+            entry.metadata_json["annotation_id"].as_i64() == Some(1)
+                && entry.metadata_json["source_artifact"].as_str() == Some("places.sqlite")
+        }));
+        assert!(downloads.iter().any(|entry| {
+            entry.metadata_json["download_id"].as_i64() == Some(1)
+                && entry.metadata_json["source_artifact"].as_str() == Some("downloads.sqlite")
+        }));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn firefox_downloads_sqlite_derived_provenance_uses_original_source_entry() -> Result<()> {
+        let case_path = unique_case_path("firefox-downloads-derived-provenance");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("firefox-downloads-derived-provenance-source");
+        let profile_dir = evidence_dir.join("Profile");
+        create_test_empty_firefox_places(&profile_dir)?;
+        create_test_firefox3_downloads(&profile_dir.join("downloads.sqlite"), true)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let source_entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let downloads_source = source_entries
+            .iter()
+            .find(|entry| entry.name == "downloads.sqlite")
+            .expect("indexed downloads.sqlite source entry");
+        let expected_modified = downloads_source.metadata_json["modified_utc"]
+            .as_str()
+            .expect("indexed downloads.sqlite modified time")
+            .to_string();
+        let downloads_source_id = downloads_source.id;
+
+        let imported = import_browser_artifacts_into_evidence(
+            &case_path,
+            ImportBrowserArtifactsIntoEvidenceOptions {
+                evidence_id,
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                source_profile_path: "Profile".to_string(),
+                volume_index_zero_based: None,
+                legacy_evidence_name: None,
+            },
+        )?;
+        assert!(imported.parse_errors.is_empty());
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let download = entries
+            .iter()
+            .find(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("browser_download")
+                    && entry.metadata_json["download_id"].as_i64() == Some(1)
+            })
+            .expect("derived downloads.sqlite record");
+        assert_eq!(
+            download.metadata_json["source_entry_id"].as_i64(),
+            Some(downloads_source_id)
+        );
+        assert_eq!(
+            download.metadata_json["source_file_time_basis"].as_str(),
+            Some("original_evidence_filesystem")
+        );
+        assert_eq!(
+            download.metadata_json["source_file_modified_utc"].as_str(),
+            Some(expected_modified.as_str())
+        );
+        assert!(download.metadata_json["source_artifact_path_exact"]
+            .as_str()
+            .is_some_and(|path| path
+                .replace('\\', "/")
+                .ends_with("Profile/downloads.sqlite")));
+        assert!(download.metadata_json["staging_file_modified_utc"].is_string());
+        for key in [
+            "created_utc",
+            "modified_utc",
+            "accessed_utc",
+            "mft_modified_utc",
+        ] {
+            assert!(download.metadata_json[key].is_null());
+        }
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    /// A reader failure must be disclosed on the import instead of being
+    /// silently presented as an artifact-free profile.
+    #[test]
+    fn firefox_reader_failure_is_disclosed_not_swallowed() -> Result<()> {
+        let case_path = unique_case_path("firefox-parse-error-disclosure");
+        create_test_case(&case_path)?;
+        let profile_dir = unique_temp_dir("firefox-parse-error-source");
+        fs::create_dir_all(&profile_dir)?;
+        fs::write(profile_dir.join("places.sqlite"), b"not a sqlite database")?;
+
+        let imported = import_browser_history(
+            &case_path,
+            ImportBrowserHistoryOptions {
+                history_path: profile_dir.clone(),
+                max_visits: 0,
+                evidence_name: None,
+            },
+        )?;
+        assert_eq!(imported.visits_indexed, 0);
+        assert!(
+            !imported.parse_errors.is_empty(),
+            "an unreadable places.sqlite must be disclosed as parse errors"
+        );
+        assert!(imported
+            .parse_errors
+            .iter()
+            .any(|error| error.starts_with("history visits:")));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(profile_dir);
         Ok(())
     }
 
@@ -20137,6 +31579,67 @@ mod tests {
         assert_eq!(processed.entries_indexed, 1);
         assert_eq!(filesystem_entry_count(&case_path)?, 1);
         assert!(list_evidence(&case_path)?[0].indexed_at.is_none());
+
+        // The fixture has two independently created files, so a one-entry
+        // result is known to be partial without asking the implementation to
+        // interpret its own output. Capture the indexed entry as a finding and
+        // require the job scope to follow it into report provenance.
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(entries.len(), 1);
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let item = add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: Some(entries[0].id),
+                item_order: None,
+                display_name: None,
+                logical_path: None,
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({}),
+            },
+        )?;
+        assert_eq!(item.item_ref_json["index_job_status"], "truncated");
+        assert_eq!(item.item_ref_json["index_requested_entry_limit"], 1);
+        assert_eq!(item.item_ref_json["index_entries_indexed"], 1);
+        assert!(item.item_ref_json["index_truncation_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("entry limit reached")));
+
+        let report = report_data(&case_path)?;
+        let source = &report.evidence[0];
+        assert_eq!(source.latest_process_job_id, Some(processed.job_id));
+        assert_eq!(
+            source.latest_process_job_type.as_deref(),
+            Some("filesystem_index")
+        );
+        assert_eq!(
+            source.latest_process_job_status.as_deref(),
+            Some("truncated")
+        );
+        assert_eq!(source.requested_entry_limit, Some(1));
+        assert_eq!(source.latest_process_entries_indexed, Some(1));
+        assert!(source
+            .processing_truncation_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("entry limit reached")));
+        assert!(source.processing_coverage.contains("PARTIAL INDEXING ONLY"));
+        assert!(source
+            .processing_coverage
+            .contains("do not represent full source coverage"));
+
+        let html = render_report_html(&report);
+        assert!(html.contains("Latest processing status"));
+        assert!(html.contains("Requested limit"));
+        assert!(html.contains("Latest job indexed entries"));
+        assert!(html.contains("PARTIAL INDEXING ONLY"));
+        assert!(html.contains("Processing Coverage Warning"));
+        assert!(html.contains("contains findings derived from truncated"));
+        assert!(html.contains("entry limit reached"));
+        assert!(!html.contains("Complete indexing job"));
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -20949,6 +32452,21 @@ mod tests {
                 item_ref_json: serde_json::json!({ "kind": "selection" }),
             },
         )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id: included_bookmark_id,
+                evidence_id: None,
+                entry_id: None,
+                item_order: Some(90),
+                display_name: Some("Second selected item".to_string()),
+                logical_path: Some("/case/second.txt".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some("more data".to_string()),
+                item_ref_json: serde_json::json!({ "kind": "selection" }),
+            },
+        )?;
 
         let report = report_data(&case_path)?;
         assert_eq!(report.folders.len(), 1);
@@ -20958,13 +32476,20 @@ mod tests {
             report.folders[0].bookmarks[0].title.as_deref(),
             Some("Important finding")
         );
-        assert_eq!(report.folders[0].bookmarks[0].items.len(), 1);
+        assert_eq!(report.folders[0].bookmarks[0].items.len(), 2);
         assert_eq!(
             report.folders[0].bookmarks[0].items[0]
                 .display_name
                 .as_deref(),
             Some("Selected bytes")
         );
+        let html = render_report_html(&report);
+        assert!(html.contains("<th>Position</th>"));
+        assert!(!html.contains("<th>Order</th>"));
+        assert!(html.contains("<tr><td>1</td><td>Selected bytes</td>"));
+        assert!(html.contains("<tr><td>2</td><td>Second selected item</td>"));
+        assert!(!html.contains("<tr><td>10</td><td>Selected bytes</td>"));
+        assert!(!html.contains("<tr><td>90</td><td>Second selected item</td>"));
 
         cleanup_case_path(&case_path);
         Ok(())
@@ -20996,6 +32521,191 @@ mod tests {
         assert!(!html.contains("<script>alert(1)</script>"));
 
         cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_disk_search_reports_stop_reason_result_vs_byte_vs_eof() -> Result<()> {
+        // EA-009 known-answer: the scan must report WHY it stopped so the
+        // examiner gets correct coverage guidance - a result-cap stop must not
+        // be reported as (or conflated with) a byte-limit stop.
+        let case_path = unique_case_path("ea009-stop-reason");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("ea009-stop-reason-source");
+        let evidence_path = evidence_dir.join("marks.bin");
+        let mut data = vec![b'.'; 256];
+        for off in [0usize, 100, 200] {
+            data[off..off + 4].copy_from_slice(b"MARK");
+        }
+        fs::write(&evidence_path, &data)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        // Result cap reached before the (unlimited) byte budget -> ResultLimit.
+        let capped = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "MARK".to_string(),
+                max_results: 2,
+                max_scan_bytes: 0,
+            },
+        )?;
+        assert_eq!(capped.stop_reason, RawSearchStopReason::ResultLimit);
+        assert!(capped.truncated);
+
+        // Byte budget reached before scanning to the end -> ByteLimit.
+        let byte_limited = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "MARK".to_string(),
+                max_results: 1000,
+                max_scan_bytes: 50,
+            },
+        )?;
+        assert_eq!(byte_limited.stop_reason, RawSearchStopReason::ByteLimit);
+        assert!(byte_limited.truncated);
+
+        // Whole file scanned, all matches found within the cap -> Eof, complete.
+        let complete = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "MARK".to_string(),
+                max_results: 1000,
+                max_scan_bytes: 0,
+            },
+        )?;
+        assert_eq!(complete.stop_reason, RawSearchStopReason::Eof);
+        assert!(!complete.truncated);
+        assert_eq!(
+            complete
+                .hits
+                .iter()
+                .filter(|hit| hit.encoding == "ascii")
+                .count(),
+            3
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn structured_container_extensions_are_recognized() {
+        for ext in [
+            "vmdk", "VMDK", "vhd", "vhdx", "avhdx", "e01", "Ex01", "qcow2", "aff4",
+        ] {
+            assert!(
+                is_structured_container_extension(Path::new(&format!("disk.{ext}"))),
+                "{ext} should be treated as a structured container extension"
+            );
+        }
+        for ext in ["img", "dd", "raw", "bin", "001"] {
+            assert!(
+                !is_structured_container_extension(Path::new(&format!("disk.{ext}"))),
+                "{ext} should NOT be treated as a structured container"
+            );
+        }
+        assert!(!is_structured_container_extension(Path::new("noext")));
+    }
+
+    #[test]
+    fn undecodable_vmdk_is_refused_with_no_completed_process() -> Result<()> {
+        // EA-002 known-answer: a .vmdk that can only open as RAW was not truly
+        // decoded. open_disk_image refuses it; attach stays lightweight; and
+        // processing must fail with NO completed/truncated index job and NO
+        // synthetic entries (so an examiner can never believe a VM disk was
+        // examined when only its descriptor was read).
+        let case_path = unique_case_path("ea002-undecodable-vmdk");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("ea002-vmdk-source");
+        let vmdk_path = evidence_dir.join("split.vmdk");
+        fs::write(&vmdk_path, vec![0_u8; 2048])?;
+
+        assert!(
+            open_disk_image(&vmdk_path).is_err(),
+            "a .vmdk that only decodes as RAW must be refused"
+        );
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: vmdk_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        assert!(
+            process_evidence(
+                &case_path,
+                ProcessEvidenceOptions {
+                    evidence_id,
+                    max_entries: 0,
+                },
+            )
+            .is_err(),
+            "processing an undecodable container must fail"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let completed_jobs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_jobs
+             WHERE case_id = ?1 AND evidence_id = ?2 AND job_type = 'filesystem_index'
+               AND status IN ('completed', 'truncated')",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            completed_jobs, 0,
+            "an undecodable container must not record a completed/truncated index job"
+        );
+        let failed_jobs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM evidence_jobs
+             WHERE case_id = ?1 AND evidence_id = ?2 AND job_type = 'filesystem_index'
+               AND status = 'failed'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            failed_jobs, 1,
+            "the rolled-back attempt should remain visible as a failed job"
+        );
+        let entry_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            entry_count, 0,
+            "an undecodable container must index no entries"
+        );
+
+        drop(conn);
+        let report = report_data(&case_path)?;
+        assert_eq!(
+            report.evidence[0].latest_process_job_status.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(report.evidence[0].latest_process_entries_indexed, Some(0));
+        assert!(report.evidence[0]
+            .processing_coverage
+            .contains("FAILED INDEXING"));
+        assert!(render_report_html(&report).contains("FAILED INDEXING"));
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
     }
 
@@ -21125,23 +32835,66 @@ mod tests {
         assert!(rendered.html.contains("KDFT report authenticity"));
         assert!(rendered.html.contains("not computed"));
 
-        // Integrity: the hash must cover exactly the bytes before the footer.
+        // Integrity: the prefix hash must cover exactly the bytes before the
+        // footer, and must be named for what it is (KDFT-EA-008).
         let marker = "<footer class=\"kdft-integrity\"";
         let footer_start = rendered
             .html
             .find(marker)
             .expect("integrity footer present");
         let recomputed = sha256_hex(rendered.html[..footer_start].as_bytes());
-        assert_eq!(recomputed, rendered.sha256);
-        assert!(rendered.html.contains(&rendered.sha256));
+        assert_eq!(recomputed, rendered.content_prefix_sha256);
+        assert!(rendered.html.contains(&rendered.content_prefix_sha256));
+        assert!(rendered.html.contains("report_file_sha256"));
 
         // Truncation bound is honored.
         let bounded = report_data_with_directory_structure(&case_path, 1)?;
         assert!(bounded.directory_trees[0].truncated);
         assert_eq!(bounded.directory_trees[0].lines.len(), 1);
 
-        // The export hash is recordable in the audit trail.
-        record_report_export(&case_path, "C:/tmp/report.html", &rendered.sha256)?;
+        // KDFT-EA-008 acceptance: write the report like the export handlers
+        // do, hash the complete file with a standard SHA-256, and require the
+        // audit event to carry BOTH digests under explicit names. A verifier
+        // running plain `sha256sum` on the file must reproduce
+        // report_file_sha256 exactly.
+        let report_file =
+            std::env::temp_dir().join(format!("kdft-ea008-report-{}.html", std::process::id()));
+        fs::write(&report_file, &rendered.html)?;
+        let report_file_sha256 = sha256_hex(&fs::read(&report_file)?);
+        assert_ne!(
+            report_file_sha256, rendered.content_prefix_sha256,
+            "file hash must differ from the embedded prefix hash"
+        );
+        record_report_export(
+            &case_path,
+            &report_file.to_string_lossy(),
+            &rendered.content_prefix_sha256,
+            &report_file_sha256,
+        )?;
+        {
+            let conn = open_existing_case(&case_path)?;
+            let details: String = conn.query_row(
+                "SELECT details_json FROM audit_events
+                 WHERE event_type = 'report.export'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let details: serde_json::Value = serde_json::from_str(&details)?;
+            assert_eq!(
+                details["content_prefix_sha256"].as_str(),
+                Some(rendered.content_prefix_sha256.as_str())
+            );
+            assert_eq!(
+                details["report_file_sha256"].as_str(),
+                Some(report_file_sha256.as_str())
+            );
+            assert!(
+                details.get("sha256").is_none(),
+                "ambiguous legacy sha256 field must be gone"
+            );
+        }
+        let _ = fs::remove_file(&report_file);
 
         let _ = fs::remove_dir_all(&evidence_dir);
         cleanup_case_path(&case_path);
@@ -21207,7 +32960,8 @@ mod tests {
         let html = render_report_html(&report_data(&case_path)?);
         assert!(html.contains("<span class=\"meta\">search_result</span>"));
         assert!(html.contains("<dt>Artifact</dt><dd>Forensic Finding</dd>"));
-        assert!(html.contains("<dt>Path</dt><dd>/Recovery/Deleted Files/message.eml</dd>"));
+        assert!(html
+            .contains("<dt>KDFT Internal Path</dt><dd>/Recovery/Deleted Files/message.eml</dd>"));
         assert!(html.contains("<dt>Deleted</dt><dd>true</dd>"));
         assert!(html.contains("<dt>Storage Area</dt><dd>deleted_filesystem_record</dd>"));
         assert!(html.contains("<dt>Finding Offset</dt><dd>16</dd>"));
@@ -21217,6 +32971,291 @@ mod tests {
         assert!(html.contains("<dt>MFT Modified</dt><dd>2026-06-30T20:03:00Z</dd>"));
 
         cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_resolves_each_ntfs_time_role_once_from_entry_api() -> Result<()> {
+        const CREATED: &str = "2009-12-11T09:01:02Z";
+        const MODIFIED: &str = "2009-12-11T10:03:04Z";
+        const ACCESSED: &str = "2009-12-11T11:05:06Z";
+        const MFT_MODIFIED: &str = "2009-12-11T12:07:08Z";
+
+        let case_path = unique_case_path("report-single-source-ntfs-times");
+        create_test_case(&case_path)?;
+        let source_dir = unique_temp_dir("report-single-source-ntfs-times-source");
+        fs::write(source_dir.join("Nitroba work.odt"), b"timestamp oracle")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let metadata = serde_json::json!({
+            "artifact_kind": "filesystem_entry",
+            "filesystem_parser": "ntfs",
+            "ntfs_path": "Nitroba work.odt",
+            "created_utc": null,
+            "modified_utc": null,
+            "accessed_utc": null,
+            "ntfs_standard_creation_time_utc": CREATED,
+            "ntfs_standard_modification_time_utc": MODIFIED,
+            "ntfs_standard_access_time_utc": ACCESSED,
+            "ntfs_standard_mft_record_modification_time_utc": MFT_MODIFIED,
+            "ntfs_creation_time_utc": "2001-01-01T00:00:00Z",
+            "ntfs_modification_time_utc": "2001-01-02T00:00:00Z",
+            "ntfs_access_time_utc": "2001-01-03T00:00:00Z",
+            "ntfs_mft_record_modification_time_utc": "2001-01-04T00:00:00Z"
+        });
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, size_bytes, metadata_json
+             ) VALUES (?1, ?2, '/internal/nitroba.odt', 'Nitroba work.odt', 'file', 16, ?3)",
+            params![case_id, evidence_id, metadata.to_string()],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        drop(conn);
+
+        let api_entry = filesystem_entry_by_id(&case_path, entry_id)?
+            .expect("known NTFS timestamp entry should be returned by the entry API");
+        assert_eq!(
+            api_entry.metadata_json["ntfs_standard_creation_time_utc"].as_str(),
+            Some(CREATED)
+        );
+        assert_eq!(
+            api_entry.metadata_json["ntfs_standard_modification_time_utc"].as_str(),
+            Some(MODIFIED)
+        );
+        assert_eq!(
+            api_entry.metadata_json["ntfs_standard_access_time_utc"].as_str(),
+            Some(ACCESSED)
+        );
+        assert_eq!(
+            api_entry.metadata_json["ntfs_standard_mft_record_modification_time_utc"].as_str(),
+            Some(MFT_MODIFIED)
+        );
+
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: Some(entry_id),
+                item_order: None,
+                display_name: None,
+                logical_path: None,
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({}),
+            },
+        )?;
+        let html = render_report_html(&report_data(&case_path)?);
+        assert_eq!(html.matches("<dt>Created</dt>").count(), 1);
+        assert_eq!(html.matches("<dt>Modified</dt>").count(), 1);
+        assert_eq!(html.matches("<dt>Accessed</dt>").count(), 1);
+        assert_eq!(html.matches("<dt>MFT Modified</dt>").count(), 1);
+        assert!(html.contains(&format!("<dt>Created</dt><dd>{CREATED}</dd>")));
+        assert!(html.contains(&format!("<dt>Modified</dt><dd>{MODIFIED}</dd>")));
+        assert!(html.contains(&format!("<dt>Accessed</dt><dd>{ACCESSED}</dd>")));
+        assert!(html.contains(&format!("<dt>MFT Modified</dt><dd>{MFT_MODIFIED}</dd>")));
+        assert!(!html.contains("<dt>Created</dt><dd>2001-01-01T00:00:00Z</dd>"));
+        assert!(!html.contains("verified absent"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_formats_raw_whole_disk_bitwise_hit() -> Result<()> {
+        let case_path = unique_case_path("report-raw-bitwise-hit");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("report-raw-bitwise-hit-source");
+        let evidence_path = evidence_dir.join("disk.img");
+        fs::write(&evidence_path, vec![0_u8; 4096])?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let hash = hash_evidence(&case_path, evidence_id)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Raw Hits", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::HighlightedData,
+                data_type: Some("Whole-Disk Bitwise Hit".to_string()),
+                title: Some("MBR signature".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("Bitwise hit at offset 510".to_string()),
+                logical_path: Some("raw image whole-disk scan".to_string()),
+                selection_offset: Some(510),
+                selection_length: Some(2),
+                data_preview: Some("55 AA".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "highlighted_bytes",
+                    "source": "raw_image_whole_disk_scan",
+                    "evidence_id": evidence_id,
+                    "entry_id": null,
+                    "logical_path": "raw image whole-disk scan",
+                    "display_name": "Bitwise hit at offset 510",
+                    "selection_logical_offset_start": 510,
+                    "selection_logical_offset_end": 511,
+                    "selection_physical_offset_start": 510,
+                    "selection_physical_offset_end": 511,
+                    "selection_length_bytes": 2,
+                    "physical_offset_basis": "raw evidence byte offset, whole-image scan from offset 0 - exact, not fragment-approximate",
+                    "sector": 0,
+                    "sector_size": 512,
+                    "partition_index": 0,
+                    "volume_name": "001-system",
+                    "partition_start_offset": 512,
+                    "filesystem": "FAT",
+                    "region": "in-partition",
+                    "encoding": "hex",
+                    "hex_preview": "55 AA",
+                    "ascii_preview": "U.",
+                    "query": "hex:55 AA",
+                    "encodings": ["hex"],
+                    "searched_at": "2026-07-12T00:00:00Z",
+                    "actor": "Codex",
+                    "scan_start": 0,
+                    "max_scan_bytes": 33554432,
+                    "bytes_scanned": 4096,
+                    "total_size": 8192
+                }),
+            },
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        assert!(html.contains("<span class=\"meta\">highlighted_bytes</span>"));
+        assert!(html.contains("<dt>Artifact</dt><dd>Whole-Disk Bitwise Hit</dd>"));
+        assert!(html.contains("<dt>Evidence Source</dt><dd>disk.img</dd>"));
+        // EA-001/EA-004: a file-evidence digest is not "Acquisition SHA-256",
+        // and a hash not captured in the finding's item_ref is shown as the
+        // current evidence value - never backfilled into the scan-time slot.
+        assert!(!html.contains("<dt>Acquisition SHA-256</dt>"));
+        assert!(html.contains(
+            "<dt>SHA-256 (evidence file)</dt><dd>evidence not hashed at search time - compute the hash before relying on these results in court</dd>"
+        ));
+        assert!(html.contains(&format!(
+            "<dt>SHA-256 (evidence file) (current evidence value, not captured with this finding)</dt><dd>{}</dd>",
+            hash.sha256_hex
+        )));
+        assert!(html.contains("<dt>Byte Offset</dt><dd>510 (0x1FE)</dd>"));
+        assert!(html.contains("<dt>Sector</dt><dd>0</dd>"));
+        assert!(html.contains("<dt>Sector Size</dt><dd>512</dd>"));
+        assert!(html.contains("<dt>Volume</dt><dd>001-system</dd>"));
+        assert!(html.contains("<dt>Volume Start Offset</dt><dd>512</dd>"));
+        assert!(html.contains("<dt>Region</dt><dd>in-partition</dd>"));
+        assert!(html.contains("<dt>Encoding</dt><dd>hex</dd>"));
+        assert!(html.contains("<dt>Selection Length</dt><dd>2</dd>"));
+        assert!(html.contains("<dt>Hex Preview</dt><dd>55 AA</dd>"));
+        assert!(html.contains("<dt>ASCII Preview</dt><dd>U.</dd>"));
+        assert!(html.contains("<dt>Search Query</dt><dd>hex:55 AA</dd>"));
+        assert!(html.contains("<dt>Search Examiner</dt><dd>Codex</dd>"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_labels_image_digest_as_decoded_media_not_acquisition() -> Result<()> {
+        // EA-001 known-answer: for image evidence the captured digest is the
+        // DECODED logical-media hash. A verifier hashing the container file
+        // cannot reproduce it, so the report must label it "Logical media
+        // SHA-256 (decoded image stream)" and never "Acquisition SHA-256".
+        // The finding captured its own scan-time hash, so it renders from the
+        // item_ref (not backfilled from the evidence row).
+        let case_path = unique_case_path("report-image-media-hash-label");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("report-image-media-hash-source");
+        let evidence_path = evidence_dir.join("image.raw");
+        fs::write(&evidence_path, vec![0_u8; 4096])?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let scan_time_hash = "a".repeat(64);
+        let folder_id = create_bookmark_folder(&case_path, None, "Raw Hits", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::HighlightedData,
+                data_type: Some("Whole-Disk Bitwise Hit".to_string()),
+                title: Some("hit".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: None,
+                item_order: None,
+                display_name: Some("hit".to_string()),
+                logical_path: Some("raw image whole-disk scan".to_string()),
+                selection_offset: Some(0),
+                selection_length: Some(2),
+                data_preview: Some("00 00".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "highlighted_bytes",
+                    "source": "raw_image_whole_disk_scan",
+                    "evidence_id": evidence_id,
+                    "entry_id": null,
+                    "logical_path": "raw image whole-disk scan",
+                    "display_name": "hit",
+                    "evidence_sha256_hex": scan_time_hash,
+                    "selection_logical_offset_start": 0,
+                    "selection_logical_offset_end": 1,
+                    "selection_length_bytes": 2,
+                }),
+            },
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        assert!(!html.contains("<dt>Acquisition SHA-256</dt>"));
+        assert!(html.contains(&format!(
+            "<dt>Logical media SHA-256 (decoded image stream)</dt><dd>{scan_time_hash}</dd>"
+        )));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
     }
 
@@ -21290,7 +33329,8 @@ mod tests {
 
         let html = render_report_html(&report_data(&case_path)?);
         assert!(html.contains("<dt>Artifact</dt><dd>Live Browse File</dd>"));
-        assert!(html.contains("<dt>Path</dt><dd>[vol 1] /Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx</dd>"));
+        assert!(html.contains("<dt>Source Path (exact)</dt><dd>/Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx</dd>"));
+        assert!(html.contains("<dt>KDFT Internal Path</dt><dd>[vol 1] /Users/xt/Downloads/TCMS - Demo Corp - Findings Report - Example 2.docx</dd>"));
         assert!(html.contains("<dt>Size</dt><dd>42</dd>"));
         assert!(html.contains("<dt>Deleted</dt><dd>false</dd>"));
         assert!(html.contains("<dt>NTFS File Record</dt><dd>123</dd>"));
@@ -21349,6 +33389,7 @@ mod tests {
                     "title": "Example & Evidence",
                     "visit_time_utc": "2026-06-28T10:00:00Z",
                     "source_file_modified_utc": "2026-06-28T10:05:00Z",
+                    "source_file_time_basis": "original_evidence_filesystem",
                     "metadata": {
                         "transition_type": "typed",
                         "visit_count": 3
@@ -21456,7 +33497,7 @@ mod tests {
         assert!(html.contains("https://example.com/&lt;q&gt;"));
         assert!(html.contains("<dt>Transition</dt><dd>typed</dd>"));
         assert!(html.contains("<dt>Visit Count</dt><dd>3</dd>"));
-        assert!(html.contains("<dt>Source Modified</dt>"));
+        assert!(html.contains("<dt>Original Source File Modified</dt>"));
         assert!(html.contains("<dd>URL</dd>"));
         assert!(html.contains("<dt>Last Visit</dt><dd>2026-06-28T09:00:00Z</dd>"));
         assert!(html.contains("<dd>Search</dd>"));
@@ -21472,6 +33513,71 @@ mod tests {
         assert!(html.contains("<dd>Preference</dd>"));
         assert!(html.contains("<dt>Download Directory</dt><dd>C:\\Users\\Examiner\\Downloads</dd>"));
         assert!(!html.contains("https://example.com/<q>"));
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_keeps_browser_events_separate_from_source_macb() -> Result<()> {
+        let case_path = unique_case_path("report-browser-display-times");
+        create_test_case(&case_path)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Search Hits", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Search Hit".to_string()),
+                title: Some("Search hit: Example URL".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: None,
+                entry_id: None,
+                item_order: None,
+                display_name: Some("Example URL".to_string()),
+                logical_path: Some("/Browser Activities/URLs/example.com/1.record".to_string()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: Some("https://example.com/".to_string()),
+                item_ref_json: serde_json::json!({
+                    "kind": "search_result",
+                    "match_kind": "metadata",
+                    "logical_path": "/Browser Activities/URLs/example.com/1.record",
+                    "display_name": "Example URL",
+                    "metadata": {
+                        "artifact_kind": "browser_url",
+                        "url": "https://example.com/",
+                        "last_visit_time_utc": "2026-06-28T09:00:00Z",
+                        "source_file_time_basis": "original_evidence_filesystem",
+                        "source_file_created_utc": "2026-06-28T10:01:00Z",
+                        "source_file_modified_utc": "2026-06-28T10:05:00Z",
+                        "source_file_accessed_utc": "2026-06-28T10:06:00Z"
+                    }
+                }),
+            },
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        assert!(html.contains("<dt>Last Visit</dt><dd>2026-06-28T09:00:00Z</dd>"));
+        assert!(!html.contains("<dt>Created</dt><dd>2026-06-28T09:00:00Z</dd>"));
+        assert!(!html.contains("<dt>Modified</dt><dd>2026-06-28T09:00:00Z</dd>"));
+        assert!(!html.contains("<dt>Accessed</dt><dd>2026-06-28T09:00:00Z</dd>"));
+        assert!(html.contains("<dt>Original Source File Created</dt><dd>2026-06-28T10:01:00Z</dd>"));
+        assert!(
+            html.contains("<dt>Original Source File Modified</dt><dd>2026-06-28T10:05:00Z</dd>")
+        );
+        assert!(
+            html.contains("<dt>Original Source File Accessed</dt><dd>2026-06-28T10:06:00Z</dd>")
+        );
 
         cleanup_case_path(&case_path);
         Ok(())
@@ -22184,6 +34290,64 @@ mod tests {
         Ok(())
     }
 
+    fn create_test_empty_firefox_places(profile_dir: &Path) -> Result<()> {
+        fs::create_dir_all(profile_dir)?;
+        Connection::open(profile_dir.join("places.sqlite"))?
+            .execute_batch("CREATE TABLE profile_marker(id INTEGER PRIMARY KEY);")?;
+        Ok(())
+    }
+
+    fn create_test_firefox3_downloads(downloads_path: &Path, include_row: bool) -> Result<()> {
+        let conn = Connection::open(downloads_path)?;
+        conn.execute_batch(
+            "CREATE TABLE moz_downloads(
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                source TEXT,
+                target TEXT,
+                tempPath TEXT,
+                startTime INTEGER,
+                endTime INTEGER,
+                state INTEGER,
+                referrer TEXT,
+                entityID TEXT,
+                currBytes INTEGER,
+                maxBytes INTEGER,
+                mimeType TEXT,
+                preferredApplication TEXT,
+                preferredAction INTEGER,
+                autoResume INTEGER
+             );",
+        )?;
+        if include_row {
+            conn.execute_batch(
+                "INSERT INTO moz_downloads(
+                    id, name, source, target, tempPath, startTime, endTime, state,
+                    referrer, entityID, currBytes, maxBytes, mimeType,
+                    preferredApplication, preferredAction, autoResume
+                 ) VALUES (
+                    1,
+                    'install_flash_player.exe',
+                    'http://fpdownload.macromedia.com/get/flashplayer/current/install_flash_player.exe',
+                    'file:///C:/Documents%20and%20Settings/Administrator/Desktop/install_flash_player.exe',
+                    '',
+                    1210744064453125,
+                    1210744066203125,
+                    1,
+                    'http://www.adobe.com/shockwave/download/download.cgi?P1_Prod_Version=ShockwaveFlash',
+                    NULL,
+                    1495112,
+                    1495112,
+                    'application/octet-stream',
+                    NULL,
+                    0,
+                    0
+                 );",
+            )?;
+        }
+        Ok(())
+    }
+
     fn create_test_safari_history(history_path: &Path) -> Result<()> {
         let conn = Connection::open(history_path)?;
         conn.execute_batch(
@@ -22353,6 +34517,18 @@ mod tests {
             spaced
                 .write_all(b"FAT spaced artifact")
                 .context("writing test FAT file with sanitized name")?;
+            let mut exact_spaced = root
+                .create_file("Nitroba work.odt")
+                .context("creating FAT exact-path oracle with a space")?;
+            exact_spaced
+                .write_all(b"known spaced ODT payload")
+                .context("writing FAT exact-path oracle with a space")?;
+            let mut exact_underscore = root
+                .create_file("Nitroba_work.odt")
+                .context("creating FAT exact-path collision oracle")?;
+            exact_underscore
+                .write_all(b"known underscore ODT payload")
+                .context("writing FAT exact-path collision oracle")?;
         }
         Ok(fat_cursor.into_inner())
     }

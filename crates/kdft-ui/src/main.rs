@@ -1,21 +1,23 @@
 use anyhow::{bail, Context, Result};
 use kdft_case::{
-    add_bookmark_item, add_evidence, analyze_signatures, bookmark_indexed_folder_recursive,
-    bookmark_live_folder_recursive, bulk_add_bookmark_items, carve_evidence, case_info,
-    category_entry_counts, clear_all_findings, create_bookmark, create_bookmark_folder,
-    create_case, deep_search, export_image_file, export_image_tree, export_local_file,
-    export_local_tree, filesystem_entry_count, hash_evidence, import_browser_history,
-    list_bookmark_folders, list_bookmark_items, list_bookmarks, list_entries_by_category,
-    list_evidence, list_filesystem_entries_limited, list_image_tree_files, list_local_tree_files,
-    max_filesystem_entry_id, process_evidence, read_filesystem_entry_bytes, record_live_export,
+    add_evidence, analyze_signatures, bookmark_indexed_folder_recursive,
+    bookmark_live_folder_recursive, carve_evidence, case_info, category_entry_counts,
+    clear_all_findings, count_filesystem_entries_for_timeline, create_bookmark,
+    create_bookmark_folder, create_case, deep_search, export_image_file, export_image_tree,
+    export_local_file, export_local_tree, filesystem_entry_by_id, filesystem_entry_count,
+    filesystem_entry_disk_location, hash_evidence, import_browser_artifacts_into_evidence,
+    import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
+    list_entries_by_category, list_evidence, list_filesystem_entries_for_timeline,
+    list_filesystem_entries_limited, list_image_tree_files, list_local_tree_files,
+    max_filesystem_entry_id, read_filesystem_entry_bytes, record_live_export,
     record_live_export_with_source_kind, record_live_tree_export,
     record_live_tree_export_with_source_kind, record_report_export, recover_filesystem_entry,
     remove_bookmark, remove_bookmark_item, remove_evidence, render_report, report_data,
     report_data_with_directory_structure, AddEvidenceOptions, AnalyzeSignaturesOptions,
     BookmarkType, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
-    CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserHistoryOptions,
-    ProcessEvidenceOptions, ReadEntryBytesOptions, RecoverEntryOptions,
-    RECURSIVE_FOLDER_BOOKMARK_LIMIT,
+    CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
+    ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
+    RecoverEntryOptions, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -148,6 +150,18 @@ struct ProcessEvidenceRequest {
     case_path: String,
     evidence_id: i64,
     max_entries: Option<usize>,
+    // Processing options (professional-suite style): the base file-system
+    // walk always runs; everything below is examiner-selectable. Omitted
+    // fields keep today's defaults so existing callers are unchanged.
+    capture_content: Option<bool>,
+    parse_emails: Option<bool>,
+    parse_browsers: Option<bool>,
+    run_hash: Option<bool>,
+    run_file_hash: Option<bool>,
+    run_signature_analysis: Option<bool>,
+    run_carve: Option<bool>,
+    carve_max_scan_bytes: Option<u64>,
+    carve_max_files: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -179,12 +193,20 @@ struct RecoverEntryRequest {
 }
 
 #[derive(Deserialize)]
+struct OpenEntryRequest {
+    case_path: String,
+    entry_id: i64,
+}
+
+#[derive(Deserialize)]
 struct DeepSearchRequest {
     case_path: String,
     query: String,
     evidence_id: Option<i64>,
     include_content: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     max_results: Option<usize>,
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     max_file_bytes: Option<u64>,
     category: Option<String>,
     /// Comma-separated extensions, e.g. "jpg,png,zip".
@@ -192,9 +214,76 @@ struct DeepSearchRequest {
 }
 
 #[derive(Deserialize)]
+struct RawSearchRequest {
+    case_path: String,
+    evidence_id: i64,
+    query: String,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_results: Option<usize>,
+    /// 0 means unlimited (scan the whole evidence source).
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
+    max_scan_bytes: Option<u64>,
+}
+
+// Examiner-typed limits arrive as arbitrary JSON numbers; a value big enough
+// round-trips through JavaScript as scientific notation (5e+21), which a plain
+// usize/u64 field rejects and that used to fail the entire search request.
+// Saturate instead of erroring - every consumer clamps to the range it honors
+// (deep_search: 1..=1000 results, content bytes to the indexed head; raw
+// search: 1..=1000 results). Non-numbers and negatives fall back to None so
+// the handler default applies.
+fn lenient_json_u64(value: &serde_json::Value) -> Option<u64> {
+    if let Some(unsigned) = value.as_u64() {
+        return Some(unsigned);
+    }
+    let float = value.as_f64()?;
+    if !float.is_finite() || float < 0.0 {
+        return None;
+    }
+    if float >= u64::MAX as f64 {
+        return Some(u64::MAX);
+    }
+    Some(float as u64)
+}
+
+fn lenient_opt_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(lenient_json_u64))
+}
+
+fn lenient_opt_usize<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(lenient_json_u64)
+        .map(|number| usize::try_from(number).unwrap_or(usize::MAX)))
+}
+
+#[derive(Deserialize)]
 struct ImportHistoryRequest {
     case_path: String,
     history_path: String,
+    max_visits: Option<usize>,
+    evidence_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportHistoryFromImageRequest {
+    case_path: String,
+    evidence_id: i64,
+    volume: usize,
+    /// Absolute path (within the image volume) to the browser profile folder
+    /// - e.g. a Firefox profile directory or a Chromium "Default"/"Profile N"
+    /// directory. Must be a folder, not a single file, since the parsers need
+    /// several co-located files (History/Login Data/Cookies, or
+    /// places.sqlite/cookies.sqlite/logins.json).
+    image_path: String,
     max_visits: Option<usize>,
     evidence_name: Option<String>,
 }
@@ -241,6 +330,12 @@ struct RemoveBookmarkItemRequest {
 }
 
 #[derive(Deserialize)]
+struct RemoveBookmarkFolderRequest {
+    case_path: String,
+    folder_id: i64,
+}
+
+#[derive(Deserialize)]
 struct BookmarkFolderRecursiveIndexedRequest {
     case_path: String,
     folder_name: Option<String>,
@@ -272,6 +367,11 @@ struct ClearFindingsRequest {
 struct ExportReportRequest {
     case_path: String,
     output_path: String,
+}
+
+#[derive(Deserialize)]
+struct RecategorizeRequest {
+    case_path: String,
 }
 
 #[derive(Serialize)]
@@ -410,9 +510,18 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("GET", "/api/image/find") => api_response(api_image_find(&query)),
         ("POST", "/api/image/export") => api_response(api_image_export(&request.body)),
         ("POST", "/api/image/export-tree") => api_response(api_image_export_tree(&request.body)),
+        ("POST", "/api/image/bitlocker/unlock/list") => {
+            api_response(api_bitlocker_unlock_list(&request.body))
+        }
+        ("POST", "/api/image/bitlocker/unlock/bytes") => {
+            api_response(api_bitlocker_unlock_bytes(&request.body))
+        }
         ("GET", "/api/entries/dir") => api_response(api_entries_dir(&query)),
+        ("GET", "/api/entry") => api_response(api_entry_lookup(&query)),
+        ("GET", "/api/entry/disk-location") => api_response(api_entry_disk_location(&query)),
         ("GET", "/api/entries/category") => api_response(api_entries_category(&query)),
         ("GET", "/api/state") => api_response(api_state(&query)),
+        ("GET", "/api/timeline/entries") => api_response(api_timeline_entries(&query)),
         ("GET", "/api/entry/bytes") => api_response(api_entry_bytes(&query)),
         ("GET", "/api/entry/raw") => match api_entry_raw(&query) {
             Ok((content_type, body)) => HttpResponse {
@@ -438,17 +547,26 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("POST", "/api/evidence/hash") => api_response(api_hash_evidence(&request.body)),
         ("POST", "/api/evidence/carve") => api_response(api_carve_evidence(&request.body)),
         ("POST", "/api/evidence/process") => api_response(api_process_evidence(&request.body)),
+        ("POST", "/api/evidence/parse-browsers") => api_response(api_parse_browsers(&request.body)),
         ("POST", "/api/evidence/analyze-signatures") => {
             api_response(api_analyze_signatures(&request.body))
         }
         ("POST", "/api/entry/recover") => api_response(api_recover_entry(&request.body)),
+        ("POST", "/api/entry/open") => api_response(api_open_entry(&request.body)),
         ("POST", "/api/history/import") => api_response(api_import_history(&request.body)),
+        ("POST", "/api/history/import-from-image") => {
+            api_response(api_import_history_from_image(&request.body))
+        }
         ("POST", "/api/search/deep") => api_response(api_deep_search(&request.body)),
+        ("POST", "/api/search/raw") => api_response(api_raw_search(&request.body)),
         ("POST", "/api/bookmark/quick") => api_response(api_quick_bookmark(&request.body)),
         ("POST", "/api/bookmark/remove") => api_response(api_remove_bookmark(&request.body)),
         ("POST", "/api/bookmark/bulk") => api_response(api_bulk_bookmark(&request.body)),
         ("POST", "/api/bookmark/item/remove") => {
             api_response(api_remove_bookmark_item(&request.body))
+        }
+        ("POST", "/api/bookmark/folder/remove") => {
+            api_response(api_remove_bookmark_folder(&request.body))
         }
         ("POST", "/api/bookmark/folder-recursive-indexed") => {
             api_response(api_bookmark_folder_recursive_indexed(&request.body))
@@ -457,6 +575,7 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
             api_response(api_bookmark_folder_recursive_live(&request.body))
         }
         ("POST", "/api/findings/clear") => api_response(api_clear_findings(&request.body)),
+        ("POST", "/api/case/recategorize") => api_response(api_recategorize(&request.body)),
         ("POST", "/api/report/export") => api_response(api_export_report(&request.body)),
         ("POST", "/api/report/open") => api_response(api_open_report(&request.body)),
         ("GET", "/favicon.ico") => HttpResponse {
@@ -478,9 +597,12 @@ fn api_state(query: &HashMap<String, String>) -> Result<UiState> {
     // Loading state is a pure read: no stale-finding cleanup here (it writes and
     // ran on every refresh); cleanup happens on bookmark/process actions.
     // Cap entries shipped to the browser. Loading hundreds of thousands of
-    // entries into one page hangs it; beyond the cap the examiner uses Live
-    // browse (reads the image directly) or Deep Search.
-    const STATE_ENTRY_LIMIT: usize = 5000;
+    // entries into one page hangs it; beyond the cap the examiner uses the
+    // lazy indexed tree, Live browse, category pages, or Deep Search - all of
+    // which fetch their own data. 5,000 inline entries measured ~14.6 MB /
+    // ~4 s on every load of a 119k-entry case while only feeding the initial
+    // flat grid; 500 keeps small cases fully inline and big cases fast.
+    const STATE_ENTRY_LIMIT: usize = 500;
     let entry_count = filesystem_entry_count(&case_path)?;
     let entries = list_filesystem_entries_limited(&case_path, None, Some(STATE_ENTRY_LIMIT))?;
     let entries_truncated = entry_count as usize > entries.len();
@@ -501,6 +623,83 @@ fn api_state(query: &HashMap<String, String>) -> Result<UiState> {
         items: list_bookmark_items(&case_path, None)?,
         entry_count,
         report: report_data(&case_path)?,
+    })
+}
+
+#[derive(Serialize)]
+struct TimelineEntriesResponse {
+    entries: Vec<kdft_case::FilesystemEntry>,
+    entry_count: i64,
+    truncated: bool,
+}
+
+/// Dedicated entry source for "Build timeline", separate from `/api/state`'s
+/// `STATE_ENTRY_LIMIT` (500) - that cap exists because shipping the FULL
+/// entry list on every page load hangs the browser tab for huge cases, but
+/// Timeline is one deliberate, occasional click, not a per-load fetch, so it
+/// can afford a much higher default and does not need to piggyback on
+/// whatever the examiner happened to have already scrolled/browsed into
+/// client-side state.
+const TIMELINE_DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// Shared "0 means no limit" resolution for operations that only read/write
+/// the already-indexed case database (recursive bookmarking, Timeline
+/// building) - these do not touch or copy the evidence itself, so unlike
+/// evidence processing there is no real safety reason to force a ceiling.
+/// `None` (examiner didn't specify anything) still gets a sane default.
+fn resolve_unlimited_max_entries(requested: Option<usize>, default: usize) -> usize {
+    match requested {
+        Some(0) => usize::MAX,
+        Some(value) => value,
+        None => default,
+    }
+}
+
+fn api_timeline_entries(query: &HashMap<String, String>) -> Result<TimelineEntriesResponse> {
+    let case_path = query
+        .get("case_path")
+        .map(String::as_str)
+        .context("case_path query parameter is required")
+        .and_then(|value| request_path(value, "case_path"))?;
+    // 0 means "no limit at all" - Timeline building only reads the already-
+    // indexed case database, it never touches the evidence, so unlike
+    // processing there is no real safety reason to force a ceiling on it.
+    let max_entries = match query
+        .get("max_entries")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(TIMELINE_DEFAULT_MAX_ENTRIES),
+    };
+    // Optional inclusive RFC3339 date-range bounds (examiner-picked in the
+    // Timeline tab before "Build timeline"). When present, filtering happens
+    // in SQL across every known timestamp field so large cases don't pay for
+    // shipping + client-side-scanning the whole entry table just to keep a
+    // narrow window - see list_filesystem_entries_for_timeline.
+    let from = query
+        .get("from")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let to = query
+        .get("to")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let time_range = match (from, to) {
+        (Some(from), Some(to)) => Some((from, to)),
+        _ => None,
+    };
+    let entries = list_filesystem_entries_for_timeline(&case_path, max_entries, time_range)?;
+    let entry_count = if time_range.is_some() {
+        count_filesystem_entries_for_timeline(&case_path, time_range)?
+    } else {
+        filesystem_entry_count(&case_path)?
+    };
+    let truncated = entry_count as usize > entries.len();
+    Ok(TimelineEntriesResponse {
+        entries,
+        entry_count,
+        truncated,
     })
 }
 
@@ -560,6 +759,18 @@ fn api_entry_bytes(query: &HashMap<String, String>) -> Result<kdft_case::EntryBy
             length,
         },
     )
+}
+
+fn api_entry_disk_location(
+    query: &HashMap<String, String>,
+) -> Result<kdft_case::EntryDiskLocation> {
+    let case_path = query
+        .get("case_path")
+        .map(String::as_str)
+        .context("case_path query parameter is required")
+        .and_then(|value| request_path(value, "case_path"))?;
+    let entry_id = query_i64(query, "entry_id")?;
+    filesystem_entry_disk_location(&case_path, entry_id)
 }
 
 /// Bounded raw preview used by the picture thumbnail grid. Serves the entry's leading bytes
@@ -857,6 +1068,102 @@ fn api_image_export_tree(body: &[u8]) -> Result<kdft_case::LiveTreeExportResult>
     Ok(result)
 }
 
+#[derive(Deserialize)]
+struct BitlockerUnlockCredentialRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+}
+
+// Builds a call-scoped BitLocker credential from the request. The recovery
+// key/password is never logged, echoed in a notice/error, written to the audit
+// trail, or persisted to the case database - it borrows the request value only
+// for the duration of the unlock call (see the "never persist key material"
+// rule in docs/agent-tasks/codex-task-bitlocker-decrypt.md).
+fn bitlocker_credential_from(
+    unlock: &BitlockerUnlockCredentialRequest,
+) -> Result<kdft_case::BitLockerUnlockCredential<'_>> {
+    match unlock.kind.as_str() {
+        "recovery_key" => Ok(kdft_case::BitLockerUnlockCredential::RecoveryKey(
+            &unlock.value,
+        )),
+        "password" => Ok(kdft_case::BitLockerUnlockCredential::Password(
+            &unlock.value,
+        )),
+        other => bail!("unknown BitLocker unlock type '{other}' (use recovery_key or password)"),
+    }
+}
+
+fn bitlocker_image_source(case_path: &Path, evidence_id: i64) -> Result<LiveEvidenceRef> {
+    let source = live_evidence_source(case_path, evidence_id)?;
+    if source.source_kind != "image" {
+        bail!("BitLocker unlock is only available for image evidence");
+    }
+    Ok(source)
+}
+
+#[derive(Deserialize)]
+struct BitlockerUnlockListRequest {
+    case_path: String,
+    evidence_id: i64,
+    volume_index: usize,
+    unlock: BitlockerUnlockCredentialRequest,
+    dir_path: Option<String>,
+}
+
+fn api_bitlocker_unlock_list(body: &[u8]) -> Result<serde_json::Value> {
+    let request: BitlockerUnlockListRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let source = bitlocker_image_source(&case_path, request.evidence_id)?;
+    let credential = bitlocker_credential_from(&request.unlock)?;
+    let dir_path = request.dir_path.as_deref().unwrap_or("/");
+    let entries = kdft_case::list_bitlocker_ntfs_directory(
+        Path::new(&source.source_path),
+        request.volume_index,
+        credential,
+        dir_path,
+    )?;
+    Ok(json!({ "entries": entries, "dir_path": dir_path }))
+}
+
+#[derive(Deserialize)]
+struct BitlockerUnlockBytesRequest {
+    case_path: String,
+    evidence_id: i64,
+    volume_index: usize,
+    unlock: BitlockerUnlockCredentialRequest,
+    file_path: String,
+    offset: Option<u64>,
+    length: Option<usize>,
+}
+
+fn api_bitlocker_unlock_bytes(body: &[u8]) -> Result<serde_json::Value> {
+    let request: BitlockerUnlockBytesRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let source = bitlocker_image_source(&case_path, request.evidence_id)?;
+    let credential = bitlocker_credential_from(&request.unlock)?;
+    let offset = request.offset.unwrap_or(0);
+    let length = request.length.unwrap_or(512);
+    let (bytes, total_size) = kdft_case::read_bitlocker_ntfs_file_bytes(
+        Path::new(&source.source_path),
+        request.volume_index,
+        credential,
+        &request.file_path,
+        offset,
+        length,
+    )?;
+    let bytes_read = bytes.len();
+    Ok(json!({
+        "logical_path": request.file_path,
+        "offset": offset,
+        "requested_length": length,
+        "bytes_read": bytes_read,
+        "total_size": total_size,
+        "eof": offset.saturating_add(bytes_read as u64) >= total_size,
+        "bytes": bytes,
+    }))
+}
+
 fn api_image_bytes(query: &HashMap<String, String>) -> Result<serde_json::Value> {
     let (case_path, source) = live_evidence_from_query(query)?;
     let offset = query_u64(query, "offset")?.unwrap_or(0);
@@ -932,7 +1239,7 @@ fn api_image_find(query: &HashMap<String, String>) -> Result<kdft_case::ImageRaw
     kdft_case::find_in_image_raw(&case_path, source.id, start, q, kind)
 }
 
-fn api_entries_dir(query: &HashMap<String, String>) -> Result<kdft_case::IndexedDirectory> {
+fn api_entries_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
     let case_path = query
         .get("case_path")
         .map(String::as_str)
@@ -948,7 +1255,79 @@ fn api_entries_dir(query: &HashMap<String, String>) -> Result<kdft_case::Indexed
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10_000);
-    kdft_case::list_indexed_directory(&case_path, evidence_id, path, limit)
+    cached_indexed_directory(&case_path, evidence_id, path, limit)
+}
+
+/// Cached indexed-directory listings, same invalidation model as
+/// `cached_category_counts`: entries only change through process/import/carve
+/// jobs (which insert fresh ids), so a listing stays valid while
+/// (entry_count, max_entry_id) are unchanged. Deep folders are fast anyway;
+/// this exists because the ROOT of a six-figure-entry case costs ~2s of
+/// subtree aggregation per call and the tree re-renders after every examiner
+/// action - only the first browse should pay that.
+fn cached_indexed_directory(
+    case_path: &Path,
+    evidence_id: i64,
+    dir_path: &str,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    struct CacheEntry {
+        entry_count: i64,
+        max_entry_id: i64,
+        listing: serde_json::Value,
+    }
+    type Key = (PathBuf, i64, String, usize);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, CacheEntry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let entry_count = filesystem_entry_count(case_path)?;
+    let max_entry_id = max_filesystem_entry_id(case_path)?;
+    let key: Key = (
+        case_path.to_path_buf(),
+        evidence_id,
+        dir_path.to_string(),
+        limit,
+    );
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(&key) {
+            if entry.entry_count == entry_count && entry.max_entry_id == max_entry_id {
+                return Ok(entry.listing.clone());
+            }
+        }
+    }
+    let listing = kdft_case::list_indexed_directory(case_path, evidence_id, dir_path, limit)?;
+    let listing = serde_json::to_value(&listing).context("serializing directory listing")?;
+    if let Ok(mut guard) = cache.lock() {
+        // Stale generations never validate again; drop everything once the
+        // map grows past a browsing session's working set.
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert(
+            key,
+            CacheEntry {
+                entry_count,
+                max_entry_id,
+                listing: listing.clone(),
+            },
+        );
+    }
+    Ok(listing)
+}
+
+/// Looks up a single filesystem entry by id, regardless of whether it has
+/// been paged into the browser's own entry cache - used by Deep Search
+/// results ("Source" button / clicking a row) to resolve a hit into a real
+/// tree location even when the containing folder has never been browsed.
+fn api_entry_lookup(query: &HashMap<String, String>) -> Result<kdft_case::FilesystemEntry> {
+    let case_path = query
+        .get("case_path")
+        .map(String::as_str)
+        .context("case_path query parameter is required")
+        .and_then(|value| request_path(value, "case_path"))?;
+    let entry_id = query_i64(query, "entry_id")?;
+    kdft_case::filesystem_entry_by_id(&case_path, entry_id)?
+        .with_context(|| format!("entry {entry_id} not found in this case"))
 }
 
 fn api_entries_category(query: &HashMap<String, String>) -> Result<kdft_case::CategoryEntryPage> {
@@ -1425,17 +1804,200 @@ fn api_add_evidence(body: &[u8]) -> Result<serde_json::Value> {
     }))
 }
 
-fn api_process_evidence(body: &[u8]) -> Result<kdft_case::ProcessEvidenceResult> {
+fn api_process_evidence(body: &[u8]) -> Result<serde_json::Value> {
     let request: ProcessEvidenceRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    process_evidence(
+    let index_result = kdft_case::process_evidence_with_profile(
         &case_path,
         ProcessEvidenceOptions {
             evidence_id: request.evidence_id,
-            // 0 = index everything (kdft-case treats it as unlimited).
-            max_entries: request.max_entries.unwrap_or(0),
+            // A caller may still explicitly opt into unlimited by sending max_entries: 0
+            // (kdft-case treats 0 as unlimited) - but OMITTING the field must never silently mean
+            // unlimited, since a one-click "process now" against a multi-hundred-GB image with no
+            // cap can exhaust disk space in seconds. Matches the kdft-cli default of 5000.
+            max_entries: request.max_entries.unwrap_or(5000),
         },
-    )
+        kdft_case::ProcessingProfile {
+            capture_content: request.capture_content.unwrap_or(true),
+            parse_emails: request.parse_emails.unwrap_or(true),
+            parse_browsers: request.parse_browsers.unwrap_or(true),
+        },
+    )?;
+    // Examiner-selected follow-up passes, each already an independent audited
+    // job. The base index result stays at the top level so existing callers
+    // keep working; per-pass results (or their failure text) are nested. A
+    // failed optional pass must not discard the completed index.
+    let mut response =
+        serde_json::to_value(&index_result).context("serializing processing result")?;
+    let extras = response
+        .as_object_mut()
+        .context("processing result serialized to a non-object")?;
+    if request.run_hash.unwrap_or(false) {
+        extras.insert(
+            "hash".to_string(),
+            match hash_evidence(&case_path, request.evidence_id) {
+                Ok(result) => serde_json::to_value(result)?,
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            },
+        );
+    }
+    if request.run_signature_analysis.unwrap_or(false) {
+        extras.insert(
+            "signature_analysis".to_string(),
+            match analyze_signatures(
+                &case_path,
+                AnalyzeSignaturesOptions {
+                    evidence_id: Some(request.evidence_id),
+                    max_entries: 100_000,
+                },
+            ) {
+                Ok(result) => serde_json::to_value(result)?,
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            },
+        );
+    }
+    if request.run_carve.unwrap_or(false) {
+        extras.insert(
+            "carve".to_string(),
+            match carve_evidence(
+                &case_path,
+                request.evidence_id,
+                CarveOptions {
+                    // NO ARBITRARY LIMITS: default is the whole media, every hit.
+                    max_scan_bytes: request.carve_max_scan_bytes.unwrap_or(0),
+                    max_files: request.carve_max_files.unwrap_or(0),
+                },
+            ) {
+                Ok(result) => serde_json::to_value(result)?,
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            },
+        );
+    }
+    if request.run_file_hash.unwrap_or(false) {
+        extras.insert(
+            "file_hash".to_string(),
+            match kdft_case::hash_indexed_files(
+                &case_path,
+                kdft_case::HashIndexedFilesOptions {
+                    evidence_id: request.evidence_id,
+                    max_files: 0,
+                    max_file_bytes: 0,
+                },
+            ) {
+                Ok(result) => serde_json::to_value(result)?,
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            },
+        );
+    }
+    if request.parse_browsers.unwrap_or(true) {
+        // ext volumes auto-import during the walk itself; this post-index pass
+        // covers NTFS/FAT images and local folder evidence.
+        extras.insert(
+            "browser_parsing".to_string(),
+            match run_browser_parsing_pass(&case_path, request.evidence_id) {
+                Ok(result) => result,
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            },
+        );
+    }
+    Ok(response)
+}
+
+/// Post-index browser-artifact pass: detect profiles among the indexed
+/// entries and replace each profile's derived records under the original
+/// evidence source. A failure on one profile is reported and does not stop
+/// the others.
+fn run_browser_parsing_pass(case_path: &PathBuf, evidence_id: i64) -> Result<serde_json::Value> {
+    let source = live_evidence_source(case_path, evidence_id)?;
+    let candidates = kdft_case::find_browser_profile_candidates(case_path, evidence_id)?;
+    let mut imported = Vec::new();
+    let mut errors = Vec::new();
+    let mut skipped_ext = 0_usize;
+    for candidate in &candidates {
+        // ext-parsed profiles were already imported mid-walk.
+        if candidate
+            .filesystem_parser
+            .as_deref()
+            .is_some_and(|parser| parser.contains("ext"))
+        {
+            skipped_ext += 1;
+            continue;
+        }
+        let label = format!(
+            "{} profile: {} (auto-parsed from {})",
+            candidate.db_name, candidate.profile_path, source.display_name
+        );
+        let result = match source.source_kind.as_str() {
+            "image" => {
+                let Some(volume) = candidate.volume_index_zero_based else {
+                    errors.push(serde_json::json!({
+                        "profile": candidate.profile_path,
+                        "error": "no volume index recorded for this entry",
+                    }));
+                    continue;
+                };
+                stage_and_import_image_profile_into_evidence(
+                    case_path,
+                    evidence_id,
+                    &source.source_path,
+                    volume,
+                    &candidate.profile_path,
+                    Some(label.clone()),
+                    0,
+                )
+            }
+            "folder" => {
+                let local = Path::new(&source.source_path).join(
+                    candidate
+                        .profile_path
+                        .replace('/', std::path::MAIN_SEPARATOR_STR),
+                );
+                import_browser_artifacts_into_evidence(
+                    case_path,
+                    ImportBrowserArtifactsIntoEvidenceOptions {
+                        evidence_id,
+                        history_path: local,
+                        max_visits: 0,
+                        source_profile_path: candidate.profile_path.clone(),
+                        volume_index_zero_based: candidate.volume_index_zero_based,
+                        legacy_evidence_name: Some(label),
+                    },
+                )
+            }
+            other => {
+                errors.push(serde_json::json!({
+                    "profile": candidate.profile_path,
+                    "error": format!("browser parsing is not available for {other} evidence"),
+                }));
+                continue;
+            }
+        };
+        match result {
+            Ok(outcome) => imported.push(serde_json::json!({
+                "profile": candidate.profile_path,
+                "evidence_id": outcome.evidence_id,
+                "visits_indexed": outcome.visits_indexed,
+                "entries_indexed": outcome.entries_indexed,
+                "parse_errors": outcome.parse_errors,
+            })),
+            Err(error) => errors.push(serde_json::json!({
+                "profile": candidate.profile_path,
+                "error": error.to_string(),
+            })),
+        }
+    }
+    Ok(serde_json::json!({
+        "profiles_found": candidates.len(),
+        "profiles_handled_during_walk": skipped_ext,
+        "imported": imported,
+        "errors": errors,
+    }))
+}
+
+fn api_parse_browsers(body: &[u8]) -> Result<serde_json::Value> {
+    let request: RemoveEvidenceRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    run_browser_parsing_pass(&case_path, request.evidence_id)
 }
 
 fn api_analyze_signatures(body: &[u8]) -> Result<kdft_case::AnalyzeSignaturesResult> {
@@ -1488,6 +2050,165 @@ fn api_recover_entry(body: &[u8]) -> Result<kdft_case::RecoverEntryResult> {
     )
 }
 
+const EXTERNAL_PREVIEW_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn external_preview_extension(name: &str) -> Option<String> {
+    let extension = Path::new(name)
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "pdf"
+            | "txt"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "xml"
+            | "rtf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ods"
+            | "odt"
+            | "ppt"
+            | "pptx"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "bmp"
+            | "webp"
+            | "tif"
+            | "tiff"
+            | "wav"
+            | "mp3"
+            | "mp4"
+            | "mov"
+            | "avi"
+    )
+    .then_some(extension)
+}
+
+fn sanitize_external_preview_component(value: &str, max_len: usize) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_separator = false;
+    for ch in value.chars() {
+        let accepted = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_');
+        if accepted {
+            sanitized.push(ch);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            sanitized.push('_');
+            previous_was_separator = true;
+        }
+        if sanitized.len() >= max_len {
+            break;
+        }
+    }
+    sanitized.trim_matches(['.', '_']).to_string()
+}
+
+fn safe_external_preview_name(entry_id: i64, name: &str) -> String {
+    let leaf = name
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("preview.bin");
+    let extension = Path::new(leaf)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| sanitize_external_preview_component(value, 16))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "bin".to_string());
+    let stem = leaf.strip_suffix(&format!(".{extension}")).unwrap_or(leaf);
+    let stem = sanitize_external_preview_component(stem, 96);
+    let stem = if stem.is_empty() {
+        "preview"
+    } else {
+        stem.as_str()
+    };
+    format!("{entry_id}-{stem}.{extension}")
+}
+
+fn external_preview_output_path(case_path: &Path, entry_id: i64, name: &str) -> PathBuf {
+    let case_stem = case_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("case");
+    let parent = case_path.parent().unwrap_or_else(|| Path::new("."));
+    parent
+        .join(format!("{case_stem}-previews"))
+        .join(safe_external_preview_name(entry_id, name))
+}
+
+fn api_open_entry(body: &[u8]) -> Result<serde_json::Value> {
+    let request: OpenEntryRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let entry = filesystem_entry_by_id(&case_path, request.entry_id)?
+        .with_context(|| format!("filesystem entry {} not found", request.entry_id))?;
+    if entry.entry_kind != "file" {
+        bail!("only file entries can be opened externally");
+    }
+    let extension = external_preview_extension(&entry.name).with_context(|| {
+        format!(
+            "external preview is not enabled for {}; recover the file explicitly to inspect it safely",
+            entry.name
+        )
+    })?;
+    let size = entry
+        .size_bytes
+        .and_then(|value| u64::try_from(value).ok())
+        .context("file size is unknown; recover the file explicitly before opening it")?;
+    if size > EXTERNAL_PREVIEW_MAX_BYTES {
+        bail!(
+            "file is {} bytes; external preview is limited to {} bytes",
+            size,
+            EXTERNAL_PREVIEW_MAX_BYTES
+        );
+    }
+    let output_path = external_preview_output_path(&case_path, entry.id, &entry.name);
+    if output_path.exists() {
+        #[cfg(target_os = "windows")]
+        {
+            let mut permissions = fs::metadata(&output_path)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&output_path, permissions)?;
+        }
+        fs::remove_file(&output_path)
+            .with_context(|| format!("replacing preview copy {}", output_path.display()))?;
+    }
+    let recovered = recover_filesystem_entry(
+        &case_path,
+        RecoverEntryOptions {
+            entry_id: entry.id,
+            output_path: output_path.clone(),
+        },
+    )?;
+    if recovered.status != "completed" || recovered.bytes_written != recovered.total_size {
+        bail!(
+            "preview recovery was partial ({} of {} bytes); the file was not opened",
+            recovered.bytes_written,
+            recovered.total_size
+        );
+    }
+    let mut permissions = fs::metadata(&output_path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&output_path, permissions)
+        .with_context(|| format!("marking preview copy read-only {}", output_path.display()))?;
+    open_target(&output_path.to_string_lossy())?;
+    Ok(json!({
+        "entry_id": entry.id,
+        "output_path": output_path,
+        "bytes_written": recovered.bytes_written,
+        "status": recovered.status,
+        "extension": extension,
+        "read_only": true,
+    }))
+}
+
 fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
     let request: ImportHistoryRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
@@ -1498,6 +2219,177 @@ fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResu
             history_path,
             max_visits: request.max_visits.unwrap_or(0),
             evidence_name: request.evidence_name,
+        },
+    )
+}
+
+/// Browser history import (`import_browser_history`) needs several
+/// co-located files on a real local path (History/Login Data/Cookies, or
+/// places.sqlite/cookies.sqlite/logins.json) - it can't read them straight
+/// out of an attached disk image. This stages the requested profile folder
+/// out of the image (reusing the existing, already-validated live tree-export
+/// machinery), then runs the normal importer against that local copy. The
+/// staged copy is kept PERMANENTLY (next to the case file, not in a temp
+/// directory that gets deleted) because the resulting evidence source's
+/// `source_path` points at it - the byte viewer ("View bytes" on any imported
+/// record) resolves real disk bytes back through that same path, so deleting
+/// it would silently break byte-level review of everything just imported.
+fn sanitize_staging_name(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "profile".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn api_import_history_from_image(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
+    let request: ImportHistoryFromImageRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let source = live_evidence_source(&case_path, request.evidence_id)?;
+    if source.source_kind != "image" {
+        bail!(
+            "import-from-image is only for disk-image evidence; folder/file evidence already \
+             has a real local path - use the regular Browser history import with that path \
+             instead"
+        );
+    }
+    stage_and_import_image_profile(
+        &case_path,
+        &source.source_path,
+        request.volume,
+        &request.image_path,
+        request.evidence_name,
+        request.max_visits.unwrap_or(0),
+    )
+}
+
+fn stage_image_profile(
+    case_path: &PathBuf,
+    source_path: &str,
+    volume: usize,
+    image_path: &str,
+) -> Result<PathBuf> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let case_stem = case_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "case".to_string());
+    let imports_root = case_path
+        .parent()
+        .map(|parent| parent.join(format!("{case_stem}-history-imports")))
+        .unwrap_or_else(|| PathBuf::from(format!("{case_stem}-history-imports")));
+    let profile_name = image_path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("profile");
+    let staging_key = format!(
+        "{}|{}|{}",
+        source_path.to_ascii_lowercase(),
+        volume,
+        image_path.replace('\\', "/").to_ascii_lowercase()
+    );
+    let digest = kdft_case::sha256_hex(staging_key.as_bytes());
+    let staging_root = imports_root.join(format!(
+        "{}-{}",
+        sanitize_staging_name(profile_name),
+        &digest[..16]
+    ));
+    let building_root = imports_root.join(format!(
+        ".{}-{}-building-{unique}",
+        sanitize_staging_name(profile_name),
+        &digest[..16]
+    ));
+    fs::create_dir_all(&building_root)
+        .with_context(|| format!("creating staging folder {}", building_root.display()))?;
+    let export_result = export_image_tree(
+        Path::new(source_path),
+        volume,
+        image_path,
+        &building_root,
+        None,
+    );
+    let export_result = match export_result {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&building_root);
+            return Err(err);
+        }
+    };
+    if export_result.files_exported == 0 {
+        let _ = fs::remove_dir_all(&building_root);
+        bail!(
+            "no files were found under {} - point this at the browser profile folder itself \
+             (the one directly containing History/places.sqlite/Cookies/logins.json)",
+            image_path
+        );
+    }
+    if staging_root.exists() {
+        fs::remove_dir_all(&staging_root)
+            .with_context(|| format!("replacing staging folder {}", staging_root.display()))?;
+    }
+    fs::rename(&building_root, &staging_root).with_context(|| {
+        format!(
+            "publishing staging folder {} as {}",
+            building_root.display(),
+            staging_root.display()
+        )
+    })?;
+    Ok(staging_root)
+}
+
+/// Manual import-from-image keeps a dedicated evidence source, but uses a
+/// stable staging location so importing the same profile again replaces it.
+fn stage_and_import_image_profile(
+    case_path: &PathBuf,
+    source_path: &str,
+    volume: usize,
+    image_path: &str,
+    evidence_name: Option<String>,
+    max_visits: usize,
+) -> Result<kdft_case::BrowserHistoryImportResult> {
+    let staging_root = stage_image_profile(case_path, source_path, volume, image_path)?;
+    import_browser_history(
+        case_path,
+        ImportBrowserHistoryOptions {
+            history_path: staging_root.clone(),
+            max_visits,
+            evidence_name,
+        },
+    )
+}
+
+fn stage_and_import_image_profile_into_evidence(
+    case_path: &PathBuf,
+    evidence_id: i64,
+    source_path: &str,
+    volume: usize,
+    image_path: &str,
+    legacy_evidence_name: Option<String>,
+    max_visits: usize,
+) -> Result<kdft_case::BrowserHistoryImportResult> {
+    let staging_root = stage_image_profile(case_path, source_path, volume, image_path)?;
+    import_browser_artifacts_into_evidence(
+        case_path,
+        ImportBrowserArtifactsIntoEvidenceOptions {
+            evidence_id,
+            history_path: staging_root,
+            max_visits,
+            source_profile_path: image_path.to_string(),
+            volume_index_zero_based: Some(volume),
+            legacy_evidence_name,
         },
     )
 }
@@ -1529,20 +2421,43 @@ fn api_deep_search(body: &[u8]) -> Result<Vec<kdft_case::DeepSearchResult>> {
     )
 }
 
+fn api_raw_search(body: &[u8]) -> Result<kdft_case::RawSearchResult> {
+    let request: RawSearchRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    kdft_case::raw_disk_search(
+        &case_path,
+        kdft_case::RawDiskSearchOptions {
+            evidence_id: request.evidence_id,
+            query: request.query,
+            max_results: request.max_results.unwrap_or(200),
+            max_scan_bytes: request.max_scan_bytes.unwrap_or(0),
+        },
+    )
+}
+
 fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
     let request: QuickBookmarkRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
+    // Validate the whole request BEFORE the first case write: creating the
+    // destination folder first meant a rejected request (bad bookmark_type /
+    // item_ref_json) still left a permanent empty folder and its audit event
+    // in the case.
+    let item_ref_json = request.item_ref_json.unwrap_or_else(|| json!({}));
+    if !item_ref_json.is_object() {
+        bail!("item_ref_json must be a JSON object");
+    }
+    let bookmark_type = BookmarkType::parse(
+        request
+            .bookmark_type
+            .as_deref()
+            .unwrap_or("highlighted_data"),
+    )?;
     let folder_name = request
         .folder_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Findings");
-    let folder_id = ensure_report_folder(&case_path, folder_name)?;
-    let item_ref_json = request.item_ref_json.unwrap_or_else(|| json!({}));
-    if !item_ref_json.is_object() {
-        bail!("item_ref_json must be a JSON object");
-    }
     let title = request
         .title
         .as_deref()
@@ -1550,12 +2465,6 @@ fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
         .filter(|value| !value.is_empty())
         .unwrap_or("Bookmarked evidence")
         .to_string();
-    let bookmark_type = BookmarkType::parse(
-        request
-            .bookmark_type
-            .as_deref()
-            .unwrap_or("highlighted_data"),
-    )?;
     let data_type = request
         .data_type
         .as_deref()
@@ -1573,10 +2482,13 @@ fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
         "selection_length": request.selection_length,
         "preview": request.data_preview,
     });
-    let bookmark_id = create_bookmark(
+    // One transaction for folder + bookmark + item: a failure at any step
+    // (bad entry id, constraint violation) leaves nothing behind.
+    let result = kdft_case::create_bookmark_with_items(
         &case_path,
+        folder_name,
         CreateBookmarkOptions {
-            folder_id,
+            folder_id: 0, // assigned inside the transaction
             bookmark_type,
             data_type: Some(data_type),
             title: Some(title),
@@ -1585,11 +2497,8 @@ fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
             source_ref_json,
             content_ref_json,
         },
-    )?;
-    let item = add_bookmark_item(
-        &case_path,
-        CreateBookmarkItemOptions {
-            bookmark_id,
+        vec![CreateBookmarkItemOptions {
+            bookmark_id: 0, // assigned inside the transaction
             evidence_id: request.evidence_id,
             entry_id: request.entry_id,
             item_order: None,
@@ -1599,11 +2508,16 @@ fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
             selection_length: request.selection_length,
             data_preview: request.data_preview,
             item_ref_json,
-        },
+        }],
     )?;
+    let item = result
+        .items
+        .into_iter()
+        .next()
+        .context("bookmark item was not created")?;
     Ok(QuickBookmarkResponse {
-        folder_id,
-        bookmark_id,
+        folder_id: result.folder_id,
+        bookmark_id: result.bookmark_id,
         item,
     })
 }
@@ -1626,6 +2540,12 @@ fn api_remove_bookmark_item(body: &[u8]) -> Result<kdft_case::RemoveBookmarkItem
     remove_bookmark_item(&case_path, request.item_id)
 }
 
+fn api_remove_bookmark_folder(body: &[u8]) -> Result<kdft_case::RemoveBookmarkFolderResult> {
+    let request: RemoveBookmarkFolderRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    kdft_case::remove_bookmark_folder(&case_path, request.folder_id)
+}
+
 fn api_bulk_bookmark(body: &[u8]) -> Result<kdft_case::BulkBookmarkItemsResult> {
     let request: BulkBookmarkRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
@@ -1638,14 +2558,15 @@ fn api_bulk_bookmark(body: &[u8]) -> Result<kdft_case::BulkBookmarkItemsResult> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Findings");
-    let folder_id = ensure_report_folder(&case_path, folder_name)?;
     let bookmark_type =
         BookmarkType::parse(request.bookmark_type.as_deref().unwrap_or("file_group"))?;
-    let bookmark_id =
-        create_bookmark(
+    // One transaction for folder + bookmark + all items (see quick bookmark).
+    let (_folder_id, result) =
+        kdft_case::create_bookmark_with_bulk_entries(
             &case_path,
+            folder_name,
             CreateBookmarkOptions {
-                folder_id,
+                folder_id: 0, // assigned inside the transaction
                 bookmark_type,
                 data_type: request.data_type,
                 title: Some(request.title.unwrap_or_else(|| {
@@ -1656,8 +2577,9 @@ fn api_bulk_bookmark(body: &[u8]) -> Result<kdft_case::BulkBookmarkItemsResult> 
                 source_ref_json: json!({}),
                 content_ref_json: json!({}),
             },
+            &request.entry_ids,
         )?;
-    bulk_add_bookmark_items(&case_path, bookmark_id, &request.entry_ids)
+    Ok(result)
 }
 
 fn recursive_bookmark_folder_title(path: &str) -> String {
@@ -1670,10 +2592,8 @@ fn api_bookmark_folder_recursive_indexed(
 ) -> Result<kdft_case::RecursiveBookmarkResult> {
     let request: BookmarkFolderRecursiveIndexedRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    let max_entries = request
-        .max_entries
-        .unwrap_or(RECURSIVE_FOLDER_BOOKMARK_LIMIT)
-        .min(RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    let max_entries =
+        resolve_unlimited_max_entries(request.max_entries, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT);
     let folder_name = request
         .folder_name
         .as_deref()
@@ -1713,10 +2633,8 @@ fn api_bookmark_folder_recursive_indexed(
 fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::RecursiveBookmarkResult> {
     let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    let max_entries = request
-        .max_entries
-        .unwrap_or(RECURSIVE_FOLDER_BOOKMARK_LIMIT)
-        .min(RECURSIVE_FOLDER_BOOKMARK_LIMIT);
+    let max_entries =
+        resolve_unlimited_max_entries(request.max_entries, RECURSIVE_FOLDER_BOOKMARK_DEFAULT_LIMIT);
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     let (volume_name, filesystem, listing) = match source.source_kind.as_str() {
         "image" => {
@@ -1787,6 +2705,16 @@ fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::Recursiv
 
 const REPORT_DIRECTORY_TREE_MAX_LINES: usize = 2000;
 
+// Re-run the improved classifier over the existing indexed entries (no image
+// re-read). Fast DB-only pass so the examiner refreshes categories in seconds
+// after a classifier change instead of re-indexing.
+fn api_recategorize(body: &[u8]) -> Result<serde_json::Value> {
+    let request: RecategorizeRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let updated = kdft_case::recategorize_case_entries(&case_path)?;
+    Ok(serde_json::json!({ "entries_updated": updated }))
+}
+
 fn api_export_report(body: &[u8]) -> Result<serde_json::Value> {
     let request: ExportReportRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
@@ -1802,11 +2730,25 @@ fn api_export_report(body: &[u8]) -> Result<serde_json::Value> {
     }
     fs::write(&output_path, &rendered.html)
         .with_context(|| format!("writing report {}", output_path.display()))?;
-    record_report_export(&case_path, &output_path.to_string_lossy(), &rendered.sha256)?;
+    // KDFT-EA-008: hash the bytes actually on disk (not the in-memory copy)
+    // so `report_file_sha256` is exactly what a standard file-hash tool will
+    // reproduce; the embedded footer digest stays available under its own
+    // explicit name.
+    let report_file_sha256 = kdft_case::sha256_hex(
+        &fs::read(&output_path)
+            .with_context(|| format!("re-reading report for hashing {}", output_path.display()))?,
+    );
+    record_report_export(
+        &case_path,
+        &output_path.to_string_lossy(),
+        &rendered.content_prefix_sha256,
+        &report_file_sha256,
+    )?;
     Ok(json!({
         "report": output_path,
         "folders": report.folders.len(),
-        "sha256": rendered.sha256
+        "content_prefix_sha256": rendered.content_prefix_sha256,
+        "report_file_sha256": report_file_sha256
     }))
 }
 
@@ -2070,7 +3012,142 @@ fn is_separator(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_request_path, trim_balanced_path_quotes};
+    use super::{
+        external_preview_extension, external_preview_output_path, normalize_request_path,
+        safe_external_preview_name, trim_balanced_path_quotes,
+    };
+    use super::{DeepSearchRequest, RawSearchRequest};
+    use std::path::Path;
+
+    // A rejected quick-bookmark request must not write anything to the case:
+    // the folder used to be created before bookmark_type validation, leaving
+    // a permanent empty folder (plus audit noise) behind a 400 response.
+    #[test]
+    fn quick_bookmark_rejects_invalid_type_without_creating_the_folder() -> anyhow::Result<()> {
+        let case_path = std::env::temp_dir().join(format!(
+            "kdft-ui-quick-bookmark-validation-{}.kdft.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&case_path);
+        kdft_case::create_case(
+            &case_path,
+            kdft_case::CreateCaseOptions {
+                name: "quick-bookmark-validation".to_string(),
+                examiner_name: None,
+                case_number: None,
+                case_type: None,
+                description: None,
+                default_export_folder: None,
+                temporary_folder: None,
+                index_folder: None,
+            },
+        )?;
+        let body = serde_json::json!({
+            "case_path": case_path.to_string_lossy(),
+            "folder_name": "Leak Check",
+            "title": "invalid type",
+            "bookmark_type": "file"
+        })
+        .to_string();
+        let error = match super::api_quick_bookmark(body.as_bytes()) {
+            Ok(_) => panic!("invalid bookmark_type must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsupported bookmark type"),
+            "unexpected error: {error}"
+        );
+        let folders = kdft_case::list_bookmark_folders(&case_path)?;
+        assert!(
+            folders.iter().all(|folder| folder.name != "Leak Check"),
+            "rejected request must not create its destination folder"
+        );
+        let _ = std::fs::remove_file(&case_path);
+        Ok(())
+    }
+
+    // Examiner-typed limits big enough to round-trip through JavaScript as
+    // scientific notation (5e+21) used to fail the whole request with a serde
+    // type error; the lenient deserializers must saturate instead, and the
+    // backend clamps to its supported range from there.
+    #[test]
+    fn deep_search_request_accepts_scientific_notation_limits() {
+        let request: DeepSearchRequest = serde_json::from_slice(
+            br#"{"case_path":"x","query":"hack","max_results":5e21,"max_file_bytes":4.096e34}"#,
+        )
+        .expect("huge numeric limits must not fail the request");
+        assert_eq!(request.max_results, Some(usize::MAX));
+        assert_eq!(request.max_file_bytes, Some(u64::MAX));
+    }
+
+    #[test]
+    fn raw_search_request_saturates_fractional_and_rejects_negative_limits() {
+        let request: RawSearchRequest = serde_json::from_slice(
+            br#"{"case_path":"x","evidence_id":1,"query":"q","max_results":2.5,"max_scan_bytes":-3}"#,
+        )
+        .expect("odd numeric limits must not fail the request");
+        assert_eq!(request.max_results, Some(2));
+        // Negative falls back to None so the handler default applies.
+        assert_eq!(request.max_scan_bytes, None);
+    }
+
+    #[test]
+    fn search_requests_still_accept_plain_integer_limits() {
+        let request: DeepSearchRequest = serde_json::from_slice(
+            br#"{"case_path":"x","query":"hack","max_results":50,"max_file_bytes":4096}"#,
+        )
+        .expect("plain limits must parse");
+        assert_eq!(request.max_results, Some(50));
+        assert_eq!(request.max_file_bytes, Some(4096));
+    }
+
+    #[test]
+    fn external_preview_only_accepts_bounded_document_and_media_formats() {
+        assert_eq!(
+            external_preview_extension("report.PDF").as_deref(),
+            Some("pdf")
+        );
+        assert_eq!(
+            external_preview_extension("table.xlsx").as_deref(),
+            Some("xlsx")
+        );
+        assert_eq!(
+            external_preview_extension("notes.csv").as_deref(),
+            Some("csv")
+        );
+        assert_eq!(external_preview_extension("payload.exe"), None);
+        assert_eq!(external_preview_extension("script.ps1"), None);
+        assert_eq!(external_preview_extension("no-extension"), None);
+    }
+
+    #[test]
+    fn external_preview_name_is_flat_and_preserves_the_extension() {
+        let name = safe_external_preview_name(42, r#"..\folder/unsafe name?.PDF"#);
+        assert_eq!(name, "42-unsafe_name.PDF");
+        assert!(!name.contains('/') && !name.contains('\\'));
+
+        let long_name = format!("{}.xlsx", "a".repeat(300));
+        let long_safe = safe_external_preview_name(7, &long_name);
+        assert!(long_safe.starts_with("7-"));
+        assert!(long_safe.ends_with(".xlsx"));
+        assert!(long_safe.len() <= 7 + 96 + 5);
+    }
+
+    #[test]
+    fn external_preview_path_stays_beside_the_case() {
+        let path =
+            external_preview_output_path(Path::new("/Cases/case-001.kdft.sqlite"), 9, "report.pdf");
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("9-report.pdf")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|value| value.file_name())
+                .and_then(|value| value.to_str()),
+            Some("case-001.kdft-previews")
+        );
+    }
 
     #[test]
     fn path_quote_trimming_accepts_pasted_windows_paths() {
@@ -2308,9 +3385,13 @@ fn html_response(html: String) -> HttpResponse {
 }
 
 fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<()> {
+    // No-cache on every response, not just the HTML shell: this is a local dev/examiner tool
+    // under active development, and a browser silently serving a stale cached page after a fix
+    // has already shipped (looking "still broken" when it isn't) is worse than the tiny
+    // performance cost of always refetching on this local server.
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
         response.status,
         response.reason,
         response.content_type,
@@ -2325,8 +3406,10 @@ fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result
 fn open_target(target: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", target])
+        // Pass the path as one argument instead of through cmd.exe's command
+        // parser; evidence filenames can legally contain shell metacharacters.
+        Command::new("explorer.exe")
+            .arg(target)
             .spawn()
             .context("opening target")?;
     }
@@ -2355,6 +3438,9 @@ fn index_html(config: &ServerConfig) -> String {
         "defaultHistoryPath": config.default_history_path,
         "defaultReportPath": config.default_report_path,
         "workspaceRoot": config.workspace_root,
+        // Lets the page detect entries categorized by an OLDER classifier and
+        // only then offer the category-refresh maintenance action.
+        "classifierVersion": kdft_case::ENTRY_CATEGORY_CLASSIFIER_VERSION,
     });
     INDEX_HTML.replace("__KDFT_BOOTSTRAP__", &bootstrap.to_string())
 }
@@ -2413,6 +3499,57 @@ const INDEX_HTML: &str = r###"<!doctype html>
       color: var(--accent);
       border: 1px solid var(--line);
     }
+    button.offset-link {
+      background: transparent;
+      border: none;
+      padding: 0;
+      color: var(--accent);
+      font: inherit;
+      text-decoration: underline dotted;
+      cursor: pointer;
+    }
+    button.offset-link:hover { text-decoration: underline; }
+    td.offset-link-cell { cursor: pointer; }
+    td.offset-link-cell:hover { text-decoration: underline; }
+    .analyzing-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(0, 0, 0, .55);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .analyzing-card {
+      background: var(--panel, #1b1e26);
+      color: var(--text, #e8e8e8);
+      border: 1px solid var(--line, #333);
+      border-radius: 10px;
+      padding: 22px 26px;
+      max-width: 460px;
+      text-align: center;
+      box-shadow: 0 12px 44px rgba(0, 0, 0, .55);
+    }
+    .analyzing-title { font-weight: 600; font-size: 15px; margin-bottom: 14px; }
+    .analyzing-bar {
+      height: 12px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, .12);
+      margin-bottom: 12px;
+    }
+    .analyzing-bar-fill {
+      height: 100%;
+      width: 40%;
+      border-radius: 6px;
+      background: linear-gradient(90deg, #ff8a1e, #ff3b30);
+      animation: analyzingSweep 1.15s ease-in-out infinite;
+    }
+    @keyframes analyzingSweep {
+      0% { margin-left: -42%; }
+      100% { margin-left: 100%; }
+    }
+    .analyzing-note { font-size: 12px; opacity: .82; line-height: 1.45; }
     button.ghost.danger {
       color: var(--bad);
       border-color: rgba(180,35,24,.35);
@@ -2459,6 +3596,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       display: none;
     }
     .sidebar {
+      grid-column: 1;
       border-right: 1px solid var(--line);
       background: #fbfcfb;
       padding: 20px;
@@ -2488,6 +3626,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .muted { color: var(--muted); }
     .tiny { font-size: 12px; }
     .panel {
+      width: 100%;
+      min-width: 0;
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -2500,6 +3640,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       gap: 12px;
     }
     main {
+      grid-column: 2;
       padding: 20px;
       display: grid;
       gap: 16px;
@@ -2584,7 +3725,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       display: grid;
       gap: 16px;
     }
-    .view.analyze-view.active {
+    .view.analyze-view.active,
+    .view.timeline-view.active {
       min-height: calc(100vh - 172px);
     }
     .grid-2 {
@@ -2800,6 +3942,88 @@ const INDEX_HTML: &str = r###"<!doctype html>
       border-radius: 8px;
       background: var(--surface-2);
     }
+    #searchResults {
+      overflow: auto;
+    }
+    .search-results-table {
+      table-layout: fixed;
+      min-width: 1380px;
+    }
+    .search-results-table th,
+    .search-results-table td {
+      overflow-wrap: anywhere;
+    }
+    .search-results-table th:nth-child(1),
+    .search-results-table td:nth-child(1) {
+      width: 34px;
+    }
+    .search-results-table th:nth-child(2),
+    .search-results-table td:nth-child(2) {
+      width: 250px;
+    }
+    .search-results-table th:nth-child(3),
+    .search-results-table td:nth-child(3) {
+      width: 90px;
+    }
+    .search-results-table th:nth-child(4),
+    .search-results-table td:nth-child(4) {
+      width: 150px;
+    }
+    .search-results-table th:nth-child(5),
+    .search-results-table td:nth-child(5) {
+      width: 230px;
+    }
+    .search-results-table th:nth-child(6),
+    .search-results-table td:nth-child(6),
+    .search-results-table th:nth-child(7),
+    .search-results-table td:nth-child(7) {
+      width: 165px;
+    }
+    .search-results-table th:nth-child(9),
+    .search-results-table td:nth-child(9) {
+      width: 180px;
+    }
+    .grid-header-cell,
+    .search-header-cell {
+      display: grid;
+      gap: 4px;
+      align-content: start;
+    }
+    button.grid-sort-button,
+    button.search-sort-button {
+      width: 100%;
+      min-height: 20px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.2;
+      text-align: left;
+      text-transform: uppercase;
+    }
+    button.grid-sort-button:hover,
+    button.grid-sort-button.active,
+    button.search-sort-button:hover,
+    button.search-sort-button.active {
+      color: var(--accent);
+    }
+    .grid-sort-indicator,
+    .search-sort-indicator {
+      margin-left: 4px;
+      color: var(--accent);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .grid-column-filter,
+    .search-column-filter {
+      min-height: 24px;
+      padding: 3px 5px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
     .path-pick-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -2808,6 +4032,43 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .path-pick-label {
       min-width: 0;
+    }
+    .processing-options {
+      margin: 6px 0;
+      border: 1px solid var(--line, #d9e1e8);
+      border-radius: 6px;
+      padding: 4px 8px;
+    }
+    .processing-options summary {
+      cursor: pointer;
+      user-select: none;
+    }
+    .processing-options-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 2px 12px;
+      margin: 6px 0;
+    }
+    .check-option {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.85em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .check-option input[type="checkbox"] {
+      margin: 0;
+      flex: none;
+    }
+    .check-option input[type="number"] {
+      width: 88px;
+      flex: none;
+    }
+    .check-option input[disabled] + span,
+    .processing-options-grid.muted .check-option {
+      opacity: 0.55;
     }
     .browser-panel {
       grid-column: 1 / -1;
@@ -2961,6 +4222,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       background: rgba(11,111,99,.10);
       color: var(--accent);
     }
+    .tree-label-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+    }
     .tree-label {
       min-width: 0;
       overflow: hidden;
@@ -2980,17 +4247,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .browser-table-wrap .category-table {
       table-layout: fixed;
-      min-width: 1300px;
+      min-width: 2480px;
     }
     .browser-table-wrap .folder-table {
       table-layout: fixed;
-      min-width: 1220px;
+      min-width: 2180px;
     }
-    /* Lazy indexed browse table (large cases): few columns, so it must fit
-       the pane instead of forcing the wide folder-table horizontal scroll. */
+    /* Large-case browse exposes the same forensic fields as the regular grid. */
     .browser-table-wrap .idx-table {
       table-layout: fixed;
-      min-width: 100%;
+      min-width: 2180px;
     }
     .browser-table-wrap .idx-table th:nth-child(1),
     .browser-table-wrap .idx-table td:nth-child(1) {
@@ -2999,10 +4265,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .idx-table th:nth-child(3),
     .browser-table-wrap .idx-table td:nth-child(3) {
       width: 72px;
-    }
-    .browser-table-wrap .idx-table th:nth-child(4),
-    .browser-table-wrap .idx-table td:nth-child(4) {
-      width: 96px;
     }
     .browser-table-wrap .idx-table th:nth-child(5),
     .browser-table-wrap .idx-table td:nth-child(5) {
@@ -3029,6 +4291,350 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .live-table th:nth-child(5),
     .browser-table-wrap .live-table td:nth-child(5) {
       width: 170px;
+    }
+    .timeline-panel {
+      grid-column: 1 / -1;
+      min-height: calc(100vh - 180px);
+    }
+    .timeline-panel .panel-body {
+      height: calc(100vh - 252px);
+      min-height: 560px;
+      padding: 10px;
+    }
+    .timeline-shell {
+      display: grid;
+      grid-template-rows: auto minmax(170px, 30%) auto minmax(0, 1fr);
+      gap: 10px;
+      height: 100%;
+      min-height: 0;
+    }
+    .timeline-bottom {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+      gap: 10px;
+      min-height: 0;
+      min-width: 0;
+    }
+    .raw-hits-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 14px 0 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .raw-hits-head h3 {
+      margin: 0;
+      font-size: 13px;
+    }
+    .timeline-detail {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      overflow: auto;
+      min-height: 0;
+      padding: 10px;
+      font-size: 12px;
+    }
+    .timeline-detail .timeline-detail-empty {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 6px 2px;
+    }
+    .timeline-detail-head {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding-bottom: 8px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    .timeline-detail-selected {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .timeline-detail-jumps {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .timeline-detail-jumps h4 {
+      margin: 2px 0;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    .timeline-jump {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      padding: 3px 7px;
+      cursor: pointer;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .timeline-jump:hover,
+    .timeline-jump.active {
+      border-color: var(--accent, #2563eb);
+      background: rgba(37, 99, 235, 0.08);
+    }
+    .timeline-jump .timeline-jump-clock {
+      flex: none;
+    }
+    .timeline-jump .timeline-jump-attr {
+      color: var(--muted);
+    }
+    @media (max-width: 1180px) {
+      .timeline-bottom {
+        grid-template-columns: minmax(0, 1fr);
+        grid-auto-rows: minmax(0, 1fr);
+      }
+    }
+    .timeline-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px 10px;
+    }
+    .timeline-summary {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .timeline-summary strong {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .timeline-graph {
+      position: relative;
+      min-height: 170px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .timeline-graph-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .timeline-graph-focus {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .timeline-graph-svg {
+      display: block;
+      width: 100%;
+      height: 145px;
+    }
+    .timeline-axis-label {
+      fill: var(--muted);
+      font-size: 11px;
+    }
+    .timeline-graph-area {
+      fill: rgba(0, 113, 188, .12);
+    }
+    .timeline-graph-line {
+      fill: none;
+      stroke: #0071bc;
+      stroke-width: 2;
+    }
+    .timeline-graph-point {
+      fill: #0071bc;
+      stroke: #fff;
+      stroke-width: 2;
+      cursor: pointer;
+    }
+    .timeline-graph-point:hover,
+    .timeline-graph-point.active {
+      fill: #004f8a;
+      stroke: #004f8a;
+    }
+    .timeline-graph-cursor {
+      stroke: #0071bc;
+      stroke-width: 1.5;
+      opacity: .75;
+      pointer-events: none;
+    }
+    .timeline-graph-hitbox {
+      fill: transparent;
+      cursor: pointer;
+    }
+    .timeline-graph-tooltip {
+      position: absolute;
+      z-index: 6;
+      display: none;
+      max-width: 220px;
+      border: 1px solid rgba(0, 0, 0, .28);
+      border-radius: 4px;
+      background: #fff;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, .16);
+      padding: 7px 9px;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.35;
+      pointer-events: none;
+    }
+    .timeline-graph-tooltip strong {
+      display: block;
+      font-size: 12px;
+    }
+    .timeline-selection-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 7px 10px;
+    }
+    .timeline-selection-title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 15px;
+      font-weight: 900;
+    }
+    .timeline-timestamp-pager {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      color: #0b6fb3;
+      font-size: 15px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .timeline-timestamp-pager button {
+      min-width: 28px;
+      border: 0;
+      background: transparent;
+      color: #0b6fb3;
+      font-size: 17px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+    .timeline-table-wrap {
+      min-height: 0;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .timeline-table-wrap .analysis-status,
+    .timeline-table-wrap .empty {
+      margin: 10px;
+    }
+    .timeline-table {
+      table-layout: fixed;
+      min-width: 1220px;
+      font-size: 12px;
+    }
+    .timeline-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .timeline-table th,
+    .timeline-table td {
+      padding: 5px 8px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .timeline-table th:nth-child(1),
+    .timeline-table td:nth-child(1) {
+      width: 178px;
+    }
+    .timeline-table th:nth-child(2),
+    .timeline-table td:nth-child(2) {
+      width: 190px;
+    }
+    .timeline-table th:nth-child(3),
+    .timeline-table td:nth-child(3) {
+      width: 150px;
+    }
+    .timeline-table th:nth-child(4),
+    .timeline-table td:nth-child(4) {
+      width: 190px;
+    }
+    .timeline-table th:nth-child(5),
+    .timeline-table td:nth-child(5) {
+      width: 110px;
+    }
+    .timeline-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .timeline-badge.timeline-communication {
+      color: #9a4f00;
+      border-color: rgba(194, 97, 0, .35);
+      background: #fff7ed;
+    }
+    .timeline-badge.timeline-opening {
+      color: #0b6f45;
+      border-color: rgba(11, 111, 69, .32);
+      background: #ecfdf3;
+    }
+    .timeline-badge.timeline-knowledge {
+      color: #4b5563;
+      border-color: rgba(107, 114, 128, .35);
+      background: #f3f4f6;
+    }
+    .timeline-item-name {
+      display: inline;
+      font-weight: 800;
+    }
+    .timeline-item-path {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .timeline-item-value {
+      color: var(--text);
+      max-width: 360px;
+      overflow-wrap: anywhere;
     }
     /* Right-click context menu (live browse rows) */
     .ctx-menu {
@@ -3298,6 +4904,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .folder-table td:nth-child(9) {
       width: 150px;
     }
+    .browser-table-wrap th.grid-col-name {
+      width: 320px;
+    }
+    .browser-table-wrap th.grid-col-category {
+      width: 190px;
+    }
+    .browser-table-wrap th.grid-col-type {
+      width: 100px;
+    }
+    .browser-table-wrap th.grid-col-ext {
+      width: 82px;
+    }
+    .browser-table-wrap th.grid-col-size {
+      width: 96px;
+    }
+    .browser-table-wrap th.grid-col-flags,
+    .browser-table-wrap th.grid-col-offset {
+      width: 150px;
+    }
+    .browser-table-wrap th.grid-col-artifactTime,
+    .browser-table-wrap th.grid-col-created,
+    .browser-table-wrap th.grid-col-modified,
+    .browser-table-wrap th.grid-col-accessed,
+    .browser-table-wrap th.grid-col-mftModified,
+    .browser-table-wrap td.entry-time {
+      width: 176px;
+      white-space: nowrap;
+    }
+    .browser-table-wrap th.grid-col-sha256,
+    .browser-table-wrap td.entry-hash {
+      width: 470px;
+      white-space: nowrap;
+    }
     .browser-table-wrap .toolbar {
       gap: 5px;
     }
@@ -3310,6 +4949,32 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .folder-table .toolbar {
       flex-wrap: nowrap;
       justify-content: flex-end;
+    }
+    .icon {
+      flex-shrink: 0;
+      vertical-align: middle;
+      color: var(--muted);
+    }
+    .file-icon,
+    .category-icon {
+      float: left;
+      margin-right: 6px;
+      margin-top: 2px;
+      color: var(--muted);
+    }
+    .file-icon-folder { color: #c9972b; }
+    .file-icon-image,
+    .file-icon-video { color: #4a7fd6; }
+    .file-icon-audio { color: #8a5cd6; }
+    .file-icon-executable { color: #d64a4a; }
+    .file-icon-archive,
+    .file-icon-disk-image { color: #4aa06b; }
+    .file-icon-email { color: #d68a3f; }
+    .tree-label-row .category-icon {
+      float: none;
+      margin-top: 0;
+      margin-right: 0;
+      flex-shrink: 0;
     }
     .entry-name {
       display: block;
@@ -3407,6 +5072,38 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .hex-meta input {
       min-height: 30px;
       padding: 5px 7px;
+    }
+    .byte-context {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(58px, 1fr));
+      min-width: 132px;
+      min-height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #fff;
+    }
+    .byte-context button {
+      min-height: 30px;
+      padding: 5px 8px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .byte-context button + button {
+      border-left: 1px solid var(--line);
+    }
+    .byte-context button.active {
+      background: var(--text);
+      color: #fff;
+    }
+    .byte-context button:disabled {
+      cursor: not-allowed;
+      color: #9aa7a4;
+      background: #f3f6f5;
     }
     .viewer-notice {
       margin-top: 6px;
@@ -3516,8 +5213,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       color: #d8e8e4;
     }
     .hex-info {
+      min-width: 0;
       color: #f0c38a;
       font-weight: 750;
+      line-height: 1.4;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     .raw-find {
       display: flex;
@@ -4012,6 +5713,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         <button class="tab" data-view="searchView" title="Deep Search (Alt+4)">Deep Search<span class="tab-shortcut">Alt+4</span></button>
         <button class="tab" data-view="bookmarksView" title="Bookmarks (Alt+5)">Bookmarks<span class="tab-shortcut">Alt+5</span></button>
         <button class="tab" data-view="reportView" title="Quick Report (Alt+6)">Quick Report<span class="tab-shortcut">Alt+6</span></button>
+        <button class="tab" data-view="timelineView" title="Timeline (Alt+7)">Timeline<span class="tab-shortcut">Alt+7</span></button>
       </nav>
 
       <section id="setupView" class="view">
@@ -4087,7 +5789,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
               </div>
               <div class="row" id="fsOptionsRow">
                 <label>Read File System<select id="readFileSystem"><option value="true">yes &mdash; index now (bounded)</option><option value="false">no &mdash; attach only</option></select></label>
+                <label>Processing limit<input id="processMaxEntries" type="number" min="0" value="5000" title="Entries to index when processing. 0 = unlimited - only use this deliberately on large images; unbounded indexing writes real data into the case database and can consume a lot of disk space. Applies to Add Evidence (process now), the Process button, and Analyze image."></label>
               </div>
+              <details id="processingOptions" class="processing-options">
+                <summary class="muted tiny">Processing options (applies to every Process / Analyze run)</summary>
+                <div class="processing-options-grid">
+                  <label class="check-option" title="Read each file's leading bytes into the case for Deep Search content matching. Turning this OFF gives a much faster metadata-only index (names, paths, timestamps, sizes, offsets) - content search then reports 'not indexed' for this evidence until re-processed with content on."><input type="checkbox" id="optCaptureContent" checked> Capture file content for search</label>
+                  <label class="check-option" title="Parse .eml / RFC-822 text messages into email metadata (from, to, subject, preview) during the walk."><input type="checkbox" id="optParseEmails" checked> Parse email messages</label>
+                  <label class="check-option" title="Compute the evidence SHA-256 over the decoded logical media after indexing (full read of the media - can take long on large images). Also records the acquisition segment manifest."><input type="checkbox" id="optRunHash"> Compute evidence hash</label>
+                  <label class="check-option" title="Compute a SHA-256 for EVERY indexed file's complete reconstructed content and stamp it into the entry metadata. Reads every file - can take long on large or compressed images. Files that cannot be fully reconstructed get a disclosed skip reason instead of a partial-content hash."><input type="checkbox" id="optRunFileHash"> Hash files (SHA-256 per file)</label>
+                  <label class="check-option" title="Verify file types by content signature after indexing and stamp match/mismatch/alias per entry."><input type="checkbox" id="optRunSignatures"> Verify file types (signatures)</label>
+                  <label class="check-option" title="Signature-carve the whole decoded media after indexing (can take long on large images). Carved lengths are marked verified or not-verified per file."><input type="checkbox" id="optRunCarve"> Carve by file signature</label>
+                  <label class="check-option" title="Detect browser profiles among the indexed entries (Chromium History, Firefox places.sqlite, Safari History.db) and parse their visit/download/login records into the case."><input type="checkbox" id="optRunBrowserParse" checked> Parse browser artifacts</label>
+                </div>
+                <div class="processing-options-grid muted">
+                  <label class="check-option" title="Not yet supported in KDFT - planned next. Archive contents are not expanded into child entries."><input type="checkbox" disabled> Expand archive contents (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Compound/OLE documents are not expanded."><input type="checkbox" disabled> Expand compound files (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Registry hives found on the image are indexed as files but not parsed into records."><input type="checkbox" disabled> Parse registry (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Windows shortcuts and jump lists are not parsed."><input type="checkbox" disabled> Parse links / jump lists (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Windows event logs are indexed as files but not parsed into records."><input type="checkbox" disabled> Parse event logs (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Unix syslogs are not parsed into records."><input type="checkbox" disabled> Parse syslogs (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned."><input type="checkbox" disabled> Picture analysis (not yet supported)</label>
+                  <label class="check-option" title="Not yet supported in KDFT - planned. Deep Search scans indexed content directly; there is no persistent keyword index."><input type="checkbox" disabled> Build keyword index (not yet supported)</label>
+                </div>
+              </details>
+              <p class="muted tiny">Live Browse (before processing) always shows the full disk read-only with no limit - this setting only bounds the searchable index (Deep Search / Categories / Bookmarks / Reports).</p>
               <div class="row" id="historyOptionsRow" hidden>
                 <label>Max visits (0 = all)<input id="historyMaxVisits" type="number" min="0" value="0"></label>
               </div>
@@ -4119,6 +5845,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button id="analyzeBack" class="ghost" title="Back in Analyze" disabled>&larr; Back</button>
                 <button id="analyzeForward" class="ghost" title="Forward in Analyze" disabled>Forward &rarr;</button>
                 <button id="liveBrowse" class="ghost">Live browse</button>
+                <button id="recategorizeBtn" class="ghost" hidden title="Entries in this case were categorized by an older classifier version. Refresh re-runs the current classifier over the case database only (fast; evidence is not re-read).">Update categories</button>
                 <button id="exportReportFromAnalyze" class="ghost">Export report</button>
                 <button id="openAnalyzeWindow" class="ghost">Open full screen</button>
               </div>
@@ -4169,6 +5896,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
                       <div id="viewerNotice" class="viewer-notice" hidden></div>
                     </div>
                     <div class="hex-meta">
+                      <div id="byteContext" class="byte-context" role="group" aria-label="Byte context">
+                        <button id="byteContextFile" class="active" type="button" aria-pressed="true">File</button>
+                        <button id="byteContextFilesystem" type="button" aria-pressed="false" disabled>File system</button>
+                      </div>
                       <label>Display<select id="viewerMode"><option value="hex">Hex + ASCII</option><option value="text">Text</option><option value="metadata">Details</option></select></label>
                       <label>Bytes/row<select id="bytesPerRow"><option value="16">16</option><option value="8">8</option><option value="32">32</option></select></label>
                       <label>Offset base<select id="offsetBase"><option value="hex">hex</option><option value="decimal">decimal</option></select></label>
@@ -4178,6 +5909,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                       <button id="hexPrev" class="ghost">Prev</button>
                       <button id="hexGo" class="secondary">Go</button>
                       <button id="hexNext" class="ghost">Next</button>
+                      <button id="openSelectedEntry" class="ghost" disabled>Open file</button>
                       <button id="bookmarkSelectedEntry" class="ghost">Bookmark</button>
                       <button id="dataInterpreterToggle" class="ghost" onclick="toggleDataInterpreter()">Data Interpreter</button>
                       <button id="toggleViewerFullscreen" class="ghost" aria-pressed="false">Full screen</button>
@@ -4190,23 +5922,63 @@ const INDEX_HTML: &str = r###"<!doctype html>
           </section>
       </section>
 
+      <section id="timelineView" class="view timeline-view">
+        <section class="panel timeline-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Timeline</h2>
+              <p id="timelineSubtitle" class="muted tiny">Timestamped events from loaded case entries</p>
+            </div>
+            <div class="toolbar">
+              <span id="timelineCount" class="pill">not built</span>
+              <button id="buildTimeline" class="secondary">Build timeline</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="timeline-shell">
+              <div class="timeline-controls">
+                <div id="timelineSummary" class="timeline-summary">No timeline built.</div>
+                <span class="tiny date-filter timeline-date-filter">
+                  <input type="date" id="timelineDateFrom" title="Show only events on or after this date">
+                  <input type="date" id="timelineDateTo" title="Show only events on or before this date">
+                  <button id="timelineDateFilterClear" class="ghost" title="Clear date filter">All dates</button>
+                </span>
+              </div>
+              <div id="timelineGraph" class="timeline-graph"></div>
+              <div id="timelineTimestampNav" class="timeline-selection-nav"></div>
+              <div class="timeline-bottom">
+                <div id="timelineTable" class="timeline-table-wrap"></div>
+                <aside id="timelineDetail" class="timeline-detail"></aside>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
       <section id="searchView" class="view">
         <div class="grid-2">
           <section class="panel">
-            <div class="panel-head"><h2>Deep Search</h2><span class="pill">Indexed evidence</span></div>
+            <div class="panel-head"><h2>Deep Search</h2><span class="pill">Indexed + bitwise</span></div>
             <div class="panel-body form-grid">
               <label>Query<input id="searchQuery" placeholder="keyword, file name, URL, hex:50 4B"></label>
+              <label>Search mode<select id="searchMode" title="Indexed is a fast lookup over the processed case database. All also scans the raw evidence byte-for-byte (unallocated space and file slack included) for the same query.">
+                <option value="indexed">Indexed (fast)</option>
+                <option value="all">All - indexed + bitwise (whole disk)</option>
+              </select></label>
               <label>Evidence<select id="searchEvidence"><option value="">All evidence</option></select></label>
               <div class="row">
                 <label>Include content<select id="includeContent"><option value="true">yes</option><option value="false">no</option></select></label>
-                <label>Max results<input id="maxResults" type="number" min="1" value="50"></label>
+                <label>Max results<input id="maxResults" type="number" min="1" max="1000" value="50" title="The search backend returns at most 1,000 results per run - narrow the query or scope instead of raising this past 1,000."></label>
               </div>
-              <label>Max file bytes<input id="maxFileBytes" type="number" min="1" value="65536"></label>
+              <label>Max file bytes<input id="maxFileBytes" type="number" min="1" max="4096" value="4096" title="Indexed content search only has each file's first 4,096 bytes available (indexed at Read File System time) - this can only narrow that window, not widen it. The bitwise pass in All mode has no such limit."></label>
               <div class="row">
                 <label>Category scope<input id="searchCategory" placeholder="e.g. Email, Pictures, Recovery"></label>
                 <label>File types<input id="searchFileTypes" placeholder="jpg,png,zip"></label>
               </div>
-              <p class="muted tiny">Prefix the query with <strong>hex:</strong> for byte-pattern search (e.g. hex:FF D8 FF); hits report byte offsets. Scopes restrict hits to matching stored categories or file extensions.</p>
+              <div id="bitwiseControls" class="row" hidden>
+                <label>Bitwise scan limit (bytes, per source)<input id="rawSearchMaxScanBytes" type="number" min="0" step="1" value="536870912" title="0 scans the entire evidence source with no limit - can take a long time on a large image. The default (512 MB) keeps the bitwise pass fast; raise it or set 0 for full coverage."></label>
+              </div>
+              <p class="muted tiny">Prefix the query with <strong>hex:</strong> for a byte-pattern search (e.g. hex:FF D8 FF); hits report byte offsets. Category/file-type scopes and Max file bytes apply to the indexed pass. <strong>All</strong> mode additionally scans the selected evidence (or every image/file source when "All evidence" is chosen) byte-for-byte, covering allocated files, unallocated space, and file slack, in ASCII and UTF-16, reporting the absolute byte offset of each hit; the bitwise pass reads real evidence I/O so it is bounded by the scan limit above by default.</p>
               <button id="runSearch">Run Search</button>
             </div>
           </section>
@@ -4219,8 +5991,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <button id="bookmarkSelectedSearchResults" class="ghost">Bookmark selected</button>
                 <button id="clearSelectedSearchResults" class="ghost">Clear</button>
                 <span id="searchSelectedCount" class="muted tiny">0 selected</span>
+                <span id="searchFilterStatus" class="muted tiny"></span>
               </div>
               <div id="searchResults"></div>
+              <div id="rawSearchSection" hidden>
+                <div class="raw-hits-head">
+                  <h3>Bitwise whole-disk hits</h3>
+                  <span id="rawSearchCount" class="pill">0</span>
+                  <span id="rawSearchStatus" class="muted tiny"></span>
+                </div>
+                <div id="rawSearchResults"></div>
+              </div>
             </div>
           </section>
         </div>
@@ -4271,6 +6052,48 @@ const INDEX_HTML: &str = r###"<!doctype html>
     const PAGE_PARAMS = new URLSearchParams(window.location.search);
     const ANALYSIS_MODE = PAGE_PARAMS.get("mode") === "analysis";
     const REQUESTED_EVIDENCE_ID = Number(PAGE_PARAMS.get("evidence_id") || "");
+    // "process now" / one-click processing must stay bounded by default - the backend treats
+    // max_entries: 0 as UNLIMITED, which previously let one click walk an entire multi-hundred-GB
+    // image with no cap. Matches the kdft-cli default (`evidence process --max-entries`, default
+    // 5000). The examiner can raise this (including to 0/unlimited) via the "Processing limit"
+    // input in the Add Evidence panel - currentProcessMaxEntries() reads that value, persisted in
+    // localStorage, with an explicit confirmation gate before ever sending 0/unlimited.
+    const DEFAULT_PROCESS_MAX_ENTRIES = 5000;
+
+    function currentProcessMaxEntries() {
+      const input = $("processMaxEntries");
+      const raw = input ? Number(input.value) : NaN;
+      const value = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_PROCESS_MAX_ENTRIES;
+      if (value === 0) {
+        const confirmed = window.confirm(
+          "Processing limit is set to 0 (unlimited). This indexes every entry with no cap - on a " +
+          "large image this can write a large amount of data into the case database and use a lot " +
+          "of disk space. Continue with no limit?"
+        );
+        if (!confirmed) {
+          return DEFAULT_PROCESS_MAX_ENTRIES;
+        }
+      }
+      return value;
+    }
+
+    // Recursive folder bookmarking (right-click a folder -> "Bookmark folder
+    // (recursive)", live or indexed) only writes case-database rows
+    // referencing already-listed files - it never touches or copies the
+    // evidence itself, so it defaults to fully unlimited (0). The backend
+    // (resolve_unlimited_max_entries in kdft-ui) honors 0 as "no cap at all",
+    // not just a high number. The "Recursive bookmark limit" input can still
+    // NO ARBITRARY LIMITS (Cristina, 2026-07-13): recursive bookmarking and
+    // Timeline builds always cover the whole selected scope. The former limit
+    // inputs are gone; these helpers stay for their call sites and always
+    // report "unlimited".
+    function currentRecursiveBookmarkLimit() {
+      return 0;
+    }
+
+    function currentTimelineBuildLimit() {
+      return 0;
+    }
     if (ANALYSIS_MODE) {
       document.body.classList.add("analysis-fullscreen");
     }
@@ -4281,6 +6104,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         length,
         data,
         fetching: false,
+        byteContext: "file",
+        diskLocation: null,
+        locationLoading: false,
+        locationError: "",
         selStart: null,
         selEnd: null,
         live: null,
@@ -4292,7 +6119,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       casePath: PAGE_PARAMS.get("case_path") || localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath,
       data: null,
       searchResults: [],
-      selectedSearchIndexes: new Set(),
+      selectedSearchKeys: new Set(),
+      searchSort: { column: "", direction: "asc" },
+      searchColumnFilters: {},
+      gridViews: {},
+      currentEntryGrid: { gridId: "", entries: [] },
+      currentLiveGrid: { gridId: "", items: [] },
       browserState: { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" },
       analyzeHistory: { back: [], forward: [], applying: false },
       live: { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null },
@@ -4305,6 +6137,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       lastSelectedEntryId: null,
       pictureViewMode: "grid",
       dateFilter: { from: "", to: "" },
+      timeline: newTimelineState(),
       hex: makeHexState(),
       lastReportPath: BOOTSTRAP.defaultReportPath,
       pendingAnalysisSelection: ANALYSIS_MODE ? {
@@ -4322,6 +6155,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function newCategoryCache(evidenceId = null, key = "") {
       return { evidenceId, key, entries: [], total: null, loading: false, error: "", pageSize: 1000 };
+    }
+
+    function newTimelineState() {
+      return {
+        built: false,
+        prompted: false,
+        casePath: "",
+        // Entries fetched directly from /api/timeline/entries when the examiner
+        // clicks "Build timeline" - a dedicated, much-higher-limit fetch,
+        // independent of whatever happens to already be cached in
+        // state.data.entries from ordinary page browsing (see
+        // requestTimelineBuild). Empty until the first successful build.
+        entries: [],
+        truncated: false,
+        sourceEntries: 0,
+        loadedEntryCount: 0,
+        totalEntryCount: 0,
+        events: [],
+        selectedEntryId: null,
+        selectedEventIndex: null,
+        graphBuckets: [],
+        focusBucket: null,
+        scrollToSelected: false
+      };
     }
 
     function setNotice(message, bad) {
@@ -4604,6 +6461,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
           setNotice("Enter a case database file path first.", true);
           return;
         }
+        const proceedWithStorage = window.confirm(
+          "Make sure this case is being created on storage with enough free space.\n\n" +
+          "Processing/indexing evidence writes real data into the case database, and large " +
+          "images can need a lot of room. Pick a drive with plenty of free space before " +
+          "continuing.\n\nContinue creating the case?"
+        );
+        if (!proceedWithStorage) {
+          setNotice("Case creation cancelled.");
+          return;
+        }
         $("casePath").value = target;
         state.casePath = target;
         localStorage.setItem("kdft.casePath", target);
@@ -4693,11 +6560,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
           const processed = await apiPost("/api/evidence/process", {
             case_path: currentCasePath(),
             evidence_id: data.evidence_id,
-            max_entries: 0
+            max_entries: currentProcessMaxEntries(),
+            ...processingOptionsPayload()
           });
           await refresh();
           selectEvidenceSource(data.evidence_id, preferredAnalysisPath(data.evidence_id), "filesystem");
-          setNotice(withPathCorrectionNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries.", evidencePath));
+          setNotice(withPathCorrectionNotice("Attached and processed evidence " + data.evidence_id + " with " + processed.entries_indexed + " entries." + processingExtrasSummary(processed), evidencePath));
         } catch (processErr) {
           await refresh();
           selectEvidenceSource(data.evidence_id, "/");
@@ -4736,26 +6604,137 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    async function processEvidence(id) {
-      try {
-        const data = await apiPost("/api/evidence/process", {
-          case_path: currentCasePath(),
-          evidence_id: id,
-          max_entries: 0
-        });
-        let message = "Process job " + data.job_id + " " + data.status + " with " + data.entries_indexed + " entries.";
-        if (data.bookmark_items_relinked > 0) {
-          message += " Re-linked " + data.bookmark_items_relinked + " bookmark item(s) to the new index.";
-        }
-        await refresh();
-        if (state.live.evidenceId === id) {
-          state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
-        }
-        selectEvidenceSource(id, preferredAnalysisPath(id), "filesystem");
-        setNotice(message);
-      } catch (err) {
-        setNotice(err.message, true);
+    // Blocking progress overlay for a long analyze. Analyzing indexes the whole
+    // disk inside one DB write transaction, so while it runs the examiner must
+    // NOT start a second analyze or open other views (those writes collide with
+    // the lock and surface as "database is locked"). This overlay both shows the
+    // tool is working and physically blocks interaction until it finishes, so a
+    // single uninterrupted analyze runs to completion - no batching, no caps.
+    function renderAnalyzingOverlay() {
+      let el = document.getElementById("analyzingOverlay");
+      if (!state.analyzing) {
+        if (el) { el.remove(); }
+        return;
       }
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "analyzingOverlay";
+        el.className = "analyzing-overlay";
+        document.body.appendChild(el);
+      }
+      const secs = Math.max(0, Math.floor((Date.now() - state.analyzing.startedAt) / 1000));
+      const mins = Math.floor(secs / 60);
+      const elapsed = mins > 0 ? mins + "m " + (secs % 60) + "s" : secs + "s";
+      el.innerHTML =
+        '<div class="analyzing-card" role="alertdialog" aria-busy="true">' +
+          '<div class="analyzing-title">Analyzing ' + escapeHtml(state.analyzing.name) + '…</div>' +
+          '<div class="analyzing-bar"><div class="analyzing-bar-fill"></div></div>' +
+          '<div class="analyzing-note">Reading and indexing the whole disk. This can take a while on a large image - ' +
+          'please wait and do not click Analyze again or open other views until it finishes. Elapsed: ' + escapeHtml(elapsed) + '</div>' +
+        '</div>';
+    }
+
+    async function runAnalyze(name, worker) {
+      if (state.analyzing) {
+        setNotice("An analysis is already running - wait for it to finish before starting another.", true);
+        return undefined;
+      }
+      state.analyzing = { name: name || "evidence", startedAt: Date.now(), timer: null };
+      renderAnalyzingOverlay();
+      state.analyzing.timer = window.setInterval(renderAnalyzingOverlay, 1000);
+      try {
+        return await worker();
+      } finally {
+        if (state.analyzing && state.analyzing.timer) { window.clearInterval(state.analyzing.timer); }
+        state.analyzing = null;
+        renderAnalyzingOverlay();
+      }
+    }
+
+    // Examiner-selected processing options (professional-suite style), sent
+    // with every Process / Analyze run. Checkbox state persists like the
+    // processing limit so a chosen profile sticks across sessions.
+    const PROCESSING_OPTION_CHECKBOXES = ["optCaptureContent", "optParseEmails", "optRunHash", "optRunFileHash", "optRunSignatures", "optRunCarve", "optRunBrowserParse"];
+
+    function processingOptionsPayload() {
+      return {
+        capture_content: $("optCaptureContent").checked,
+        parse_emails: $("optParseEmails").checked,
+        parse_browsers: $("optRunBrowserParse").checked,
+        run_hash: $("optRunHash").checked,
+        run_file_hash: $("optRunFileHash").checked,
+        run_signature_analysis: $("optRunSignatures").checked,
+        run_carve: $("optRunCarve").checked,
+        // NO ARBITRARY LIMITS: carve covers the whole decoded media.
+        carve_max_scan_bytes: 0,
+        carve_max_files: 0
+      };
+    }
+
+    // One-line outcome of the optional passes for the completion notice. A
+    // failed optional pass is reported but never hides the completed index.
+    function processingExtrasSummary(data) {
+      const parts = [];
+      if (!$("optCaptureContent").checked) {
+        parts.push("metadata-only index - content search stays unavailable for this evidence until re-processed with content on");
+      }
+      if (data.hash) {
+        parts.push(data.hash.error ? "hash FAILED: " + data.hash.error : "hash " + String(data.hash.sha256_hex || "").slice(0, 16) + "…");
+      }
+      if (data.signature_analysis) {
+        const sig = data.signature_analysis;
+        parts.push(sig.error ? "signatures FAILED: " + sig.error : "signatures: " + sig.matches + " match / " + sig.mismatches + " mismatch / " + sig.unknown + " unknown");
+      }
+      if (data.carve) {
+        parts.push(data.carve.error ? "carve FAILED: " + data.carve.error : "carved " + data.carve.carved_files + " file(s)" + (data.carve.truncated ? " (bounded scan)" : ""));
+      }
+      if (data.file_hash) {
+        parts.push(data.file_hash.error
+          ? "file hashing FAILED: " + data.file_hash.error
+          : "hashed " + Number(data.file_hash.files_hashed || 0).toLocaleString() + " file(s)"
+            + (data.file_hash.files_skipped ? " (" + data.file_hash.files_skipped + " skipped, reasons stamped per entry)" : ""));
+      }
+      if (data.browser_parsing) {
+        const bp = data.browser_parsing;
+        if (bp.error) {
+          parts.push("browser parsing FAILED: " + bp.error);
+        } else if (Number(bp.profiles_found || 0) > 0) {
+          const visits = (bp.imported || []).reduce((sum, item) => sum + Number(item.visits_indexed || 0), 0);
+          const parseErrors = (bp.imported || []).reduce((sum, item) => sum + ((item.parse_errors || []).length), 0);
+          parts.push("browser profiles: " + bp.profiles_found + " found, " + (bp.imported || []).length + " imported (" + visits.toLocaleString() + " visits)"
+            + ((bp.errors || []).length ? ", " + bp.errors.length + " failed" : "")
+            + (parseErrors ? ", " + parseErrors + " parser error" + (parseErrors === 1 ? "" : "s") + " disclosed in the job record" : ""));
+        }
+      }
+      return parts.length ? " " + parts.join("; ") + "." : "";
+    }
+
+    async function processEvidence(id) {
+      const evidence = state.data && state.data.evidence.find((item) => item.id === id);
+      const label = evidence ? evidence.display_name : "evidence #" + id;
+      await runAnalyze(label, async () => {
+        try {
+          const data = await apiPost("/api/evidence/process", {
+            case_path: currentCasePath(),
+            evidence_id: id,
+            max_entries: currentProcessMaxEntries(),
+            ...processingOptionsPayload()
+          });
+          let message = "Process job " + data.job_id + " " + data.status + " with " + data.entries_indexed + " entries.";
+          if (data.bookmark_items_relinked > 0) {
+            message += " Re-linked " + data.bookmark_items_relinked + " bookmark item(s) to the new index.";
+          }
+          message += processingExtrasSummary(data);
+          await refresh();
+          if (state.live.evidenceId === id) {
+            state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+          }
+          selectEvidenceSource(id, preferredAnalysisPath(id), "filesystem");
+          setNotice(message);
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
     }
 
     async function removeEvidence(id) {
@@ -4884,6 +6863,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function currentAnalyzeLocation() {
+      // Live Browse keeps its own state namespace (state.live.*) separate from the indexed/
+      // category browser (state.browserState) - fold it into the same location shape so a single
+      // Back/Forward history covers folder-by-folder live browsing too, not just tab/category
+      // switches (Cristina: the Back button was skipping over her live-browse folder clicks
+      // entirely and jumping straight to whatever view she was on before opening the disk).
+      if (state.live.active && state.live.evidenceId && state.live.selKey) {
+        const separator = state.live.selKey.indexOf("|");
+        const volume = separator === -1 ? state.live.selKey : state.live.selKey.slice(0, separator);
+        const path = separator === -1 ? "/" : state.live.selKey.slice(separator + 1);
+        return {
+          evidenceId: state.live.evidenceId,
+          treeMode: "live",
+          selectedPath: normalizeLogicalPath(path || "/"),
+          selectedCategory: "",
+          liveVolume: volume
+        };
+      }
       const browserState = state.browserState || {};
       if (!browserState.evidenceId) {
         return null;
@@ -4905,7 +6901,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         location.evidenceId || "",
         location.treeMode || "filesystem",
         normalizeLogicalPath(location.selectedPath || "/"),
-        location.selectedCategory || ""
+        location.selectedCategory || "",
+        location.treeMode === "live" ? (location.liveVolume || "") : ""
       ].join("|");
     }
 
@@ -4946,20 +6943,38 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.analyzeHistory.applying = true;
       try {
-        const treeMode = location.treeMode === "categories" ? "categories" : "filesystem";
-        state.browserState = {
-          evidenceId: location.evidenceId,
-          selectedPath: normalizeLogicalPath(location.selectedPath || "/"),
-          treeMode,
-          selectedCategory: treeMode === "categories" ? (location.selectedCategory || "") : ""
-        };
-        if (treeMode === "categories") {
-          state.cat = newCategoryCache(location.evidenceId, location.selectedCategory || "");
+        if (location.treeMode === "live") {
+          if (!(state.live.active && state.live.evidenceId === location.evidenceId)) {
+            const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: location.evidenceId });
+            state.live = { active: true, evidenceId: location.evidenceId, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+          }
+          const path = normalizeLogicalPath(location.selectedPath || "/");
+          try {
+            await liveLoadDir(location.liveVolume, path);
+            state.live.selKey = liveKey(location.liveVolume, path);
+            state.live.expanded.add(state.live.selKey);
+          } catch (err) {
+            setNotice(err.message, true);
+          }
         } else {
-          expandTreePath(state.browserState.selectedPath);
-          if (state.idx.evidenceId === location.evidenceId) {
-            state.idx.selPath = state.browserState.selectedPath;
-            state.idx.expanded.add(state.idx.selPath);
+          if (state.live.active) {
+            state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+          }
+          const treeMode = location.treeMode === "categories" ? "categories" : "filesystem";
+          state.browserState = {
+            evidenceId: location.evidenceId,
+            selectedPath: normalizeLogicalPath(location.selectedPath || "/"),
+            treeMode,
+            selectedCategory: treeMode === "categories" ? (location.selectedCategory || "") : ""
+          };
+          if (treeMode === "categories") {
+            state.cat = newCategoryCache(location.evidenceId, location.selectedCategory || "");
+          } else {
+            expandTreePath(state.browserState.selectedPath);
+            if (state.idx.evidenceId === location.evidenceId) {
+              state.idx.selPath = state.browserState.selectedPath;
+              state.idx.expanded.add(state.idx.selPath);
+            }
           }
         }
         state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
@@ -5010,6 +7025,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("This disk image entry cannot be analyzed directly from its current source.", true);
         return;
       }
+      await runAnalyze(entry.name || evidence.display_name, async () => {
       try {
         let imageEvidence = state.data.evidence.find((item) => sameLocalPath(item.source_path, imagePath));
         if (!imageEvidence) {
@@ -5030,9 +7046,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const processed = await apiPost("/api/evidence/process", {
           case_path: currentCasePath(),
           evidence_id: imageEvidence.id,
-          max_entries: 0
+          max_entries: currentProcessMaxEntries(),
+          ...processingOptionsPayload()
         });
-        const message = "Analyzed image " + imageEvidence.display_name + ": " + processed.entries_indexed + " entries (" + processed.status + ").";
+        const message = "Analyzed image " + imageEvidence.display_name + ": " + processed.entries_indexed + " entries (" + processed.status + ")." + processingExtrasSummary(processed);
         await refresh();
         if (state.live.evidenceId === imageEvidence.id) {
           state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
@@ -5042,6 +7059,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } catch (err) {
         setNotice(err.message, true);
       }
+      });
     }
 
     async function importHistory() {
@@ -5109,8 +7127,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const key = categoryKey || "";
       state.browserState.treeMode = "categories";
       state.browserState.selectedCategory = key;
-      if (state.cat.evidenceId !== state.browserState.evidenceId || state.cat.key !== key) {
-        state.cat = newCategoryCache(state.browserState.evidenceId, key);
+      if (state.cat.evidenceId !== ALL_EVIDENCE_CATEGORY_SCOPE || state.cat.key !== key) {
+        state.cat = newCategoryCache(ALL_EVIDENCE_CATEGORY_SCOPE, key);
       }
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       renderEvidenceBrowserEntries();
@@ -5141,7 +7159,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (event && event.shiftKey && state.lastSelectedEntryId) {
         selectEntryRange(state.lastSelectedEntryId, entryId, true);
         renderEvidenceBrowserEntries();
-        setNotice("Selected " + state.selectedEntryIds.size + " entries.");
+        setNotice("Selected " + selectedEntriesForActions().length + " visible entries.");
         return;
       }
       setEntrySelection(entryId, checked);
@@ -5176,7 +7194,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (event && event.shiftKey && state.lastSelectedEntryId) {
         selectEntryRange(state.lastSelectedEntryId, entryId, true);
         renderEvidenceBrowserEntries();
-        setNotice("Selected " + state.selectedEntryIds.size + " entries.");
+        setNotice("Selected " + selectedEntriesForActions().length + " visible entries.");
         return;
       }
       if (event && (event.ctrlKey || event.metaKey)) {
@@ -5237,9 +7255,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkSelectedEntries() {
-      const ids = Array.from(state.selectedEntryIds);
+      const ids = selectedEntriesForActions().map((entry) => entry.id);
       if (ids.length === 0) {
-        setNotice("Select one or more entries first.", true);
+        setNotice("Select one or more visible entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
       // One request for the whole selection (bulk_add_bookmark_items runs every insert in a
@@ -5277,9 +7295,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function exportSelectedEntries() {
-      const ids = Array.from(state.selectedEntryIds);
+      const ids = selectedEntriesForActions().map((entry) => entry.id);
       if (ids.length === 0) {
-        setNotice("Select one or more file entries first.", true);
+        setNotice("Select one or more visible file entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
       const fileIds = ids.filter((entryId) => {
@@ -5378,7 +7396,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectedAction.selectedIndex = 0;
       }
       if (state.live.active) {
-        if (!state.live.selected || state.live.selected.size === 0) {
+        if (selectedVisibleLiveItems().length === 0) {
           setNotice("Select rows before reporting selected items.", true);
           return;
         }
@@ -5387,7 +7405,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         await exportReport();
         return;
       }
-      const count = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
+      const count = selectedEntriesForActions().length;
       if (count === 0) {
         setNotice("Select rows before reporting selected items.", true);
         return;
@@ -5407,9 +7425,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // Axy-style "Create export": write the selected artifacts to a CSV download with the
     // examiner-grade columns (identity, category, size, MAC times, deleted state, offsets).
     function exportSelectedCsv() {
-      const entries = Array.from(state.selectedEntryIds || [])
-        .map((entryId) => findLoadedEntry(entryId))
-        .filter(Boolean);
+      const entries = selectedEntriesForActions();
       if (entries.length === 0) {
         setNotice("Select rows to export first.", true);
         return;
@@ -5458,6 +7474,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "metadata";
+      loadEntryDiskLocation(entry.id);
       renderHexViewer();
       const evidence = selectedEvidenceSource();
       if (entry.entry_kind === "file" && isPromotableDiskImageEntry(entry, evidence)) {
@@ -5471,7 +7488,205 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.hex = makeHexState(entryId, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "hex";
       $("hexOffset").value = String(state.hex.offset);
+      const locationRequest = loadEntryDiskLocation(entryId);
       await fetchEntryBytes();
+      await locationRequest;
+      // The live-browse "view bytes" paths (openLiveFile, openLiveRawDevice,
+      // etc.) already do this - this one was missing it, so clicking "View
+      // bytes" on an indexed entry fetched the bytes successfully but showed
+      // nothing if the inspector pane was collapsed.
+      setInspectorCollapsed(false);
+    }
+
+    function resolvedDiskLocation() {
+      const location = state.hex && state.hex.diskLocation;
+      return location && location.available && location.decoded_media_offset != null ? location : null;
+    }
+
+    function isFilesystemByteContext() {
+      return Boolean(state.hex && (state.hex.raw || (state.hex.entryId && state.hex.byteContext === "filesystem")));
+    }
+
+    function diskLocationMappedLength(location) {
+      if (!location) {
+        return 0;
+      }
+      const value = Number(location.contiguous_bytes);
+      return Number.isFinite(value) && value > 0 ? value : 1;
+    }
+
+    function decodedRangeWithinDiskLocation(location, start, end) {
+      if (!location || location.decoded_media_offset == null) {
+        return false;
+      }
+      const mappedStart = Number(location.decoded_media_offset);
+      const mappedEnd = mappedStart + diskLocationMappedLength(location) - 1;
+      return start >= mappedStart && end <= mappedEnd;
+    }
+
+    function fileRangeWithinDiskLocation(location, start, end) {
+      if (!location || location.file_relative_offset == null) {
+        return false;
+      }
+      const mappedStart = Number(location.file_relative_offset);
+      const mappedEnd = mappedStart + diskLocationMappedLength(location) - 1;
+      return start >= mappedStart && end <= mappedEnd;
+    }
+
+    function updateResolvedOffsetCell(entryId) {
+      const entry = findLoadedEntry(entryId);
+      const location = resolvedDiskLocation();
+      if (!entry || !location) {
+        return;
+      }
+      entry.metadata_json = entry.metadata_json || {};
+      entry.metadata_json.resolved_decoded_media_offset = location.decoded_media_offset;
+      entry.metadata_json.resolved_offset_basis = location.basis;
+      document.querySelectorAll(`.entry-row[data-entry-id="${entryId}"] .entry-offset`).forEach((cell) => {
+        const label = entryPrimaryOffset(entry);
+        cell.textContent = label;
+        cell.title = label + " | " + location.basis;
+      });
+    }
+
+    async function loadEntryDiskLocation(entryId = state.hex.entryId) {
+      if (!entryId || !state.hex || state.hex.entryId !== entryId) {
+        return null;
+      }
+      const targetState = state.hex;
+      targetState.locationLoading = true;
+      targetState.locationError = "";
+      updateByteContextControls();
+      try {
+        const location = await apiGet("/api/entry/disk-location", {
+          case_path: currentCasePath(),
+          entry_id: entryId
+        });
+        if (state.hex !== targetState || state.hex.entryId !== entryId) {
+          return location;
+        }
+        targetState.diskLocation = location;
+        targetState.locationLoading = false;
+        targetState.locationError = location.available ? "" : (location.warning || "File-system location unavailable.");
+        updateResolvedOffsetCell(entryId);
+        updateByteContextControls();
+        renderHexViewer();
+        return location;
+      } catch (err) {
+        if (state.hex === targetState) {
+          targetState.locationLoading = false;
+          targetState.locationError = err.message || String(err);
+          updateByteContextControls();
+          renderHexViewer();
+        }
+        return null;
+      }
+    }
+
+    async function setByteContext(context) {
+      if (!state.hex || state.hex.live || state.hex.raw || !state.hex.entryId) {
+        return;
+      }
+      const currentOffset = Number(state.hex.data ? state.hex.data.offset : state.hex.offset) || 0;
+      if (context === "filesystem") {
+        let location = resolvedDiskLocation();
+        if (!location) {
+          location = await loadEntryDiskLocation(state.hex.entryId);
+        }
+        if (!location || !location.available || location.decoded_media_offset == null) {
+          setNotice((location && location.warning) || state.hex.locationError || "File-system location is unavailable for this entry.", true);
+          return;
+        }
+        state.hex.byteContext = "filesystem";
+        state.hex.offset = fileRangeWithinDiskLocation(location, currentOffset, currentOffset)
+          ? Number(location.decoded_media_offset) + currentOffset - Number(location.file_relative_offset || 0)
+          : Number(location.decoded_media_offset);
+      } else {
+        const location = resolvedDiskLocation();
+        state.hex.byteContext = "file";
+        state.hex.offset = location && decodedRangeWithinDiskLocation(location, currentOffset, currentOffset)
+          ? Number(location.file_relative_offset || 0) + currentOffset - Number(location.decoded_media_offset)
+          : 0;
+      }
+      state.hex.data = null;
+      clearHexSelection();
+      $("viewerMode").value = "hex";
+      $("hexOffset").value = String(state.hex.offset);
+      updateByteContextControls();
+      await fetchEntryBytes();
+    }
+
+    const EXTERNAL_OPEN_EXTENSIONS = new Set([
+      "pdf", "txt", "log", "csv", "tsv", "json", "xml", "rtf",
+      "doc", "docx", "xls", "xlsx", "ods", "odt", "ppt", "pptx",
+      "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff",
+      "wav", "mp3", "mp4", "mov", "avi"
+    ]);
+
+    function canOpenEntryExternally(entry) {
+      return Boolean(entry && entry.id && entry.entry_kind === "file" && EXTERNAL_OPEN_EXTENSIONS.has(filesystemFileExtension(entry)));
+    }
+
+    async function openSelectedEntryExternal(entryId = null) {
+      const entry = entryId ? findLoadedEntry(entryId) : currentHexEntry();
+      if (!entry || !entry.id || entry.entry_kind !== "file") {
+        setNotice("Select an indexed file before opening it.", true);
+        return;
+      }
+      if (!canOpenEntryExternally(entry)) {
+        setNotice("This file type is not enabled for external preview. Recover it explicitly for controlled inspection.", true);
+        return;
+      }
+      if (!window.confirm("Open a recovered read-only copy in the registered application? Treat evidence files as untrusted content.")) {
+        return;
+      }
+      try {
+        setNotice("Preparing read-only preview for " + (entry.name || logicalName(entry.logical_path)) + "...");
+        const data = await apiPost("/api/entry/open", {
+          case_path: currentCasePath(),
+          entry_id: entry.id
+        });
+        setNotice("Opened read-only preview copy " + data.output_path + ".");
+      } catch (err) {
+        setNotice(err.message || String(err), true);
+      }
+    }
+
+    function updateByteContextControls() {
+      const fileButton = $("byteContextFile");
+      const filesystemButton = $("byteContextFilesystem");
+      const openButton = $("openSelectedEntry");
+      if (!fileButton || !filesystemButton) {
+        return;
+      }
+      const entry = currentHexEntry();
+      const raw = Boolean(state.hex && state.hex.raw);
+      const live = Boolean(state.hex && state.hex.live);
+      const indexedFile = Boolean(entry && entry.id && entry.entry_kind === "file");
+      const fileActive = !raw && state.hex.byteContext !== "filesystem";
+      const filesystemActive = raw || state.hex.byteContext === "filesystem";
+      fileButton.classList.toggle("active", fileActive);
+      fileButton.setAttribute("aria-pressed", String(fileActive));
+      fileButton.disabled = raw || (!indexedFile && !live);
+      filesystemButton.classList.toggle("active", filesystemActive);
+      filesystemButton.setAttribute("aria-pressed", String(filesystemActive));
+      const location = resolvedDiskLocation();
+      filesystemButton.disabled = !raw && (!indexedFile || !location);
+      if (raw) {
+        filesystemButton.title = "Decoded evidence bytes at absolute media offsets.";
+      } else if (state.hex.locationLoading) {
+        filesystemButton.title = "Resolving the file's first authoritative media location...";
+      } else if (location) {
+        filesystemButton.title = location.basis + (location.warning ? " | " + location.warning : "");
+      } else {
+        filesystemButton.title = state.hex.locationError || "No authoritative file-data offset is available.";
+      }
+      if (openButton) {
+        openButton.disabled = !canOpenEntryExternally(entry);
+        openButton.title = openButton.disabled
+          ? "External preview is available for bounded document, data, image, and media files."
+          : "Recover a read-only copy and open it with the registered application.";
+      }
     }
 
     async function fetchEntryBytes() {
@@ -5484,36 +7699,62 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.hex.fetching = true;
       try {
-        const data = state.hex.raw
-          ? await apiGet("/api/image/bytes", {
+        let data;
+        const filesystemContext = isFilesystemByteContext();
+        if (state.hex.raw) {
+          data = await apiGet("/api/image/bytes", {
               case_path: currentCasePath(),
               evidence_id: state.hex.raw.evidenceId,
               raw: true,
               offset: state.hex.offset,
               length: state.hex.length
-            })
-          : state.hex.live
-          ? await apiGet("/api/image/bytes", {
+            });
+          data.byte_context = "filesystem";
+        } else if (state.hex.live) {
+          data = await apiGet("/api/image/bytes", {
               case_path: currentCasePath(),
               evidence_id: state.hex.live.evidenceId,
               volume: state.hex.live.volume,
               path: state.hex.live.path,
               offset: state.hex.offset,
               length: state.hex.length
-            })
-          : await apiGet("/api/entry/bytes", {
+            });
+        } else if (filesystemContext) {
+          const location = resolvedDiskLocation();
+          if (!location) {
+            throw new Error(state.hex.locationError || "File-system location is unavailable for this entry.");
+          }
+          data = await apiGet("/api/image/bytes", {
+            case_path: currentCasePath(),
+            evidence_id: location.evidence_id,
+            raw: true,
+            offset: state.hex.offset,
+            length: state.hex.length
+          });
+          data.byte_context = "filesystem";
+          data.entry_id = state.hex.entryId;
+          data.disk_location = location;
+          data.file_relative_offset = Number(location.file_relative_offset || 0)
+            + Number(data.offset) - Number(location.decoded_media_offset);
+        } else {
+          data = await apiGet("/api/entry/bytes", {
               case_path: currentCasePath(),
               entry_id: state.hex.entryId,
               offset: state.hex.offset,
               length: state.hex.length
             });
+          data.byte_context = "file";
+          data.file_relative_offset = Number(data.offset);
+        }
         clearHexSelection();
         state.hex.data = data;
         $("hexOffset").value = String(data.offset);
         $("hexLength").value = String(data.requested_length);
         state.hex.fetching = false;
         renderHexViewer();
-        setNotice("Opened entry bytes at offset " + data.offset + ".");
+        setNotice(filesystemContext
+          ? "Opened file-system bytes at decoded-media offset " + data.offset + "."
+          : "Opened file bytes at file-relative offset " + data.offset + ".");
       } catch (err) {
         clearHexSelection();
         state.hex.data = null;
@@ -5646,43 +7887,209 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    function currentSearchMode() {
+      const el = $("searchMode");
+      return el && el.value === "all" ? "all" : "indexed";
+    }
+
+    // Show the bitwise-only controls and clear any stale bitwise results when
+    // the examiner flips the single search window between Indexed and All.
+    function updateSearchModeUi() {
+      const mode = currentSearchMode();
+      const controls = $("bitwiseControls");
+      if (controls) {
+        controls.hidden = mode !== "all";
+      }
+      if (mode !== "all") {
+        state.rawSearchResult = null;
+        const section = $("rawSearchSection");
+        if (section) {
+          section.hidden = true;
+        }
+        renderRawSearchResults();
+      }
+    }
+
+    // One-line summary of how the indexed pass ended, reused by every notice
+    // the unified search shows afterwards so a failed indexed pass stays
+    // visible instead of being overwritten by the bitwise status.
+    function indexedPassSummary() {
+      if (state.searchError) {
+        return "Indexed pass FAILED (" + state.searchError + ")";
+      }
+      return "Indexed: " + state.searchResults.length + " result" + (state.searchResults.length === 1 ? "" : "s");
+    }
+
     async function runSearch() {
+      const mode = currentSearchMode();
       state.searchResults = [];
-      state.selectedSearchIndexes = new Set();
+      state.searchError = null;
+      state.selectedSearchKeys = new Set();
+      resetGridView("search");
       renderSearchResults();
+      // Reset the bitwise section every run; it only re-appears for All mode.
+      state.rawSearchResult = null;
+      resetGridView("rawSearch");
+      const rawSection = $("rawSearchSection");
+      if (rawSection) {
+        rawSection.hidden = mode !== "all";
+      }
+      renderRawSearchResults();
       try {
         state.searchResults = await apiPost("/api/search/deep", {
           case_path: currentCasePath(),
           query: $("searchQuery").value,
           evidence_id: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
           include_content: $("includeContent").value === "true",
-          max_results: numberValue("maxResults", 50),
-          max_file_bytes: numberValue("maxFileBytes", 65536),
+          // Clamp to what deep_search actually honors: results cap 1000, and
+          // content matching only ever sees each file's first 4,096 indexed
+          // bytes (anything past that is the bitwise pass's job).
+          max_results: boundedNumberValue("maxResults", 50, 1, 1000),
+          max_file_bytes: boundedNumberValue("maxFileBytes", 4096, 1, 4096),
           category: $("searchCategory").value || null,
           file_types: $("searchFileTypes").value || null
         });
-        state.selectedSearchIndexes = new Set();
-        renderSearchResults();
-        setNotice("Search returned " + state.searchResults.length + " results.");
       } catch (err) {
-        setNotice(err.message, true);
+        // Do NOT abort here: in All mode the bitwise pass is independent of
+        // the indexed pass and must still run (a failed indexed pass used to
+        // silently skip it, leaving a blank "No results" with no explanation).
+        state.searchError = err.message || String(err);
       }
+      state.selectedSearchKeys = new Set();
+      gridViewState("search");
+      renderSearchResults();
+      if (mode !== "all") {
+        setNotice(
+          state.searchError
+            ? "Indexed search failed: " + state.searchError
+            : "Indexed search returned " + state.searchResults.length + " result" + (state.searchResults.length === 1 ? "" : "s") + ".",
+          Boolean(state.searchError)
+        );
+        return;
+      }
+      setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError));
+      await runBitwiseForUnifiedSearch();
     }
 
-    function goToSearchResult(index) {
+    // Which evidence sources the bitwise pass scans: the one selected in the
+    // shared Evidence dropdown, or every image/file source when "All evidence"
+    // is chosen (record/folder sources have no single raw byte stream to scan).
+    function bitwiseEvidenceTargets(evidenceValue) {
+      if (!state.data) {
+        return [];
+      }
+      const isScannable = (item) => item.source_kind === "image" || item.source_kind === "file";
+      if (evidenceValue) {
+        const id = Number(evidenceValue);
+        const item = state.data.evidence.find((entry) => entry.id === id);
+        return item && isScannable(item) ? [{ id: item.id, name: item.display_name }] : [];
+      }
+      return state.data.evidence.filter(isScannable).map((item) => ({ id: item.id, name: item.display_name }));
+    }
+
+    async function runBitwiseForUnifiedSearch() {
+      const query = $("searchQuery").value;
+      if (!query.trim()) {
+        setNotice("Enter a query to run the bitwise pass.", true);
+        return;
+      }
+      const targets = bitwiseEvidenceTargets($("searchEvidence").value);
+      // provenance keeps each source's full RawSearchResult (minus hits): evidence
+      // SHA-256 + hashed_at, searched_at, actor, sector_size, and the echoed scan
+      // params - the court-admissibility context a bookmarked hit must carry.
+      const merged = { hits: [], bytes_scanned: 0, total_size: 0, truncated: false, sources: [], multiSource: targets.length > 1, query, provenance: {} };
+      if (!targets.length) {
+        state.rawSearchResult = merged;
+        renderRawSearchResults();
+        setNotice(indexedPassSummary() + ". Bitwise pass skipped: the selected evidence has no raw byte stream (only image/file sources can be scanned byte-for-byte).", true);
+        return;
+      }
+      const maxResults = boundedNumberValue("maxResults", 50, 1, 1000);
+      const maxScanBytes = boundedNumberValue("rawSearchMaxScanBytes", 536870912, 0, Number.MAX_SAFE_INTEGER);
+      state.rawSearchRunning = true;
+      renderRawSearchResults();
+      const status = $("rawSearchStatus");
+      if (status) {
+        status.textContent = "Scanning " + targets.length + " source" + (targets.length === 1 ? "" : "s") + "...";
+      }
+      for (const target of targets) {
+        try {
+          const result = await apiPost("/api/search/raw", {
+            case_path: currentCasePath(),
+            evidence_id: target.id,
+            query,
+            max_results: maxResults,
+            max_scan_bytes: maxScanBytes
+          });
+          (result.hits || []).forEach((hit) => merged.hits.push({ ...hit, evidence_id: target.id, evidence_name: target.name }));
+          merged.bytes_scanned += Number(result.bytes_scanned) || 0;
+          merged.total_size += Number(result.total_size) || 0;
+          merged.truncated = merged.truncated || Boolean(result.truncated);
+          const provenance = { ...result };
+          delete provenance.hits;
+          merged.provenance[target.id] = provenance;
+          merged.sources.push({ evidence_id: target.id, name: target.name, hits: (result.hits || []).length, bytes_scanned: result.bytes_scanned, total_size: result.total_size, truncated: result.truncated, stop_reason: result.stop_reason || null, evidence_sha256_hex: result.evidence_sha256_hex || null });
+        } catch (err) {
+          merged.sources.push({ evidence_id: target.id, name: target.name, error: err.message || String(err) });
+        }
+      }
+      state.rawSearchRunning = false;
+      state.rawSearchResult = merged;
+      resetGridView("rawSearch");
+      renderRawSearchResults();
+      const errored = merged.sources.filter((source) => source.error);
+      const scannedText = formatBytes(merged.bytes_scanned) + " scanned across " + targets.length + " source" + (targets.length === 1 ? "" : "s");
+      setNotice(
+        indexedPassSummary() + ". Bitwise: " + merged.hits.length.toLocaleString() + " hit(s), " + scannedText +
+          bitwiseStopReasonNote(merged) +
+          (errored.length ? "; " + errored.length + " source(s) errored" : "") + ".",
+        Boolean(state.searchError) || merged.truncated || errored.length > 0
+      );
+    }
+
+    // EA-009: report WHY the bitwise pass stopped rather than a blanket "scan
+    // limit". Precedence across scanned sources: result cap > byte budget >
+    // complete (end of evidence). Uses the backend-reported per-source
+    // stop_reason; falls back to the truncated flag for older results.
+    function bitwiseStopReasonNote(merged) {
+      const sources = (merged && merged.sources) || [];
+      const reasons = sources.filter((source) => !source.error).map((source) => source.stop_reason).filter(Boolean);
+      if (reasons.includes("result_limit")) {
+        return " (reached the result cap - narrow the query or raise Max results for more matches)";
+      }
+      if (reasons.includes("byte_limit")) {
+        return " (stopped at the scan-limit budget - raise the bitwise scan limit or set 0 for full coverage)";
+      }
+      if (!reasons.length && merged && merged.truncated) {
+        return " (stopped early - raise the scan limit for full coverage)";
+      }
+      return "";
+    }
+
+    async function goToSearchResult(index) {
       const hit = state.searchResults[index];
       if (!hit) {
         setNotice("Search result is no longer loaded.", true);
         return;
       }
-      goToEntryFolder(hit.entry_id);
+      await goToEntryFolder(hit.entry_id);
     }
 
-    function goToEntryFolder(entryId) {
-      const entry = findLoadedEntry(entryId);
+    // Deep Search queries the case database directly and can return entries
+    // anywhere in a large, lazily browsed case - not just ones the examiner
+    // has already navigated to. findLoadedEntry() only checks the browser's
+    // own in-memory cache, so a fresh /api/entry lookup is the fallback for
+    // "Source"/row-click on a hit that isn't cached yet (this used to fail
+    // outright with "Entry is not loaded in the current case state.").
+    async function goToEntryFolder(entryId) {
+      let entry = findLoadedEntry(entryId);
       if (!entry) {
-        setNotice("Entry is not loaded in the current case state.", true);
-        return;
+        try {
+          entry = await apiGet("/api/entry", { case_path: currentCasePath(), entry_id: entryId });
+        } catch (err) {
+          setNotice("Could not load entry " + entryId + ": " + err.message, true);
+          return;
+        }
       }
       const selectedPath = entry.entry_kind === "directory"
         ? normalizeLogicalPath(entry.logical_path)
@@ -5698,6 +8105,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "metadata";
       switchView("analyzeView");
+      // Large lazily-browsed cases keep their own folder cache (state.idx),
+      // separate from state.browserState. renderEvidenceBrowserEntries()
+      // only (re)loads it when the EVIDENCE SOURCE changes, not when only
+      // the target folder changes within the same source - so jumping to a
+      // specific file here has to explicitly (re)load its folder into
+      // state.idx too, the same way normal tree navigation
+      // (idxSelectDir/idxRestorePath) does. Without this, the folder pane
+      // silently kept showing whatever was loaded before (often just "/")
+      // while the inspector on the right correctly showed the new entry.
+      if (state.data && state.data.entries_truncated) {
+        state.idx = { evidenceId: entry.evidence_id, dirCache: {}, expanded: new Set(["/"]), selPath: "/" };
+        try {
+          await idxRestorePath(selectedPath);
+        } catch (err) {
+          setNotice(err.message, true);
+          return;
+        }
+      }
       renderEvidenceBrowserEntries();
       const offset = entryPrimaryOffset(entry);
       const location = offset ? " File starts at " + offset + "." : "";
@@ -5732,7 +8157,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         evidence_id: state.idx.evidenceId,
         logical_path: child.logical_path,
         name: child.name,
-        entry_kind: child.is_dir ? "directory" : "file",
+        entry_kind: child.entry_kind || (child.is_dir ? "directory" : "file"),
         size_bytes: child.size_bytes,
         is_deleted: child.is_deleted,
         metadata_json: child.metadata_json || {}
@@ -5762,7 +8187,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkEntry(entryId, refreshAfter = true) {
-      const entry = findLoadedEntry(entryId);
+      // timelineEntryById is a superset of findLoadedEntry (adds the dedicated
+      // timeline fetch set), so bookmarking works from the Timeline tab on a
+      // large/truncated case too; identical to findLoadedEntry when no timeline
+      // is built.
+      const entry = typeof timelineEntryById === "function" ? timelineEntryById(entryId) : findLoadedEntry(entryId);
       if (!entry) {
         setNotice("Entry is not loaded.", true);
         return;
@@ -5849,7 +8278,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           case_path: currentCasePath(),
           evidence_id: evidence.id,
           logical_path: normalized,
-          folder_name: "Evidence Folders"
+          folder_name: "Evidence Folders",
+          max_entries: currentRecursiveBookmarkLimit()
         });
         await refresh();
         setNotice(
@@ -5943,18 +8373,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkSelectedSearchResults() {
-      const indexes = Array.from(state.selectedSearchIndexes || []).sort((left, right) => left - right);
-      if (indexes.length === 0) {
-        setNotice("No search results selected.", true);
+      const rows = selectedVisibleSearchResultRows();
+      if (rows.length === 0) {
+        setNotice("No visible search results selected.", true);
         return;
       }
       let succeeded = 0;
-      const failed = [];
+      const failedKeys = [];
       let lastError = "";
-      for (const index of indexes) {
-        const hit = state.searchResults[index];
+      for (const row of rows) {
+        const hit = row.hit;
         if (!hit) {
-          failed.push(index);
+          failedKeys.push(row.key);
           lastError = "Search result is no longer loaded.";
           continue;
         }
@@ -5962,18 +8392,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
           await bookmarkSearchHit(hit, false);
           succeeded += 1;
         } catch (err) {
-          failed.push(index);
+          failedKeys.push(row.key);
           lastError = err.message || String(err);
         }
       }
-      state.selectedSearchIndexes = new Set(failed);
+      state.selectedSearchKeys = new Set(failedKeys);
       await refresh();
       renderSearchResults();
-      if (failed.length) {
-        setNotice("Bookmarked " + succeeded + " search result" + (succeeded === 1 ? "" : "s") + "; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
+      if (failedKeys.length) {
+        setNotice("Bookmarked " + succeeded + " visible search result" + (succeeded === 1 ? "" : "s") + "; " + failedKeys.length + " failed" + (lastError ? ": " + lastError : "."), true);
         return;
       }
-      setNotice("Bookmarked " + succeeded + " search result" + (succeeded === 1 ? "" : "s") + ".");
+      setNotice("Bookmarked " + succeeded + " visible search result" + (succeeded === 1 ? "" : "s") + ".");
     }
 
     async function clearFindings() {
@@ -6032,22 +8462,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function toggleSearchResultSelection(index, selected) {
+      const hit = state.searchResults[index];
+      if (!hit) {
+        renderSearchSelectionCount();
+        return;
+      }
+      const key = searchResultKey(hit);
       if (selected) {
-        state.selectedSearchIndexes.add(index);
+        state.selectedSearchKeys.add(key);
       } else {
-        state.selectedSearchIndexes.delete(index);
+        state.selectedSearchKeys.delete(key);
       }
       renderSearchSelectionCount();
     }
 
     function selectAllSearchResults() {
-      state.selectedSearchIndexes = new Set(state.searchResults.map((_hit, index) => index));
+      state.selectedSearchKeys = new Set(visibleSearchResultRows().map((row) => row.key));
       renderSearchResults();
     }
 
     function clearSelectedSearchResults() {
-      state.selectedSearchIndexes = new Set();
+      state.selectedSearchKeys = new Set();
       renderSearchResults();
+    }
+
+    // Re-run the classifier over the existing indexed entries (fast DB-only
+    // pass, no image re-read) so category changes show up without re-indexing.
+    async function recategorizeCase() {
+      const btn = $("recategorizeBtn");
+      if (btn) { btn.disabled = true; }
+      setNotice("Re-categorizing indexed entries (re-running the classifier, no re-indexing)...");
+      try {
+        const data = await apiPost("/api/case/recategorize", { case_path: currentCasePath() });
+        await refresh();
+        setNotice("Re-categorized " + Number(data.entries_updated || 0).toLocaleString() + " entries with the current classifier.");
+      } catch (err) {
+        setNotice("Re-categorize failed: " + err.message, true);
+      } finally {
+        if (btn) { btn.disabled = false; }
+      }
     }
 
     async function exportReport() {
@@ -6058,7 +8511,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         });
         state.lastReportPath = data.report;
         await refresh();
-        setNotice("Wrote report " + data.report + ".");
+        // Show the FULL-FILE digest: it is what sha256sum/certutil reproduce.
+        // The embedded footer digest only covers bytes before the footer.
+        setNotice(
+          "Wrote report " + data.report
+          + (data.report_file_sha256 ? " (file SHA-256 " + data.report_file_sha256 + ")" : "")
+          + "."
+        );
       } catch (err) {
         setNotice(err.message, true);
       }
@@ -6080,6 +8539,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const data = state.data;
       $("caseTitle").textContent = data.case.name;
       $("caseMeta").textContent = "Examiner: " + (data.case.examiner_name || "unknown") + " | Created: " + data.case.created_at;
+      // Category refresh is maintenance, not a daily control: only offer it
+      // when the loaded entry sample shows categories stamped by an OLDER
+      // classifier than this build (re-processing always stamps the current
+      // one, so a freshly processed case never shows the button).
+      const staleCategories = (data.entries || []).some((entry) => {
+        const source = entry.metadata_json && entry.metadata_json.category_source;
+        return source && source !== BOOTSTRAP.classifierVersion;
+      });
+      $("recategorizeBtn").hidden = !staleCategories;
       $("statEvidence").textContent = data.evidence.length;
       $("statEntries").textContent = data.entry_count;
       $("statBookmarks").textContent = data.bookmarks.length;
@@ -6094,9 +8562,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
         };
       }
       pruneSelectedEntries();
+      if (state.timeline.casePath && state.timeline.casePath !== state.casePath) {
+        state.timeline = newTimelineState();
+      }
+      if (!state.timeline.casePath) {
+        state.timeline.casePath = state.casePath;
+      }
+      if (state.timeline.built) {
+        rebuildTimelineEvents();
+      }
+      syncDateFilterInputs();
       renderDashboard();
       renderEvidence();
       renderEvidenceBrowserEntries();
+      renderTimeline();
       renderSearchEvidence();
       renderBookmarks();
       renderReport();
@@ -6139,9 +8618,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
       state.expandedTreePaths = new Map();
       state.selectedEntryIds = new Set();
+      setCurrentEntryGrid("", []);
+      setCurrentLiveGrid("", []);
       state.cat = newCategoryCache();
+      state.timeline = newTimelineState();
       state.hex = makeHexState();
       renderHexViewer();
+      renderTimeline();
       $("bookmarksTable").innerHTML = empty("No bookmarks.");
       $("reportPreview").textContent = "{}";
       $("reportCount").textContent = "0 folders";
@@ -6229,14 +8712,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return evidenceEntryCounts(state.data.entries).get(evidenceId) || 0;
     }
 
-    function evidenceProcessingStatusHtml(item, entryCount = evidenceIndexedEntryCount(item.id)) {
+    function evidenceProcessingStatusText(item, entryCount = evidenceIndexedEntryCount(item.id)) {
       if (item.indexed_at) {
-        return '<span class="pill good">indexed</span>';
+        return "indexed";
       }
       if (item.read_file_system_requested && (Number(entryCount) > 0 || item.last_job_status === "truncated")) {
-        return '<span class="pill warn">partially indexed</span>';
+        return "partially indexed";
       }
-      return '<span class="pill warn">attached</span>';
+      return "attached";
+    }
+
+    function evidenceProcessingStatusHtml(item, entryCount = evidenceIndexedEntryCount(item.id)) {
+      const status = evidenceProcessingStatusText(item, entryCount);
+      // content_indexed === false: the latest index was run metadata-only, so
+      // Deep Search content matching cannot see this evidence. Say so where
+      // the examiner picks evidence, not just in the job log.
+      const metadataOnly = item.content_indexed === false
+        ? ' <span class="pill warn" title="The latest index for this evidence was metadata-only (Capture file content was off). Deep Search content matching is unavailable until it is re-processed with content on.">metadata-only</span>'
+        : "";
+      if (status === "indexed") {
+        return '<span class="pill good">indexed</span>' + metadataOnly;
+      }
+      if (status === "partially indexed") {
+        return '<span class="pill warn">partially indexed</span>' + metadataOnly;
+      }
+      return '<span class="pill warn">attached</span>' + metadataOnly;
     }
 
     function renderDashboardArtifactCategories(data) {
@@ -6320,8 +8820,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return currentEvidenceId || (state.data.evidence[0] && state.data.evidence[0].id) || null;
     }
 
-    function renderEvidence() {
-      const rows = state.data.evidence.map((item, index) => `
+    function evidenceGridColumns() {
+      return [
+        { key: "source", label: "Source", sortable: true, filterable: true, sortType: "text" },
+        { key: "kind", label: "Kind", sortable: true, filterable: true, sortType: "text" },
+        { key: "status", label: "Status", sortable: true, filterable: true, sortType: "text" },
+        { key: "actions", label: "", sortable: false, filterable: false, sortType: "none" }
+      ];
+    }
+
+    function evidenceGridRow(item, evidenceIndex) {
+      return {
+        item,
+        evidenceIndex,
+        values: {
+          source: compactParts([item.display_name, item.source_path, item.sha256_hex ? "SHA-256: " + item.sha256_hex : ""]),
+          kind: item.source_kind,
+          status: compactParts([evidenceProcessingStatusText(item), item.sha256_hex ? "hashed" : ""])
+        }
+      };
+    }
+
+    function renderEvidenceGridRow(row) {
+      const item = row.item;
+      return `
         <tr>
           <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span>${item.sha256_hex ? `<br><span class="muted tiny" title="SHA-256 computed ${escapeAttr(item.hashed_at || "")}">SHA-256: ${escapeHtml(item.sha256_hex)}</span>` : ""}</td>
           <td><span class="pill">${escapeHtml(item.source_kind)}</span></td>
@@ -6333,12 +8855,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
               ${processActionHtml(item)}
               ${item.source_kind === "folder" || item.source_kind === "browser_history" ? "" : `<button class="ghost" onclick="hashEvidence(${item.id})">${item.sha256_hex ? "Re-hash" : "Hash"}</button>`}
               ${item.source_kind === "image" ? `<button class="ghost" onclick="carveEvidence(${item.id})">Carve</button>` : ""}
-              <button class="ghost" onclick="bookmarkEvidence(${index})">Bookmark</button>
+              <button class="ghost" onclick="bookmarkEvidence(${row.evidenceIndex})">Bookmark</button>
               <button class="ghost danger" onclick="removeEvidence(${item.id})">Remove</button>
             </div>
           </td>
-        </tr>`).join("");
-      $("evidenceTable").innerHTML = rows ? table(["Source", "Kind", "Status", ""], rows) : empty("No evidence.");
+        </tr>`;
+    }
+
+    function renderEvidence() {
+      const rows = state.data.evidence.map((item, index) => evidenceGridRow(item, index));
+      if (rows.length === 0) {
+        $("evidenceTable").innerHTML = empty("No evidence.");
+        return;
+      }
+      const columns = evidenceGridColumns();
+      const tableResult = sortableGridTable("evidence", columns, rows, "", renderEvidenceGridRow);
+      const filterStatus = gridFilterStatusHtml("evidence", columns, tableResult.visibleRows.length, rows.length, "evidence sources");
+      $("evidenceTable").innerHTML = filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No evidence sources match the column filters."));
     }
 
     async function carveEvidence(id) {
@@ -6483,15 +9016,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     async function toggleLiveBrowse() {
       const evidence = selectedEvidenceSource();
       if (state.live.active) {
+        const previous = currentAnalyzeLocation();
         state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
         renderEvidenceBrowserEntries();
         setNotice("Live browse off.");
+        commitAnalyzeNavigation(previous);
         return;
       }
       if (!supportsLiveBrowseEvidence(evidence)) {
         setNotice(liveBrowseUnavailableMessage(evidence), true);
         return;
       }
+      const previous = currentAnalyzeLocation();
       setNotice(evidence.source_kind === "image"
         ? "Reading volumes from " + evidence.display_name + "..."
         : "Opening live view for " + evidence.display_name + "...");
@@ -6506,6 +9042,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         renderEvidenceBrowserEntries();
         setNotice(liveBrowseReadyNotice(evidence));
+        commitAnalyzeNavigation(previous);
       } catch (err) {
         state.live.active = false;
         setNotice(err.message, true);
@@ -6535,11 +9072,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderLiveBrowse();
     }
 
-    async function liveSelectDir(volume, path) {
+    async function liveSelectDir(volume, path, recordNavigation = true) {
+      const previous = currentAnalyzeLocation();
       try { await liveLoadDir(volume, path); } catch (err) { setNotice(err.message, true); return; }
       state.live.selKey = liveKey(volume, path);
       state.live.expanded.add(state.live.selKey);
       renderLiveBrowse();
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
     }
 
     function liveChildPath(path, name) {
@@ -6561,6 +9104,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     async function openLiveRawDevice() {
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      state.hex.byteContext = "filesystem";
       state.hex.raw = {
         evidenceId: state.live.evidenceId,
         name: "Whole device (raw)",
@@ -6583,6 +9127,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const startOffset = Number(volume.start_offset || 0);
       state.hex = makeHexState(null, startOffset, numberValue("hexLength", 512));
+      state.hex.byteContext = "filesystem";
       state.hex.raw = {
         evidenceId: state.live.evidenceId,
         name: volume.name + " raw bytes",
@@ -6708,7 +9253,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           evidence_id: state.live.evidenceId,
           volume: volume,
           path: path,
-          folder_name: "Live Browse"
+          folder_name: "Live Browse",
+          max_entries: currentRecursiveBookmarkLimit()
         });
         await refresh();
         state.live.active = true;
@@ -6725,6 +9271,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // ---- Live selection (checkboxes, ranges) and bulk actions ----
 
     function visibleLiveEntries() {
+      if (state.currentLiveGrid && state.currentLiveGrid.gridId === "live") {
+        return state.currentLiveGrid.items || [];
+      }
       const selected = state.live.selKey;
       if (!selected) {
         return [];
@@ -6738,6 +9287,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         is_dir: entry.is_dir,
         symlink: Boolean(entry.symlink)
       }));
+    }
+
+    function selectedVisibleLiveItems() {
+      const selected = state.live && state.live.selected ? state.live.selected : new Map();
+      return visibleLiveEntries().filter((item) => selected.has(liveKey(item.volume, item.path)));
     }
 
     function setLiveSelection(item, selected) {
@@ -6812,7 +9366,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function bookmarkSelectedLive() {
       hideContextMenu();
-      const items = Array.from(state.live.selected.values());
+      const items = selectedVisibleLiveItems();
       if (items.length === 0) {
         setNotice("No live items selected.", true);
         return;
@@ -6839,7 +9393,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function exportSelectedLive() {
       hideContextMenu();
-      const items = Array.from(state.live.selected.values());
+      const items = selectedVisibleLiveItems();
       if (items.length === 0) {
         setNotice("No live items selected.", true);
         return;
@@ -6919,6 +9473,37 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    // Right-click a browser profile folder in Live Browse (a Firefox profile
+    // dir, or a Chromium "Default"/"Profile N" dir) to parse its real history/
+    // bookmarks/logins/cookies straight out of the image - no manual export
+    // step. Stages the folder server-side into a temp dir, runs the existing
+    // History/places.sqlite parser against it, and cleans up automatically
+    // (see api_import_history_from_image in kdft-ui).
+    async function importLiveFolderAsBrowserHistory(volume, path, name) {
+      hideContextMenu();
+      setNotice("Importing browser history from " + (name || path) + "...");
+      try {
+        const data = await apiPost("/api/history/import-from-image", {
+          case_path: currentCasePath(),
+          evidence_id: state.live.evidenceId,
+          volume: volume,
+          image_path: path,
+          max_visits: nonNegativeNumberValue("historyMaxVisits", 0),
+          evidence_name: name || undefined
+        });
+        await refresh();
+        setNotice(
+          "Imported browser history from " + (name || path) + ": " +
+          data.entries_indexed.toLocaleString() + " record(s) (" +
+          data.visits_indexed.toLocaleString() + " visits, " +
+          data.bookmarks_indexed.toLocaleString() + " bookmarks)." +
+          (data.truncated ? " Stopped at the visit cap - raise Max visits in Add Evidence for full coverage." : "")
+        );
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
     // ---- Live context menu ----
 
     function hideContextMenu() {
@@ -6942,13 +9527,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const escPath = escapeAttr(escapeJs(path));
       const escName = escapeAttr(escapeJs(name));
       const args = `${volume}, '${escPath}', '${escName}'`;
-      const selCount = state.live.selected.size;
+      const selCount = selectedVisibleLiveItems().length;
       const rows = [];
       if (isDir) {
         rows.push(ctxItem("Open folder", `liveSelectDir(${volume}, '${escPath}')`));
         rows.push(ctxItem("Bookmark folder", `bookmarkLiveItem(${args}, true)`));
         rows.push(ctxItem("Bookmark folder (recursive)", `bookmarkLiveFolderRecursive(${args})`));
         rows.push(ctxItem("Export folder (recursive)", `exportLiveTree(${args})`));
+        rows.push(ctxItem("Import as browser history", `importLiveFolderAsBrowserHistory(${volume}, '${escPath}', '${escName}')`));
       } else {
         rows.push(ctxItem("View bytes", `openLiveFile(${args})`));
         rows.push(ctxItem("Bookmark file", `bookmarkLiveItem(${args}, false)`));
@@ -6974,7 +9560,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function entrySelectionCtxRows(rows) {
-      const selCount = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
+      const selCount = selectedEntriesForActions().length;
       if (selCount > 0) {
         rows.push('<div class="sep"></div>');
         rows.push(ctxItem("Bookmark selected (" + selCount + ")", "bookmarkSelectedEntries()"));
@@ -7005,6 +9591,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } else {
         rows.push(ctxItem("View bytes", `openEntry(${entryId})`));
         rows.push(ctxItem("Details", `selectBrowserEntry(${entryId})`));
+        if (canOpenEntryExternally(entry)) {
+          rows.push(ctxItem("Open file", `openSelectedEntryExternal(${entryId})`));
+        }
+        if (entry.entry_kind === "file" && isPromotableDiskImageEntry(entry, evidenceSourceForEntry(entry))) {
+          rows.push(ctxItem("Analyze image", `analyzeDiskImageEntry(${entryId})`));
+        }
         rows.push(ctxItem("Bookmark", `bookmarkEntry(${entryId})`));
         if (entry.entry_kind === "file") {
           rows.push(ctxItem(recoveryActionText(entry).button, `recoverEntry(${entryId})`));
@@ -7013,6 +9605,34 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       entrySelectionCtxRows(rows);
       openContextMenu(menu, rows, event);
+    }
+
+    // With in-lane Source/Bookmark buttons removed, right-click is the
+    // action surface for search hits (row click still navigates to source).
+    function showSearchResultContextMenu(event, index) {
+      const menu = $("ctxMenu");
+      if (!menu || !Number.isFinite(index)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      openContextMenu(menu, [
+        ctxItem("Go to source", `goToSearchResult(${index})`),
+        ctxItem("Bookmark hit", `bookmarkSearchResult(${index})`)
+      ], event);
+    }
+
+    function showRawHitContextMenu(event, index) {
+      const menu = $("ctxMenu");
+      if (!menu || !Number.isFinite(index)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      openContextMenu(menu, [
+        ctxItem("Open in hex viewer", `openRawHitInHex(${index})`),
+        ctxItem("Bookmark hit", `bookmarkRawSearchHit(${index})`)
+      ], event);
     }
 
     function showFolderContextMenu(event, path, idxDir, entryId) {
@@ -7067,6 +9687,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const categoryRow = target.closest("[data-category-key]");
       if (categoryRow) {
         showCategoryContextMenu(event, categoryRow.dataset.categoryKey || "");
+        return;
+      }
+      // Search-result and bitwise-hit rows come BEFORE the generic entry-id
+      // branch: with in-lane buttons removed, right-click is their action
+      // surface, and search rows also carry data-entry-id.
+      const searchRow = target.closest("[data-search-index]");
+      if (searchRow) {
+        showSearchResultContextMenu(event, Number(searchRow.dataset.searchIndex));
+        return;
+      }
+      const rawHitRow = target.closest("[data-raw-hit-index]");
+      if (rawHitRow) {
+        showRawHitContextMenu(event, Number(rawHitRow.dataset.rawHitIndex));
+        return;
+      }
+      const timelineRow = target.closest("[data-timeline-event-index]");
+      if (timelineRow) {
+        const entryId = Number(timelineRow.dataset.entryId);
+        if (Number.isFinite(entryId)) {
+          showTimelineContextMenu(event, entryId, timelineRow.dataset.timelineEventIndex);
+        }
         return;
       }
       const entryRow = target.closest("[data-entry-id]");
@@ -7148,6 +9789,61 @@ const INDEX_HTML: &str = r###"<!doctype html>
       });
     }
 
+    function liveGridColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" }
+      ];
+    }
+
+    function liveGridRow(entry, selVolume, selPath, viewedPath) {
+      const childPath = liveChildPath(selPath, entry.name);
+      const type = entry.symlink ? "Symlink" : (entry.is_dir ? "Folder" : "File");
+      const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
+      const modified = entry.modified_utc || entry.created_utc || "";
+      return {
+        entry,
+        item: {
+          volume: selVolume,
+          path: childPath,
+          name: entry.name,
+          is_dir: entry.is_dir,
+          symlink: Boolean(entry.symlink)
+        },
+        key: liveKey(selVolume, childPath),
+        viewed: viewedPath === childPath,
+        values: {
+          name: entry.name,
+          type,
+          size,
+          modified
+        },
+        sortValues: {
+          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+          modified: Date.parse(modified)
+        }
+      };
+    }
+
+    function renderLiveGridRow(row) {
+      const entry = row.entry;
+      const escChild = escapeAttr(escapeJs(row.item.path));
+      const escName = escapeAttr(escapeJs(entry.name));
+      const isChecked = state.live.selected.has(row.key);
+      const rowClasses = "entry-row" + (isChecked ? " multi-selected" : "") + (row.viewed ? " selected" : "");
+      const rowArgs = `event, ${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, ${entry.symlink ? "true" : "false"}`;
+      return `<tr class="${rowClasses}" onclick="handleLiveRowClick(${rowArgs})" oncontextmenu="showLiveContextMenu(${rowArgs})">
+          <td><input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleLiveSelection(${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, this.checked, event)"></td>
+          <td><span class="entry-name">${escapeHtml(entry.name)}</span></td>
+          <td class="entry-kind">${escapeHtml(row.values.type)}</td>
+          <td class="entry-size">${row.values.size}</td>
+          <td class="entry-time">${escapeHtml(row.values.modified)}</td>
+        </tr>`;
+    }
+
     function renderLiveBrowse() {
       renderTreeModeControls();
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
@@ -7176,6 +9872,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <span class="tree-label">${escapeHtml(volume.name)} <span class="muted tiny">${escapeHtml(volume.filesystem)}</span></span>
           <span class="muted tiny" onclick="event.stopPropagation(); openLiveVolumeRaw(${volume.index})">View raw bytes</span>
         </button>`);
+        if (volume.bitlocker) {
+          rows.push(bitlockerStatusRow(volume));
+        }
         if (volume.browsable && expanded) {
           renderLiveDirRows(volume.index, "/", 1, rows);
         }
@@ -7190,34 +9889,170 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("folderTitle").textContent = selected ? selPath : "Select a volume";
       if (!selected) {
         $("entryTable").innerHTML = empty("Select a volume or folder on the left to browse it live.");
+        setCurrentLiveGrid("live", []);
+        renderSelectionCount();
         return;
       }
       const viewedPath = state.hex.live && state.hex.live.volume === selVolume ? state.hex.live.path : null;
-      const contentRows = entries.map((entry) => {
-        const childPath = liveChildPath(selPath, entry.name);
-        const escChild = escapeAttr(escapeJs(childPath));
-        const escName = escapeAttr(escapeJs(entry.name));
-        const key = liveKey(selVolume, childPath);
-        const isChecked = state.live.selected.has(key);
-        const rowClasses = "entry-row" + (isChecked ? " multi-selected" : "") + (viewedPath === childPath ? " selected" : "");
-        const rowArgs = `event, ${selVolume}, '${escChild}', '${escName}', ${entry.is_dir}, ${entry.symlink ? "true" : "false"}`;
-        return `<tr class="${rowClasses}" onclick="handleLiveRowClick(${rowArgs})" oncontextmenu="showLiveContextMenu(${rowArgs})">
-          <td><input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleLiveSelection(${selVolume}, '${escChild}', '${escName}', ${entry.is_dir}, this.checked, event)"></td>
-          <td><span class="entry-name">${escapeHtml(entry.name)}</span></td>
-          <td class="entry-kind">${entry.symlink ? "Symlink" : (entry.is_dir ? "Folder" : "File")}</td>
-          <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
-          <td class="entry-time">${escapeHtml(entry.modified_utc || entry.created_utc || "")}</td>
-        </tr>`;
-      }).join("");
-      $("selectedCount").textContent = state.live.selected.size + " selected";
-      updateSelectedActionControls();
+      const columns = liveGridColumns();
+      const tableResult = sortableGridTable("live", columns, entries.map((entry) => liveGridRow(entry, selVolume, selPath, viewedPath)), "live-table", renderLiveGridRow);
+      setCurrentLiveGrid("live", tableResult.visibleRows.map((row) => row.item));
+      renderSelectionCount();
       const caveat = evidence && evidence.source_kind === "folder"
         ? `<div class="analysis-status">Live view reads the current disk state (not a preserved snapshot).</div>`
         : "";
       const hint = caveat + `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders can bookmark or export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
-      $("entryTable").innerHTML = contentRows
-        ? hint + table(["", "Name", "Type", "Size", "Modified"], contentRows, "live-table")
+      const filterStatus = gridFilterStatusHtml("live", columns, tableResult.visibleRows.length, entries.length, "items");
+      $("entryTable").innerHTML = entries.length
+        ? hint + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No live items match the column filters."))
         : empty("This folder is empty.");
+    }
+
+    // BitLocker: honest status line + unlock affordance for a locked volume.
+    // The decrypt layer is read-only over the evidence; the recovery key/password
+    // is held in memory only (state.bitlocker.unlock) for the browse session and
+    // never written to localStorage, the case DB, notices, or logs.
+    function bitlockerStatusRow(volume) {
+      const bl = volume.bitlocker || {};
+      const method = bl.encryption_method ? (bl.encryption_method.description || bl.encryption_method.raw || "") : "";
+      const protectors = Array.isArray(bl.protectors)
+        ? bl.protectors.map((p) => (p && (p.kind || p.label || p.raw)) || "").filter(Boolean).join(", ")
+        : "";
+      const hasCredentialProtector = bl.can_unlock_with_recovery_key || bl.can_unlock_with_password;
+      // decrypt_supported === false means the cipher was identified but this
+      // build's decrypt layer refuses it (only AES-128-CBC with/without the
+      // Elephant diffuser is validated); a credential cannot help until then,
+      // so say that honestly instead of offering a doomed unlock.
+      const cipherUnsupported = bl.decrypt_supported === false;
+      const canUnlock = hasCredentialProtector && !cipherUnsupported;
+      const unlocked = state.bitlocker && state.bitlocker.active && Number(state.bitlocker.volumeIndex) === Number(volume.index);
+      const action = unlocked
+        ? `<button class="ghost tiny" onclick="event.stopPropagation(); lockBitlockerVolume()">Lock (forget key)</button>`
+        : (canUnlock
+          ? `<button class="ghost tiny" onclick="event.stopPropagation(); unlockBitlockerVolume(${volume.index})">Unlock &amp; browse</button>`
+          : (cipherUnsupported
+            ? `<span class="muted tiny">Detected, but this build cannot decrypt ${escapeHtml(String(method || "this cipher"))} yet (decrypt is limited to AES-128-CBC &plusmn; diffuser); a recovery key/password will not help until then</span>`
+            : `<span class="muted tiny">Cannot decrypt (no recovery-key/password protector${bl.tpm_only ? "; TPM-only" : ""})</span>`));
+      return `<div class="tree-row bitlocker-info" style="--depth:1">
+        <span class="tree-toggle"></span>
+        <span class="tree-label"><span class="muted tiny">${escapeHtml(bl.status || "BitLocker volume")}${method ? " - " + escapeHtml(String(method)) : ""}${protectors ? " - " + escapeHtml(protectors) : ""}</span></span>
+        ${action}
+      </div>`;
+    }
+
+    async function unlockBitlockerVolume(volumeIndex) {
+      const which = window.prompt("BitLocker unlock - enter 'r' for a 48-digit recovery key, or 'p' for a password:", "r");
+      if (which == null) {
+        return;
+      }
+      const kind = which.trim().toLowerCase().startsWith("p") ? "password" : "recovery_key";
+      const value = window.prompt(
+        kind === "password" ? "Enter the BitLocker password:" : "Enter the 48-digit recovery key (six-digit groups separated by dashes):",
+        ""
+      );
+      if (value == null || !value.trim()) {
+        setNotice("BitLocker unlock cancelled.", true);
+        return;
+      }
+      setNotice("Unlocking BitLocker volume " + volumeIndex + " (key used for this request, held in memory only)...");
+      try {
+        const data = await apiPost("/api/image/bitlocker/unlock/list", {
+          case_path: currentCasePath(),
+          evidence_id: state.live.evidenceId,
+          volume_index: Number(volumeIndex),
+          unlock: { type: kind, value: value },
+          dir_path: "/"
+        });
+        state.bitlocker = { active: true, volumeIndex: Number(volumeIndex), unlock: { type: kind, value: value }, path: "/", entries: data.entries || [], preview: null };
+        renderLiveBrowse();
+        renderBitlockerEntries();
+        setNotice("Unlocked BitLocker volume " + volumeIndex + ": " + (data.entries || []).length + " root entries. Use Lock to clear the key from memory.");
+      } catch (err) {
+        setNotice("BitLocker unlock failed: " + err.message, true);
+      }
+    }
+
+    function lockBitlockerVolume() {
+      if (state.bitlocker && state.bitlocker.unlock) {
+        state.bitlocker.unlock.value = ""; // best-effort scrub before dropping
+      }
+      state.bitlocker = null;
+      renderLiveBrowse();
+      setNotice("BitLocker volume locked - the key was cleared from memory.");
+    }
+
+    async function bitlockerDrill(path) {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) {
+        return;
+      }
+      try {
+        const data = await apiPost("/api/image/bitlocker/unlock/list", {
+          case_path: currentCasePath(),
+          evidence_id: state.live.evidenceId,
+          volume_index: bl.volumeIndex,
+          unlock: bl.unlock,
+          dir_path: path
+        });
+        bl.path = path;
+        bl.entries = data.entries || [];
+        bl.preview = null;
+        renderBitlockerEntries();
+      } catch (err) {
+        setNotice("BitLocker browse failed: " + err.message, true);
+      }
+    }
+
+    async function openBitlockerFileBytes(path, name) {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) {
+        return;
+      }
+      try {
+        const data = await apiPost("/api/image/bitlocker/unlock/bytes", {
+          case_path: currentCasePath(),
+          evidence_id: state.live.evidenceId,
+          volume_index: bl.volumeIndex,
+          unlock: bl.unlock,
+          file_path: path,
+          offset: 0,
+          length: 256
+        });
+        const bytes = data.bytes || [];
+        bl.preview = { name: name, offset: 0, hex: bytes.map(byteHex).join(" "), ascii: printableAsciiPreview(bytes) };
+        renderBitlockerEntries();
+        setNotice("Read " + (data.bytes_read || bytes.length) + " bytes of " + name + " (total " + formatBytes(data.total_size || 0) + ").");
+      } catch (err) {
+        setNotice("BitLocker byte read failed: " + err.message, true);
+      }
+    }
+
+    function renderBitlockerEntries() {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) {
+        return;
+      }
+      $("folderTitle").textContent = "BitLocker vol " + bl.volumeIndex + " : " + (bl.path || "/");
+      const parent = bl.path && bl.path !== "/" ? (bl.path.replace(/\/[^\/]*$/, "") || "/") : null;
+      const rows = [];
+      if (parent !== null) {
+        rows.push(`<tr><td colspan="3"><button class="ghost tiny" onclick="bitlockerDrill('${escapeAttr(escapeJs(parent))}')">.. up</button></td></tr>`);
+      }
+      (bl.entries || []).forEach((entry) => {
+        const child = liveChildPath(bl.path || "/", entry.name);
+        if (entry.is_dir) {
+          rows.push(`<tr><td><button class="ghost tiny" onclick="bitlockerDrill('${escapeAttr(escapeJs(child))}')">${escapeHtml(entry.name)}/</button></td><td>Folder</td><td></td></tr>`);
+        } else {
+          rows.push(`<tr><td><button class="ghost tiny" onclick="openBitlockerFileBytes('${escapeAttr(escapeJs(child))}','${escapeAttr(escapeJs(entry.name))}')">${escapeHtml(entry.name)}</button></td><td>File</td><td>${entry.size_bytes == null ? "" : escapeHtml(formatBytes(entry.size_bytes))}</td></tr>`);
+        }
+      });
+      const dump = bl.preview
+        ? `<div class="analysis-status">First bytes of ${escapeHtml(bl.preview.name)} (offset ${bl.preview.offset}):<br><span class="mono tiny">${escapeHtml(bl.preview.hex)}</span><br><span class="mono tiny">${escapeHtml(bl.preview.ascii)}</span></div>`
+        : "";
+      $("entryTable").innerHTML =
+        `<div class="analysis-status">Decrypted BitLocker NTFS volume - read-only, key held in memory only. <button class="ghost tiny" onclick="lockBitlockerVolume()">Lock (forget key)</button></div>` +
+        dump +
+        `<table class="live-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead><tbody>${rows.join("") || '<tr><td colspan="3" class="muted">Empty folder.</td></tr>'}</tbody></table>`;
     }
 
     // Lazy indexed browse: for cases too big to ship every entry, load folders
@@ -7292,6 +10127,95 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return parent === "/" ? "/" + name : parent + "/" + name;
     }
 
+    function indexedGridColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "ext", label: "Extension", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
+        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+        { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
+      ];
+    }
+
+    function indexedGridRow(child) {
+      const entry = child.entry_id != null ? idxChildToEntry(child) : null;
+      const type = child.is_dir ? "Folder" : (entry ? filesystemTypeLabel(entry) : "File");
+      const size = child.size_bytes == null ? "" : formatBytes(child.size_bytes);
+      const flags = child.is_deleted ? "deleted" : "";
+      const artifactTime = artifactEventTime(entry);
+      const created = filesystemCreatedTime(entry);
+      const modified = filesystemModifiedTime(entry);
+      const accessed = filesystemAccessedTime(entry);
+      const mftModified = filesystemMftModifiedTime(entry);
+      const sha256 = filesystemFileSha256(entry);
+      return {
+        child,
+        entry,
+        selectable: !child.is_dir && child.entry_id != null,
+        values: {
+          name: compactParts([child.name, flags]),
+          type,
+          ext: filesystemFileExtension(entry),
+          size,
+          artifactTime,
+          created,
+          modified,
+          accessed,
+          mftModified,
+          sha256
+        },
+        sortValues: {
+          size: child.size_bytes == null ? NaN : Number(child.size_bytes),
+          artifactTime: Date.parse(artifactTime),
+          created: Date.parse(created),
+          modified: Date.parse(modified),
+          accessed: Date.parse(accessed),
+          mftModified: Date.parse(mftModified)
+        }
+      };
+    }
+
+    function renderIndexedGridRow(row) {
+      const child = row.child;
+      const selectable = row.selectable;
+      const isChecked = selectable && state.selectedEntryIds.has(child.entry_id);
+      const checkbox = selectable
+        ? `<input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleEntrySelection(${child.entry_id}, this.checked, event)">`
+        : "";
+      const nameCell = `<span class="entry-name">${escapeHtml(child.name)}</span>`;
+      const flags = child.is_deleted ? '<span class="pill bad">deleted</span>' : "";
+      // No in-lane buttons: rows are worked via selection + right-click.
+      const rowClick = child.is_dir
+        ? ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`
+        : (selectable ? ` style="cursor:pointer" onclick="handleEntryRowClick(event, ${child.entry_id})"` : "");
+      const ctxAttr = child.is_dir
+        ? ` data-idx-dir="${escapeAttr(child.logical_path)}"`
+        : (selectable ? ` data-entry-id="${child.entry_id}"` : "");
+      return `<tr class="entry-row${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
+          <td>${checkbox}</td>
+          <td>${nameCell} ${flags}</td>
+          <td class="entry-kind">${escapeHtml(row.values.type)}</td>
+          <td class="entry-ext">${escapeHtml(row.values.ext)}</td>
+          <td class="entry-size">${row.values.size}</td>
+          <td class="entry-time entry-artifact-time" title="${escapeAttr(row.values.artifactTime)}">${escapeHtml(row.values.artifactTime)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
+          <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
+        </tr>`;
+    }
+
+    function visibleIndexedGridRows(children) {
+      return visibleGridRows("indexed", indexedGridColumns(), children.map(indexedGridRow));
+    }
+
     function renderIdxDirRows(path, depth, rows) {
       const children = state.idx.dirCache[path] || [];
       children.filter((child) => child.is_dir).forEach((child) => {
@@ -7340,37 +10264,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const selPath = state.idx.selPath || "/";
       const children = state.idx.dirCache[selPath] || [];
       $("folderTitle").textContent = displayPath(selPath);
-      const contentRows = children.map((child) => {
-        const selectable = !child.is_dir && child.entry_id != null;
-        const isChecked = selectable && state.selectedEntryIds.has(child.entry_id);
-        const checkbox = selectable
-          ? `<input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleEntrySelection(${child.entry_id}, this.checked, event)">`
-          : "";
-        const nameCell = `<span class="entry-name">${escapeHtml(child.name)}</span>`;
-        const flags = child.is_deleted ? '<span class="pill bad">deleted</span>' : "";
-        const actions = selectable
-          ? `<div class="toolbar">
-              <button class="secondary" onclick="event.stopPropagation(); openEntry(${child.entry_id})">View</button>
-              <button class="ghost" onclick="event.stopPropagation(); bookmarkEntry(${child.entry_id})">Bookmark</button>
-            </div>`
-          : "";
-        const rowClick = child.is_dir
-          ? ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`
-          : (selectable ? ` style="cursor:pointer" onclick="handleEntryRowClick(event, ${child.entry_id})"` : "");
-        const ctxAttr = child.is_dir
-          ? ` data-idx-dir="${escapeAttr(child.logical_path)}"`
-          : (selectable ? ` data-entry-id="${child.entry_id}"` : "");
-        return `<tr class="entry-row${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
-          <td>${checkbox}</td>
-          <td>${nameCell} ${flags}</td>
-          <td class="entry-kind">${child.is_dir ? "Folder" : "File"}</td>
-          <td class="entry-size">${child.size_bytes == null ? "" : formatBytes(child.size_bytes)}</td>
-          <td class="actions">${actions}</td>
-        </tr>`;
-      }).join("");
+      const columns = indexedGridColumns();
+      const gridRows = children.map(indexedGridRow);
+      const tableResult = sortableGridTable("indexed", columns, gridRows, "idx-table", renderIndexedGridRow);
+      setCurrentEntryGrid("indexed", tableResult.visibleRows.filter((row) => row.selectable).map((row) => row.entry).filter(Boolean));
       const banner = `<div class="analysis-status">Large case (${(state.data.entry_count || 0).toLocaleString()} entries): browsing the full index folder by folder. Open folders on the left; use Deep Search to find files by name or content.</div>`;
-      $("entryTable").innerHTML = banner + (contentRows
-        ? table(["", "Name", "Type", "Size", ""], contentRows, "idx-table")
+      const filterStatus = gridFilterStatusHtml("indexed", columns, tableResult.visibleRows.length, children.length, "items");
+      $("entryTable").innerHTML = banner + (children.length
+        ? filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No indexed items match the column filters."))
         : empty("This folder has no direct children."));
       renderSelectionCount();
     }
@@ -7395,6 +10296,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           state.idx = { evidenceId: state.browserState.evidenceId, dirCache: {}, expanded: new Set(["/"]), selPath: "/" };
           $("filesystemTree").innerHTML = empty("Loading directory tree...");
           $("entryTable").innerHTML = empty("Loading...");
+          setCurrentEntryGrid("indexed", []);
           renderTreeModeControls();
           idxRestorePath(state.browserState.selectedPath).then(renderIndexedBrowse).catch((err) => setNotice(err.message, true));
           renderHexViewer();
@@ -7411,6 +10313,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         $("entryTable").innerHTML = empty("Select an evidence source.");
         $("treeCount").textContent = "0";
         $("folderTitle").textContent = "/";
+        setCurrentEntryGrid("", []);
         renderHexViewer();
         return;
       }
@@ -7464,33 +10367,44 @@ const INDEX_HTML: &str = r###"<!doctype html>
         .map((entry) => ({ ...entry, logical_path: normalizeLogicalPath(entry.logical_path) }));
     }
 
-    function renderAttachedEvidenceSource(evidence) {
-      if (!evidence) {
-        $("filesystemTree").innerHTML = empty("No evidence selected.");
-        $("treeCount").textContent = "0";
-        $("folderTitle").textContent = "/";
-        $("entryTable").innerHTML = empty("No evidence selected.");
-        return;
-      }
-      $("treeCount").textContent = "1";
-      $("folderTitle").textContent = "Attached Evidence";
-      $("filesystemTree").innerHTML = `<button class="tree-row active" style="--depth:0" title="${escapeAttr(evidence.source_path)}">
-        <span class="tree-toggle"></span>
-        <span class="tree-label">${escapeHtml(evidence.display_name)}</span>
-        <span class="muted tiny">source</span>
-      </button>`;
-      const evidenceIndex = state.data.evidence.findIndex((item) => item.id === evidence.id);
-      const bookmark = evidenceIndex >= 0
-        ? `<button class="ghost" onclick="bookmarkEvidence(${evidenceIndex})">Bookmark</button>`
+    function attachedEvidenceGridColumns() {
+      return [
+        { key: "source", label: "Attached Source", sortable: true, filterable: true, sortType: "text" },
+        { key: "kind", label: "Kind", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "attached", label: "Attached", sortable: true, filterable: true, sortType: "time" },
+        { key: "actions", label: "", sortable: false, filterable: false, sortType: "none" }
+      ];
+    }
+
+    function attachedEvidenceGridRow(evidence, evidenceIndex, status) {
+      const size = evidence.size_bytes == null ? "" : formatBytes(evidence.size_bytes);
+      return {
+        evidence,
+        evidenceIndex,
+        status,
+        values: {
+          source: compactParts([evidence.display_name, evidence.source_path]),
+          kind: compactParts([evidence.source_kind, evidenceProcessingStatusText(evidence)]),
+          size,
+          attached: evidence.attached_at || ""
+        },
+        sortValues: {
+          size: evidence.size_bytes == null ? NaN : Number(evidence.size_bytes),
+          attached: Date.parse(evidence.attached_at || "")
+        }
+      };
+    }
+
+    function renderAttachedEvidenceGridRow(row) {
+      const evidence = row.evidence;
+      const bookmark = row.evidenceIndex >= 0
+        ? `<button class="ghost" onclick="bookmarkEvidence(${row.evidenceIndex})">Bookmark</button>`
         : "";
-      const status = evidenceProcessingStatusHtml(evidence);
-      const liveNotice = (evidence.source_kind === "folder" || evidence.source_kind === "file") && !evidence.indexed_at
-        ? `<div class="analysis-status">Live browse shows this ${evidence.source_kind === "folder" ? "folder" : "file"} as it is on disk right now. Process (Read File System) to index it for search, categories, and reports.</div>`
-        : "";
-      const rows = `
+      return `
         <tr class="entry-row">
           <td><strong>${escapeHtml(evidence.display_name)}</strong><br><span class="muted tiny">${escapeHtml(evidence.source_path)}</span></td>
-          <td><span class="pill">${escapeHtml(evidence.source_kind)}</span> ${status}</td>
+          <td><span class="pill">${escapeHtml(evidence.source_kind)}</span> ${row.status}</td>
           <td>${evidence.size_bytes == null ? "" : formatBytes(evidence.size_bytes)}</td>
           <td>${escapeHtml(evidence.attached_at || "")}</td>
           <td class="actions">
@@ -7502,7 +10416,35 @@ const INDEX_HTML: &str = r###"<!doctype html>
             </div>
           </td>
         </tr>`;
-      $("entryTable").innerHTML = liveNotice + table(["Attached Source", "Kind", "Size", "Attached", ""], rows);
+    }
+
+    function renderAttachedEvidenceSource(evidence) {
+      if (!evidence) {
+        $("filesystemTree").innerHTML = empty("No evidence selected.");
+        $("treeCount").textContent = "0";
+        $("folderTitle").textContent = "/";
+        $("entryTable").innerHTML = empty("No evidence selected.");
+        setCurrentEntryGrid("attached", []);
+        return;
+      }
+      $("treeCount").textContent = "1";
+      $("folderTitle").textContent = "Attached Evidence";
+      $("filesystemTree").innerHTML = `<button class="tree-row active" style="--depth:0" title="${escapeAttr(evidence.source_path)}">
+        <span class="tree-toggle"></span>
+        <span class="tree-label">${escapeHtml(evidence.display_name)}</span>
+        <span class="muted tiny">source</span>
+      </button>`;
+      const evidenceIndex = state.data.evidence.findIndex((item) => item.id === evidence.id);
+      const status = evidenceProcessingStatusHtml(evidence);
+      const liveNotice = (evidence.source_kind === "folder" || evidence.source_kind === "file") && !evidence.indexed_at
+        ? `<div class="analysis-status">Live browse shows this ${evidence.source_kind === "folder" ? "folder" : "file"} as it is on disk right now. Process (Read File System) to index it for search, categories, and reports.</div>`
+        : "";
+      const columns = attachedEvidenceGridColumns();
+      const rows = [attachedEvidenceGridRow(evidence, evidenceIndex, status)];
+      const tableResult = sortableGridTable("attached", columns, rows, "", renderAttachedEvidenceGridRow);
+      setCurrentEntryGrid("attached", []);
+      const filterStatus = gridFilterStatusHtml("attached", columns, tableResult.visibleRows.length, rows.length, "sources");
+      $("entryTable").innerHTML = liveNotice + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("Attached source does not match the column filters."));
       renderSelectionCount();
     }
 
@@ -7557,9 +10499,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
         && state.browserState.evidenceId);
     }
 
+    // Categories are a case-wide artifact classification, not tied to any one
+    // evidence source - the sidebar counts (category_entry_counts, backend)
+    // already aggregate across every evidence source in the case. The grid
+    // used to silently scope to whichever single evidence source happened to
+    // be "selected" elsewhere (tree/live-browse navigation), which made
+    // newly-imported evidence (e.g. a browser-history import) invisible under
+    // its own category unless the examiner separately switched evidence
+    // source - confusing, and inconsistent with the sidebar counts they were
+    // already looking at. "all" is a sentinel meaning "every evidence source
+    // in this case", handled by loadServerCategoryEntries() below.
+    const ALL_EVIDENCE_CATEGORY_SCOPE = "all";
+
     function ensureCategoryCacheForSelection() {
       const key = state.browserState.selectedCategory || "";
-      const evidenceId = state.browserState.evidenceId || null;
+      const evidenceId = ALL_EVIDENCE_CATEGORY_SCOPE;
       if (state.cat.evidenceId !== evidenceId || state.cat.key !== key) {
         state.cat = newCategoryCache(evidenceId, key);
       }
@@ -7591,18 +10545,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
       try {
         const params = {
           case_path: currentCasePath(),
-          evidence_id: cache.evidenceId,
           main: selected.main || "",
           limit: cache.pageSize,
           offset
         };
+        // "all" (every evidence source in the case) is the normal case for
+        // Categories - only send evidence_id when scoped to one source.
+        if (cache.evidenceId !== ALL_EVIDENCE_CATEGORY_SCOPE) {
+          params.evidence_id = cache.evidenceId;
+        }
         if (selected.sub) {
           params.sub = selected.sub;
         }
         const data = await apiGet("/api/entries/category", params);
         if (state.cat !== cache
           || state.browserState.treeMode !== "categories"
-          || state.browserState.evidenceId !== cache.evidenceId
           || (state.browserState.selectedCategory || "") !== cache.key) {
           cache.loading = false;
           return;
@@ -7656,6 +10613,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         $("folderTitle").textContent = selectedLabel + " | loading";
         $("entryTable").innerHTML = empty("Loading category entries...");
         loadServerCategoryEntries(true);
+        setCurrentEntryGrid("category", []);
         renderSelectionCount();
         return;
       }
@@ -7664,6 +10622,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("folderTitle").textContent = selectedLabel + " | " + total.toLocaleString() + " total";
       if (cache.error) {
         $("entryTable").innerHTML = categoryServerStatusHtml(rows, cache) + empty(cache.error);
+        setCurrentEntryGrid("category", []);
         renderSelectionCount();
         return;
       }
@@ -7673,6 +10632,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ? "No entries in this category."
           : (dateFilterActive() ? "No loaded entries in this category match the date filter." : "No entries loaded yet.");
         $("entryTable").innerHTML = status + empty(message);
+        setCurrentEntryGrid("category", []);
         renderSelectionCount();
         return;
       }
@@ -7723,18 +10683,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       ensureCategoryTreeSub(mains, "Recovery", "Unallocated space");
       const selected = state.browserState.selectedCategory || "";
       const rows = [
-        categoryTreeRow("", "All Categories", totalCount, 0, selected === "")
+        categoryTreeRow("", "All Categories", totalCount, 0, selected === "", "")
       ];
       Array.from(mains.entries())
         .sort((left, right) => left[0].localeCompare(right[0]))
         .forEach(([mainName, main]) => {
           const mainKey = categoryKey(mainName, "");
-          rows.push(categoryTreeRow(mainKey, mainName, main.count, 1, selected === mainKey));
+          rows.push(categoryTreeRow(mainKey, mainName, main.count, 1, selected === mainKey, mainName));
           Array.from(main.subs.entries())
             .sort((left, right) => left[0].localeCompare(right[0]))
             .forEach(([subName, count]) => {
               const subKey = categoryKey(mainName, subName);
-              rows.push(categoryTreeRow(subKey, subName, count, 2, selected === subKey));
+              rows.push(categoryTreeRow(subKey, subName, count, 2, selected === subKey, mainName));
             });
         });
       $("treeCount").textContent = String(Array.from(mains.values()).filter((main) => main.count > 0).length);
@@ -7751,10 +10711,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    function categoryTreeRow(key, label, count, depth, active) {
+    function categoryTreeRow(key, label, count, depth, active, iconCategory) {
+      const icon = depth === 0
+        ? svgIconHtml('<rect x="1.5" y="1.5" width="13" height="13" rx="2"/>', "category-icon", "All Categories")
+        : categoryIconHtml(iconCategory, iconCategory);
       return `<button class="tree-row${active ? " active" : ""}" style="--depth:${depth}" onclick="selectCategory('${escapeAttr(escapeJs(key))}')" data-category-key="${escapeAttr(key)}" title="${escapeAttr(categoryLabel(key) || label)}">
         <span class="tree-toggle"></span>
-        <span class="tree-label">${escapeHtml(label)}</span>
+        <span class="tree-label-row">${icon}<span class="tree-label">${escapeHtml(label)}</span></span>
         <span class="muted tiny">${Number(count).toLocaleString()}</span>
       </button>`;
     }
@@ -7768,6 +10731,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const status = truncatedEntriesNoticeHtml();
       if (rows.length === 0) {
         $("entryTable").innerHTML = status + empty("No entries in this category.");
+        setCurrentEntryGrid("category", []);
         renderSelectionCount();
         return;
       }
@@ -7782,43 +10746,107 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderCategoryRows(rows, status);
     }
 
-    function renderCategoryRows(rows, prefixHtml = "") {
-      const entryRows = rows.map((entry) => {
-        const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
-        const isChecked = state.selectedEntryIds.has(entry.id);
-        const checked = isChecked ? " checked" : "";
-        const multiSelected = isChecked ? " multi-selected" : "";
-        const evidence = selectedEvidenceSource();
-        const action = entry.entry_kind === "directory"
-          ? `<button class="secondary" onclick="event.stopPropagation(); selectFolder('${escapeAttr(escapeJs(entry.logical_path))}')">Open</button>`
-          : entry.entry_kind === "file" && isPromotableDiskImageEntry(entry, evidence)
-            ? `<button class="secondary" onclick="event.stopPropagation(); analyzeDiskImageEntry(${entry.id})">Analyze image</button>`
-            : "";
-        const recover = entry.entry_kind === "file" && isRecoveryEntry(entry)
-          ? `<button class="ghost" onclick="event.stopPropagation(); recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>`
-          : "";
-        return `
+    function categoryGridColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "ext", label: "Extension", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" },
+        { key: "offset", label: "Offset", sortable: true, filterable: true, sortType: "number" },
+        { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
+        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+        { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
+      ];
+    }
+
+    function categoryGridRow(entry) {
+      const name = entry.name || logicalName(entry.logical_path);
+      const ext = filesystemFileExtension(entry);
+      const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
+      const offset = entryPrimaryOffset(entry);
+      const artifactTime = artifactEventTime(entry);
+      const created = filesystemCreatedTime(entry);
+      const modified = filesystemModifiedTime(entry);
+      const accessed = filesystemAccessedTime(entry);
+      const mftModified = filesystemMftModifiedTime(entry);
+      const flags = entryFlagsText(entry) || "-";
+      const sha256 = filesystemFileSha256(entry);
+      return {
+        entry,
+        values: {
+          name: compactParts([name, displayPath(entry.logical_path)]),
+          category: entryCategoryLabel(entry),
+          type: activityLabel(entry),
+          ext,
+          size,
+          flags,
+          offset,
+          artifactTime,
+          created,
+          modified,
+          accessed,
+          mftModified,
+          sha256
+        },
+        sortValues: {
+          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+          offset: gridNumericValue(offset),
+          artifactTime: Date.parse(artifactTime),
+          created: Date.parse(created),
+          modified: Date.parse(modified),
+          accessed: Date.parse(accessed),
+          mftModified: Date.parse(mftModified)
+        }
+      };
+    }
+
+    // In-lane action buttons were removed deliberately (Cristina, 2026-07-13):
+    // rows are worked via selection + right-click context menu; buttons on
+    // every lane were visual noise and overlapped the time columns.
+    function renderCategoryGridRow(row) {
+      const entry = row.entry;
+      const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
+      const isChecked = state.selectedEntryIds.has(entry.id);
+      const checked = isChecked ? " checked" : "";
+      const multiSelected = isChecked ? " multi-selected" : "";
+      return `
           <tr class="entry-row${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
-            <td title="${escapeAttr(entry.logical_path)}"><span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
-            <td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}"><span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>
+            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
+            <td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}">${categoryIconHtml(entryCategory(entry).main)}<span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>
             <td class="entry-kind">${escapeHtml(activityLabel(entry))}</td>
+            <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
             <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
             <td class="entry-flags" title="${escapeAttr(entryFlagsText(entry))}">${entryFlagsHtml(entry)}</td>
             <td class="entry-offset" title="${escapeAttr(entryPrimaryOffset(entry))}">${escapeHtml(entryPrimaryOffset(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(categoryTime(entry))}">${escapeHtml(categoryTime(entry))}</td>
-            <td class="actions">
-              <div class="toolbar">
-                ${action}
-                ${recover}
-              </div>
-            </td>
+            <td class="entry-time entry-artifact-time" title="${escapeAttr(artifactEventTime(entry))}">${escapeHtml(artifactEventTime(entry))}</td>
+            <td class="entry-time" title="${escapeAttr(filesystemCreatedTime(entry))}">${escapeHtml(filesystemCreatedTime(entry))}</td>
+            <td class="entry-time" title="${escapeAttr(filesystemModifiedTime(entry))}">${escapeHtml(filesystemModifiedTime(entry))}</td>
+            <td class="entry-time" title="${escapeAttr(filesystemAccessedTime(entry))}">${escapeHtml(filesystemAccessedTime(entry))}</td>
+            <td class="entry-time" title="${escapeAttr(filesystemMftModifiedTime(entry))}">${escapeHtml(filesystemMftModifiedTime(entry))}</td>
+            <td class="entry-hash mono" title="${escapeAttr(filesystemFileSha256(entry))}">${escapeHtml(filesystemFileSha256(entry))}</td>
           </tr>`;
-      });
+    }
+
+    function visibleCategoryGridRows(rows) {
+      return visibleGridRows("category", categoryGridColumns(), rows.map(categoryGridRow));
+    }
+
+    function renderCategoryRows(rows, prefixHtml = "") {
+      const columns = categoryGridColumns();
+      const tableResult = sortableGridTable("category", columns, rows.map(categoryGridRow), "category-table", renderCategoryGridRow);
       const gridToggle = rows.every((entry) => isImageEntry(entry))
         ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Thumbnail view</button></div>`
         : "";
-      $("entryTable").innerHTML = prefixHtml + gridToggle + table(["", "Name", "Category", "Type", "Size", "Flags", "Offset", "Time", ""], entryRows.join(""), "category-table");
+      setCurrentEntryGrid("category", tableResult.visibleRows.map((row) => row.entry));
+      const filterStatus = gridFilterStatusHtml("category", columns, tableResult.visibleRows.length, rows.length, "entries");
+      $("entryTable").innerHTML = prefixHtml + gridToggle + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No entries match the column filters."));
       renderSelectionCount();
     }
 
@@ -7847,6 +10875,41 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const value = Date.parse(text);
         return Number.isFinite(value) && value >= from && value <= to;
       }));
+    }
+
+    function syncDateFilterInputs() {
+      [
+        ["dateFilterFrom", "from"],
+        ["dateFilterTo", "to"],
+        ["timelineDateFrom", "from"],
+        ["timelineDateTo", "to"]
+      ].forEach(([id, field]) => {
+        const input = $(id);
+        if (input && input.value !== (state.dateFilter[field] || "")) {
+          input.value = state.dateFilter[field] || "";
+        }
+      });
+    }
+
+    function setDateFilterValue(field, value) {
+      const key = field === "to" ? "to" : "from";
+      if (state.dateFilter[key] === value) {
+        syncDateFilterInputs();
+        return;
+      }
+      state.dateFilter[key] = value;
+      state.timeline.focusBucket = null;
+      syncDateFilterInputs();
+      renderEvidenceBrowserEntries();
+      renderTimeline();
+    }
+
+    function clearDateFilter() {
+      state.dateFilter = { from: "", to: "" };
+      state.timeline.focusBucket = null;
+      syncDateFilterInputs();
+      renderEvidenceBrowserEntries();
+      renderTimeline();
     }
 
     function isImageEntry(entry) {
@@ -7893,33 +10956,68 @@ const INDEX_HTML: &str = r###"<!doctype html>
           </div>`;
       });
       $("entryTable").innerHTML = prefixHtml + `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('list')">List view</button></div><div class="thumb-grid">${cards.join("")}</div>`;
+      setCurrentEntryGrid("category", rows);
       renderSelectionCount();
     }
 
-    function renderEmailCategoryContents(rows, prefixHtml = "") {
-      const entryRows = rows.map((entry) => {
-        const metadata = entry.metadata_json || {};
-        const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
-        const isChecked = state.selectedEntryIds.has(entry.id);
-        const checked = isChecked ? " checked" : "";
-        const multiSelected = isChecked ? " multi-selected" : "";
-        const to = firstText(metadata.email_to, metadata.email_bcc);
-        const from = firstText(metadata.email_from, metadata.email_reply_to);
-        const date = firstText(metadata.email_date, categoryTime(entry));
-        const subject = emailDisplayName(entry);
-        const body = firstText(metadata.email_body_preview, metadata.email_parser_error, "");
-        return `
+    function emailGridColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "to", label: "To", sortable: true, filterable: true, sortType: "text" },
+        { key: "from", label: "From", sortable: true, filterable: true, sortType: "text" },
+        { key: "date", label: "Date/Time", sortable: true, filterable: true, sortType: "time" },
+        { key: "subject", label: "Subject", sortable: true, filterable: true, sortType: "text" },
+        { key: "body", label: "Body", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" }
+      ];
+    }
+
+    function emailGridRow(entry) {
+      const metadata = entry.metadata_json || {};
+      const to = firstText(metadata.email_to, metadata.email_bcc);
+      const from = firstText(metadata.email_from, metadata.email_reply_to);
+      const date = firstText(metadata.email_date, categoryTime(entry));
+      const subject = emailDisplayName(entry);
+      const body = firstText(metadata.email_body_preview, metadata.email_parser_error, "");
+      const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
+      return {
+        entry,
+        values: { to, from, date, subject, body, size },
+        sortValues: {
+          date: Date.parse(date),
+          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes)
+        }
+      };
+    }
+
+    function renderEmailGridRow(row) {
+      const entry = row.entry;
+      const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
+      const isChecked = state.selectedEntryIds.has(entry.id);
+      const checked = isChecked ? " checked" : "";
+      const multiSelected = isChecked ? " multi-selected" : "";
+      return `
           <tr class="entry-row${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
-            <td class="email-cell" title="${escapeAttr(to)}">${escapeHtml(to)}</td>
-            <td class="email-cell" title="${escapeAttr(from)}">${escapeHtml(from)}</td>
-            <td class="email-cell" title="${escapeAttr(date)}">${escapeHtml(date)}</td>
-            <td class="email-cell" title="${escapeAttr(subject)}">${escapeHtml(subject)}</td>
-            <td class="email-cell email-body-cell" title="${escapeAttr(body)}">${escapeHtml(body)}</td>
+            <td class="email-cell" title="${escapeAttr(row.values.to)}">${escapeHtml(row.values.to)}</td>
+            <td class="email-cell" title="${escapeAttr(row.values.from)}">${escapeHtml(row.values.from)}</td>
+            <td class="email-cell" title="${escapeAttr(row.values.date)}">${escapeHtml(row.values.date)}</td>
+            <td class="email-cell" title="${escapeAttr(row.values.subject)}">${escapeHtml(row.values.subject)}</td>
+            <td class="email-cell email-body-cell" title="${escapeAttr(row.values.body)}">${escapeHtml(row.values.body)}</td>
             <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
           </tr>`;
-      });
-      $("entryTable").innerHTML = prefixHtml + table(["", "To", "From", "Date/Time", "Subject", "Body", "Size"], entryRows.join(""), "email-table");
+    }
+
+    function visibleEmailGridRows(rows) {
+      return visibleGridRows("email", emailGridColumns(), rows.map(emailGridRow));
+    }
+
+    function renderEmailCategoryContents(rows, prefixHtml = "") {
+      const columns = emailGridColumns();
+      const tableResult = sortableGridTable("email", columns, rows.map(emailGridRow), "email-table", renderEmailGridRow);
+      setCurrentEntryGrid("email", tableResult.visibleRows.map((row) => row.entry));
+      const filterStatus = gridFilterStatusHtml("email", columns, tableResult.visibleRows.length, rows.length, "emails");
+      $("entryTable").innerHTML = prefixHtml + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No emails match the column filters."));
       renderSelectionCount();
     }
 
@@ -8013,16 +11111,108 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function entryPrimaryOffset(entry) {
       const metadata = entry.metadata_json || {};
       const value = firstDefined(
+        metadata.resolved_decoded_media_offset,
         metadata.file_data_physical_offset,
-        metadata.file_data_logical_offset,
         metadata.mft_record_physical_offset,
-        metadata.mft_record_logical_offset,
         metadata.physical_offset,
+        metadata.file_data_logical_offset,
+        metadata.mft_record_logical_offset,
         metadata.logical_offset,
-        metadata.partition_start_offset,
-        metadata.start_offset
       );
       return formatOffsetValue(value);
+    }
+
+    // Shared icon system (Cristina: "adding icons to known files is more good looking" /
+    // "icons at the analyzed categories as well"). One mapping table per axis (category, file
+    // kind), reused everywhere: the category tree, grid Name columns, and grid Category/Type
+    // columns. Icons are inline stroke-only SVGs (currentColor) so they inherit row text color
+    // and adapt to light/dark themes with no external assets.
+    const CATEGORY_ICON_SHAPES = {
+      "Web Activity": '<circle cx="8" cy="8" r="6.5"/><path d="M1.5 8h13M8 1.5c2.2 2 2.2 11 0 13M8 1.5c-2.2 2-2.2 11 0 13"/>',
+      "Pictures and Media": '<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><circle cx="5.5" cy="6" r="1.3"/><path d="M2 12l3.5-4 2.5 2.8 2-2.3L14 12"/>',
+      "Documents and Office": '<path d="M4 1.5h5.5L12 4v10.5H4z"/><path d="M9.5 1.5V4H12"/><path d="M5.8 8h4.4M5.8 10.2h4.4"/>',
+      "Email and Communications": '<rect x="1.5" y="3" width="13" height="10" rx="1"/><path d="M2 3.8l6 5 6-5"/>',
+      "Operating System": '<circle cx="8" cy="8" r="2.3"/><path d="M8 1.8v2M8 12.2v2M14.2 8h-2M3.8 8h-2M12.3 3.7l-1.4 1.4M5.1 10.9l-1.4 1.4M12.3 12.3l-1.4-1.4M5.1 5.1L3.7 3.7"/>',
+      "Accounts and Identity": '<circle cx="8" cy="5.3" r="2.6"/><path d="M2.5 14c0-3.3 2.5-5.3 5.5-5.3s5.5 2 5.5 5.3"/>',
+      "Program Execution": '<path d="M8.6 1.5L3 9h4l-.6 5.5L13 7h-4z"/>',
+      "Recovery": '<path d="M3 8a5 5 0 1 1 1.6 3.7"/><path d="M3 11.5V8h3.5"/>',
+      "Archives and Containers": '<rect x="1.7" y="4" width="12.6" height="10" rx="1"/><path d="M1.7 7h12.6"/><path d="M6.8 4v10M9.2 4v1.4M9.2 7v1.4M9.2 10v1.4"/>',
+      "Databases": '<ellipse cx="8" cy="3.6" rx="5.5" ry="2.1"/><path d="M2.5 3.6v8.8c0 1.16 2.46 2.1 5.5 2.1s5.5-.94 5.5-2.1V3.6"/><path d="M2.5 8c0 1.16 2.46 2.1 5.5 2.1s5.5-.94 5.5-2.1"/>',
+      "Cloud and Web": '<path d="M4.8 12.5a3.3 3.3 0 0 1-.5-6.55A4 4 0 0 1 12 5a3 3 0 0 1 .8 5.9v.1"/><path d="M5 12.5h7"/>',
+      "Location and Maps": '<path d="M8 14.3S3 9.7 3 6.3a5 5 0 0 1 10 0c0 3.4-5 8-5 8z"/><circle cx="8" cy="6.2" r="1.7"/>',
+      "Mobile Devices": '<rect x="4.5" y="1.5" width="7" height="13" rx="1.2"/><path d="M6.8 12.3h2.4"/>',
+      "Development and Source Code": '<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5M9 3l-2 10"/>',
+      "Security and Encryption": '<rect x="3" y="7.3" width="10" height="7.2" rx="1"/><path d="M5 7.3V5a3 3 0 0 1 6 0v2.3"/><circle cx="8" cy="10.6" r="1"/>',
+      "Uncategorized": '<circle cx="8" cy="8" r="6.5"/><path d="M6.1 6.2a2 2 0 1 1 2.7 1.9c-.7.3-1.2.9-1.2 1.7v.3"/><circle cx="7.9" cy="11.5" r="0.15" fill="currentColor" stroke="none"/>',
+      "Other Files": '<path d="M4 1.5h5.5L12 4v10.5H4z"/><path d="M9.5 1.5V4H12"/>'
+    };
+    const DEFAULT_CATEGORY_ICON_SHAPE = '<circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none"/>';
+
+    function svgIconHtml(shape, className, title) {
+      return `<svg class="icon ${escapeAttr(className)}" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"${title ? ` role="img"` : ""}>${title ? `<title>${escapeHtml(title)}</title>` : ""}${shape}</svg>`;
+    }
+
+    function categoryIconHtml(mainName, title) {
+      const shape = CATEGORY_ICON_SHAPES[mainName] || DEFAULT_CATEGORY_ICON_SHAPE;
+      return svgIconHtml(shape, "category-icon", title || mainName || "");
+    }
+
+    const FILE_ICON_SHAPES = {
+      folder: '<path d="M1.7 4.2c0-.66.54-1.2 1.2-1.2h3.1l1.3 1.6h5.8c.66 0 1.2.54 1.2 1.2v6.4c0 .66-.54 1.2-1.2 1.2H2.9c-.66 0-1.2-.54-1.2-1.2z"/>',
+      image: '<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><circle cx="5.5" cy="6" r="1.3"/><path d="M2 12l3.5-4 2.5 2.8 2-2.3L14 12"/>',
+      video: '<rect x="1.5" y="3" width="13" height="10" rx="1"/><path d="M6.6 6v4l3.4-2z" fill="currentColor" stroke="none"/>',
+      audio: '<path d="M5 10.5V4l7-1.5v6"/><circle cx="4" cy="11.3" r="1.7"/><circle cx="10.5" cy="9.8" r="1.7"/>',
+      pdf: '<path d="M4 1.5h5.5L12 4v10.5H4z"/><path d="M9.5 1.5V4H12"/><path d="M5.3 11.5V8.3h.9c.6 0 1 .4 1 1s-.4 1-1 1h-.9M8.5 11.5V8.3h.9c.7 0 1.2.5 1.2 1.6s-.5 1.6-1.2 1.6zM11.4 8.3v3.2M11.4 9.8h1.2"/>',
+      document: '<path d="M4 1.5h5.5L12 4v10.5H4z"/><path d="M9.5 1.5V4H12"/><path d="M5.8 8h4.4M5.8 10.2h4.4"/>',
+      spreadsheet: '<rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M2.5 6.2h11M2.5 9.8h11M6.5 2.5v11M10.5 2.5v11"/>',
+      archive: '<rect x="1.7" y="4" width="12.6" height="10" rx="1"/><path d="M1.7 7h12.6"/><path d="M6.8 4v10M9.2 4v1.4M9.2 7v1.4M9.2 10v1.4"/>',
+      "disk-image": '<ellipse cx="8" cy="4" rx="6" ry="2.2"/><path d="M2 4v8c0 1.2 2.7 2.2 6 2.2s6-1 6-2.2V4"/><path d="M2 8c0 1.2 2.7 2.2 6 2.2s6-1 6-2.2"/>',
+      executable: '<circle cx="8" cy="8" r="6.3"/><path d="M6 5.3L9.3 8 6 10.7"/>',
+      email: '<rect x="1.5" y="3" width="13" height="10" rx="1"/><path d="M2 3.8l6 5 6-5"/>',
+      ads: '<path d="M1.7 4.2c0-.66.54-1.2 1.2-1.2h3.1l1.3 1.6h5.8c.66 0 1.2.54 1.2 1.2v6.4c0 .66-.54 1.2-1.2 1.2H2.9c-.66 0-1.2-.54-1.2-1.2z"/><path d="M9.5 6.5l3 3M12.5 6.5l-3 3"/>',
+      generic: '<path d="M4 1.5h5.5L12 4v10.5H4z"/><path d="M9.5 1.5V4H12"/>'
+    };
+
+    const FILE_EXTENSION_ICON_SLUG = {
+      jpg: "image", jpeg: "image", png: "image", gif: "image", bmp: "image", tif: "image", tiff: "image",
+      heic: "image", heif: "image", webp: "image", ico: "image", svg: "image", psd: "image", raw: "image",
+      cr2: "image", nef: "image", arw: "image", dng: "image",
+      mp4: "video", mov: "video", avi: "video", mkv: "video", wmv: "video", m4v: "video", "3gp": "video",
+      webm: "video", flv: "video", mpg: "video", mpeg: "video",
+      mp3: "audio", wav: "audio", m4a: "audio", aac: "audio", flac: "audio", ogg: "audio", wma: "audio",
+      pdf: "pdf",
+      doc: "document", docx: "document", docm: "document", rtf: "document", odt: "document", txt: "document",
+      md: "document", wpd: "document",
+      xls: "spreadsheet", xlsx: "spreadsheet", xlsm: "spreadsheet", csv: "spreadsheet", ods: "spreadsheet", tsv: "spreadsheet",
+      ppt: "spreadsheet", pptx: "spreadsheet", odp: "spreadsheet",
+      zip: "archive", rar: "archive", "7z": "archive", tar: "archive", gz: "archive", tgz: "archive",
+      bz2: "archive", xz: "archive", cab: "archive",
+      e01: "disk-image", ex01: "disk-image", l01: "disk-image", lx01: "disk-image", aff4: "disk-image",
+      dd: "disk-image", img: "disk-image", iso: "disk-image", vhd: "disk-image", vhdx: "disk-image",
+      vmdk: "disk-image", vdi: "disk-image", qcow2: "disk-image",
+      exe: "executable", dll: "executable", sys: "executable", com: "executable", scr: "executable",
+      msi: "executable", bat: "executable", cmd: "executable", ps1: "executable", sh: "executable",
+      eml: "email", msg: "email", pst: "email", ost: "email", mbox: "email"
+    };
+
+    function fileIconSlug(entry) {
+      if (!entry) {
+        return "generic";
+      }
+      if (entry.entry_kind === "directory") {
+        return "folder";
+      }
+      const name = String(entry.name || entry.logical_path || "");
+      if (name.includes(":") && !/^[a-zA-Z]:[\\/]/.test(name)) {
+        return "ads";
+      }
+      const ext = filesystemFileExtension(entry);
+      return FILE_EXTENSION_ICON_SLUG[ext] || "generic";
+    }
+
+    function fileIconHtml(entry) {
+      const slug = fileIconSlug(entry);
+      return svgIconHtml(FILE_ICON_SHAPES[slug] || FILE_ICON_SHAPES.generic, "file-icon file-icon-" + slug, "");
     }
 
     function filesystemTypeLabel(entry) {
@@ -8058,24 +11248,255 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return firstText(metadata.file_extension, fileExtension(entry.name || entry.logical_path));
     }
 
-    function filesystemCreatedTime(entry) {
+    function browserArtifactDisplayTime(metadata, role) {
+      const kind = metadata && metadata.artifact_kind;
+      if (kind === "browser_history_visit") {
+        return firstText(metadata.visit_time_utc, metadata.last_visit_time_utc);
+      }
+      if (kind === "browser_url") {
+        return firstText(metadata.last_visit_time_utc);
+      }
+      if (kind === "browser_search_term") {
+        if (role === "created") {
+          return firstText(metadata.last_visit_time_utc, metadata.first_used_utc, metadata.last_used_utc);
+        }
+        return firstText(metadata.last_visit_time_utc, metadata.last_used_utc, metadata.first_used_utc);
+      }
+      if (kind === "browser_download") {
+        if (role === "modified") {
+          return firstText(metadata.end_time_utc, metadata.start_time_utc, metadata.last_modified_utc, metadata.date_added_utc);
+        }
+        return firstText(metadata.start_time_utc, metadata.end_time_utc, metadata.date_added_utc);
+      }
+      if (kind === "browser_bookmark") {
+        if (role === "created") {
+          return firstText(metadata.date_added_utc, metadata.date_last_used_utc, metadata.last_modified_utc);
+        }
+        if (role === "accessed") {
+          return firstText(metadata.date_last_used_utc, metadata.last_modified_utc, metadata.date_added_utc);
+        }
+        return firstText(metadata.last_modified_utc, metadata.date_last_used_utc, metadata.date_added_utc);
+      }
+      if (kind === "browser_login") {
+        if (role === "created") {
+          return firstText(metadata.date_created_utc, metadata.time_created_utc, metadata.date_last_used_utc, metadata.time_last_used_utc);
+        }
+        if (role === "accessed") {
+          return firstText(metadata.date_last_used_utc, metadata.time_last_used_utc, metadata.date_created_utc, metadata.time_created_utc);
+        }
+        return firstText(metadata.time_password_changed_utc, metadata.date_last_used_utc, metadata.time_last_used_utc, metadata.date_created_utc, metadata.time_created_utc);
+      }
+      if (kind === "browser_cookie") {
+        if (role === "created") {
+          return firstText(metadata.creation_utc, metadata.last_access_utc, metadata.last_accessed_utc);
+        }
+        return firstText(metadata.last_access_utc, metadata.last_accessed_utc, metadata.creation_utc);
+      }
+      if (kind === "browser_cache_entry") {
+        return firstText(metadata.created_utc, metadata.creation_utc, metadata.last_modified_utc);
+      }
+      return "";
+    }
+
+    function artifactEventTime(entry) {
       const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
-      return firstText(metadata.ntfs_creation_time_utc, metadata.ntfs_standard_creation_time_utc, metadata.created_utc, metadata.source_file_created_utc);
+      return firstText(
+        metadata.email_date,
+        browserArtifactDisplayTime(metadata, "modified"),
+        metadata.registry_key_last_write_utc,
+        metadata.evtx_logged_utc
+      );
+    }
+
+    function filesystemFileSha256(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstText(metadata.file_sha256);
+    }
+
+    function hasFilesystemTimes(entry) {
+      return !!entry && entry.entry_kind !== "record";
+    }
+
+    function filesystemCreatedTime(entry) {
+      if (!hasFilesystemTimes(entry)) return "";
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstText(metadata.ntfs_creation_time_utc, metadata.ntfs_standard_creation_time_utc, metadata.standard_information_created_utc, metadata.file_name_created_utc, metadata.created_utc, metadata.fat_created);
     }
 
     function filesystemAccessedTime(entry) {
+      if (!hasFilesystemTimes(entry)) return "";
       const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
-      return firstText(metadata.ntfs_access_time_utc, metadata.ntfs_standard_access_time_utc, metadata.accessed_utc, metadata.source_file_accessed_utc);
+      return firstText(metadata.ntfs_access_time_utc, metadata.ntfs_standard_access_time_utc, metadata.standard_information_accessed_utc, metadata.file_name_accessed_utc, metadata.accessed_utc, metadata.fat_accessed);
     }
 
     function filesystemModifiedTime(entry) {
+      if (!hasFilesystemTimes(entry)) return "";
       const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
-      return firstText(metadata.ntfs_modification_time_utc, metadata.ntfs_standard_modification_time_utc, metadata.modified_utc, metadata.source_file_modified_utc);
+      return firstText(metadata.ntfs_modification_time_utc, metadata.ntfs_standard_modification_time_utc, metadata.standard_information_modified_utc, metadata.file_name_modified_utc, metadata.modified_utc, metadata.fat_modified);
     }
 
     function filesystemMftModifiedTime(entry) {
+      if (!hasFilesystemTimes(entry)) return "";
       const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
-      return firstText(metadata.ntfs_mft_record_modification_time_utc, metadata.ntfs_standard_mft_record_modification_time_utc);
+      return firstText(metadata.ntfs_mft_record_modification_time_utc, metadata.ntfs_standard_mft_record_modification_time_utc, metadata.standard_information_mft_modified_utc, metadata.file_name_mft_modified_utc, metadata.mft_modified_utc);
+    }
+
+    function folderGridColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "ext", label: "File ext", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
+        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
+      ];
+    }
+
+    function folderGridFolderRow(path, count, countKind, folderEntry) {
+      const created = filesystemCreatedTime(folderEntry);
+      const accessed = filesystemAccessedTime(folderEntry);
+      const modified = filesystemModifiedTime(folderEntry);
+      const mftModified = filesystemMftModifiedTime(folderEntry);
+      return {
+        kind: "folder",
+        path,
+        count,
+        countKind,
+        folderEntry,
+        selectable: false,
+        values: {
+          name: logicalName(path),
+          type: "Folder",
+          ext: "",
+          size: "",
+          artifactTime: "",
+          created,
+          accessed,
+          modified,
+          mftModified,
+          sha256: ""
+        },
+        sortValues: {
+          size: NaN,
+          artifactTime: NaN,
+          created: Date.parse(created),
+          accessed: Date.parse(accessed),
+          modified: Date.parse(modified),
+          mftModified: Date.parse(mftModified)
+        }
+      };
+    }
+
+    function folderGridEntryRow(entry) {
+      const created = filesystemCreatedTime(entry);
+      const accessed = filesystemAccessedTime(entry);
+      const modified = filesystemModifiedTime(entry);
+      const mftModified = filesystemMftModifiedTime(entry);
+      const artifactTime = artifactEventTime(entry);
+      const sha256 = filesystemFileSha256(entry);
+      const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
+      return {
+        kind: "entry",
+        entry,
+        selectable: true,
+        values: {
+          name: entry.name || logicalName(entry.logical_path),
+          type: filesystemTypeLabel(entry),
+          ext: filesystemFileExtension(entry),
+          size,
+          artifactTime,
+          created,
+          accessed,
+          modified,
+          mftModified,
+          sha256
+        },
+        sortValues: {
+          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+          artifactTime: Date.parse(artifactTime),
+          created: Date.parse(created),
+          accessed: Date.parse(accessed),
+          modified: Date.parse(modified),
+          mftModified: Date.parse(mftModified)
+        }
+      };
+    }
+
+    function renderFolderGridRow(row) {
+      if (row.kind === "folder") {
+        const folderEntry = row.folderEntry;
+        return `
+          <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(row.path))}')"${folderEntry ? ` data-entry-id="${folderEntry.id}"` : ` data-folder-path="${escapeAttr(row.path)}"`}>
+            <td></td>
+            <td title="${escapeAttr(row.path)}">${svgIconHtml(FILE_ICON_SHAPES.folder, "file-icon file-icon-folder", "")}<span class="entry-name">${escapeHtml(logicalName(row.path))}</span></td>
+            <td class="entry-kind" title="${row.count} ${escapeAttr(row.countKind)} item${row.count === 1 ? "" : "s"}">Folder</td>
+            <td class="entry-ext"></td>
+            <td class="entry-size"></td>
+            <td class="entry-time entry-artifact-time"></td>
+            <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
+            <td class="entry-hash mono"></td>
+          </tr>`;
+      }
+      const entry = row.entry;
+      const selected = state.hex.entryId === entry.id ? " selected" : "";
+      const isChecked = state.selectedEntryIds.has(entry.id);
+      const checked = isChecked ? " checked" : "";
+      const multiSelected = isChecked ? " multi-selected" : "";
+      return `
+          <tr class="entry-row${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
+            <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
+            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span></td>
+            <td class="entry-kind">${escapeHtml(filesystemTypeLabel(entry))}</td>
+            <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
+            <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
+            <td class="entry-time entry-artifact-time" title="${escapeAttr(row.values.artifactTime)}">${escapeHtml(row.values.artifactTime)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
+            <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
+            <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
+          </tr>`;
+    }
+
+    function visibleFolderGridRows(entries, knownFolders) {
+      const synthetic = syntheticContainerSet(knownFolders);
+      const folder = normalizeLogicalPath(state.browserState.selectedPath || "/");
+      const childFolders = displayChildFolders(knownFolders, folder, synthetic);
+      const children = applyDateFilter(displayFolderChildren(entries, folder, synthetic));
+      let folderSpecs = childFolders.map((path) => ({
+        path,
+        count: displayFolderChildCount(entries, knownFolders, path, synthetic),
+        countKind: "direct"
+      }));
+      if (dateFilterActive()) {
+        const passing = applyDateFilter(entries);
+        folderSpecs = folderSpecs
+          .map((spec) => {
+            const normalized = normalizeLogicalPath(spec.path);
+            const prefix = normalized === "/" ? "/" : normalized + "/";
+            const matches = passing.filter((entry) => {
+              const entryPath = normalizeLogicalPath(entry.logical_path);
+              return entryPath === normalized || entryPath.startsWith(prefix);
+            }).length;
+            return { path: spec.path, count: matches, countKind: "matching" };
+          })
+          .filter((spec) => spec.count > 0);
+      }
+      const folderRows = folderSpecs.map(({ path, count, countKind }) => {
+        const folderEntry = entries.find((entry) =>
+          entry.entry_kind === "directory" && normalizeLogicalPath(entry.logical_path) === normalizeLogicalPath(path)
+        );
+        return folderGridFolderRow(path, count, countKind, folderEntry);
+      });
+      return visibleGridRows("folder", folderGridColumns(), folderRows.concat(children.map(folderGridEntryRow)));
     }
 
     function renderFolderContents(entries, knownFolders) {
@@ -8111,6 +11532,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         $("entryTable").innerHTML = status + empty(dateFilterActive()
           ? "No entries in this folder match the date filter."
           : "No entries in this folder.");
+        setCurrentEntryGrid("folder", []);
         renderSelectionCount();
         return;
       }
@@ -8118,38 +11540,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const folderEntry = entries.find((entry) =>
           entry.entry_kind === "directory" && normalizeLogicalPath(entry.logical_path) === normalizeLogicalPath(path)
         );
-        return `
-          <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(path))}')"${folderEntry ? ` data-entry-id="${folderEntry.id}"` : ` data-folder-path="${escapeAttr(path)}"`}>
-            <td></td>
-            <td title="${escapeAttr(path)}"><span class="entry-name">${escapeHtml(logicalName(path))}</span></td>
-            <td class="entry-kind" title="${count} ${countKind} item${count === 1 ? "" : "s"}">Folder</td>
-            <td class="entry-ext"></td>
-            <td class="entry-size"></td>
-            <td class="entry-time" title="${escapeAttr(filesystemCreatedTime(folderEntry))}">${escapeHtml(filesystemCreatedTime(folderEntry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemAccessedTime(folderEntry))}">${escapeHtml(filesystemAccessedTime(folderEntry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemModifiedTime(folderEntry))}">${escapeHtml(filesystemModifiedTime(folderEntry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemMftModifiedTime(folderEntry))}">${escapeHtml(filesystemMftModifiedTime(folderEntry))}</td>
-          </tr>`;
+        return folderGridFolderRow(path, count, countKind, folderEntry);
       });
-      const entryRows = children.map((entry) => {
-        const selected = state.hex.entryId === entry.id ? " selected" : "";
-        const isChecked = state.selectedEntryIds.has(entry.id);
-        const checked = isChecked ? " checked" : "";
-        const multiSelected = isChecked ? " multi-selected" : "";
-        return `
-          <tr class="entry-row${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
-            <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
-            <td title="${escapeAttr(entry.logical_path)}"><span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span></td>
-            <td class="entry-kind">${escapeHtml(filesystemTypeLabel(entry))}</td>
-            <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
-            <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemCreatedTime(entry))}">${escapeHtml(filesystemCreatedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemAccessedTime(entry))}">${escapeHtml(filesystemAccessedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemModifiedTime(entry))}">${escapeHtml(filesystemModifiedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemMftModifiedTime(entry))}">${escapeHtml(filesystemMftModifiedTime(entry))}</td>
-          </tr>`;
-      });
-      $("entryTable").innerHTML = status + table(["", "Name", "Type", "File ext", "Size", "Created", "Accessed", "Modified", "MFT modified"], folderRows.concat(entryRows).join(""), "folder-table");
+      const columns = folderGridColumns();
+      const gridRows = folderRows.concat(children.map(folderGridEntryRow));
+      const tableResult = sortableGridTable("folder", columns, gridRows, "folder-table", renderFolderGridRow);
+      setCurrentEntryGrid("folder", tableResult.visibleRows.filter((row) => row.selectable).map((row) => row.entry));
+      const filterStatus = gridFilterStatusHtml("folder", columns, tableResult.visibleRows.length, gridRows.length, "items");
+      $("entryTable").innerHTML = status + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No folder items match the column filters."));
       renderSelectionCount();
     }
 
@@ -8195,15 +11593,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderSelectionCount() {
-      const count = state.selectedEntryIds ? state.selectedEntryIds.size : 0;
+      const count = state.live.active
+        ? selectedVisibleLiveItems().length
+        : selectedEntriesForActions().length;
       $("selectedCount").textContent = count + " selected";
       updateSelectedActionControls();
     }
 
     function selectedEntriesForActions() {
-      return Array.from(state.selectedEntryIds || [])
-        .map((entryId) => findLoadedEntry(entryId))
-        .filter(Boolean);
+      const selected = state.selectedEntryIds || new Set();
+      return visibleFolderEntries().filter((entry) => entry && selected.has(entry.id));
     }
 
     function selectedFileEntryCount() {
@@ -8212,7 +11611,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function selectedFileExportAllowed() {
       if (state.live.active) {
-        return Boolean(state.live.selected && state.live.selected.size > 0);
+        return selectedVisibleLiveItems().length > 0;
       }
       return selectedFileEntryCount() > 0;
     }
@@ -8228,8 +11627,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const reportButton = $("bookmarkReportSelected");
       const selectedAction = $("selectedAction");
       const count = state.live.active
-        ? (state.live.selected ? state.live.selected.size : 0)
-        : (state.selectedEntryIds ? state.selectedEntryIds.size : 0);
+        ? selectedVisibleLiveItems().length
+        : selectedEntriesForActions().length;
       if (reportButton) {
         reportButton.disabled = count === 0;
       }
@@ -8299,6 +11698,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function visibleFolderEntries() {
+      if (state.currentEntryGrid && state.currentEntryGrid.gridId) {
+        return state.currentEntryGrid.entries || [];
+      }
       if (state.browserState.treeMode === "categories") {
         if (serverCategoryBrowseActive()) {
           return applyDateFilter(state.cat.entries || []);
@@ -8530,18 +11932,951 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function categoryTime(entry) {
       const metadata = entry.metadata_json || {};
       return firstText(
-        metadata.email_date,
-        metadata.visit_time_utc,
-        metadata.date_added_utc,
-        metadata.modified_utc,
-        metadata.mft_modified_utc,
-        metadata.file_name_modified_utc,
-        metadata.standard_information_modified_utc,
-        metadata.source_file_modified_utc,
-        metadata.created_utc,
-        metadata.file_name_created_utc,
-        metadata.standard_information_created_utc
+        artifactEventTime(entry),
+        filesystemModifiedTime(entry),
+        filesystemMftModifiedTime(entry),
+        filesystemCreatedTime(entry)
       );
+    }
+
+    const TIMELINE_HOUR_MS = 60 * 60 * 1000;
+    const TIMELINE_DAY_MS = 24 * TIMELINE_HOUR_MS;
+    const TIMELINE_METADATA_TIME_FIELDS = [
+      { key: "email_date", label: "Email Date/Time" },
+      { key: "visit_time_utc", label: "Visit Date/Time" },
+      { key: "last_visit_time_utc", label: "Last Visit Date/Time" },
+      { key: "first_used_utc", label: "First Used Date/Time" },
+      { key: "last_used_utc", label: "Last Used Date/Time" },
+      { key: "date_added_utc", label: "Added Date/Time" },
+      { key: "date_last_used_utc", label: "Last Used Date/Time" },
+      { key: "start_time_utc", label: "Started Date/Time" },
+      { key: "end_time_utc", label: "Ended Date/Time" },
+      { key: "date_created_utc", label: "Created Date/Time" },
+      { key: "time_created_utc", label: "Created Date/Time" },
+      { key: "time_last_used_utc", label: "Last Used Date/Time" },
+      { key: "time_password_changed_utc", label: "Password Changed Date/Time" },
+      { key: "creation_utc", label: "Created Date/Time" },
+      { key: "last_access_utc", label: "Last Access Date/Time" },
+      { key: "last_accessed_utc", label: "Last Access Date/Time" },
+      { key: "expires_utc", label: "Expires Date/Time" },
+      { key: "expiry_utc", label: "Expires Date/Time" },
+      { key: "last_modified_utc", label: "Last Modified Date/Time" },
+      { key: "created_utc", label: "Created Date/Time" },
+      { key: "accessed_utc", label: "Accessed Date/Time" },
+      { key: "modified_utc", label: "Last Modified Date/Time" },
+      { key: "mft_modified_utc", label: "MFT Modified Date/Time" },
+      { key: "file_name_created_utc", label: "File Name Created Date/Time" },
+      { key: "file_name_accessed_utc", label: "File Name Accessed Date/Time" },
+      { key: "file_name_modified_utc", label: "File Name Modified Date/Time" },
+      { key: "file_name_mft_modified_utc", label: "File Name MFT Modified Date/Time" },
+      { key: "standard_information_created_utc", label: "Standard Info Created Date/Time" },
+      { key: "standard_information_accessed_utc", label: "Standard Info Accessed Date/Time" },
+      { key: "standard_information_modified_utc", label: "Standard Info Modified Date/Time" },
+      { key: "standard_information_mft_modified_utc", label: "Standard Info MFT Modified Date/Time" },
+      { key: "registry_key_last_write_utc", label: "Registry Last Write Date/Time" },
+      { key: "evtx_logged_utc", label: "Logged Date/Time" },
+      // NTFS/FAT parser keys - kept in sync with TIMELINE_TIME_FIELD_KEYS in
+      // kdft-case so the SQL date-range prefilter and this client-side event
+      // extraction agree on what counts as a timestamp. Duplicates of what the
+      // filesystem*Time helpers already surface are merged by the per-entry
+      // timestamp bucket.
+      { key: "ntfs_creation_time_utc", label: "Created Date/Time" },
+      { key: "ntfs_modification_time_utc", label: "Last Modified Date/Time" },
+      { key: "ntfs_access_time_utc", label: "Accessed Date/Time" },
+      { key: "ntfs_mft_record_modification_time_utc", label: "MFT Modified Date/Time" },
+      { key: "ntfs_standard_creation_time_utc", label: "Created Date/Time" },
+      { key: "ntfs_standard_modification_time_utc", label: "Last Modified Date/Time" },
+      { key: "ntfs_standard_access_time_utc", label: "Accessed Date/Time" },
+      { key: "ntfs_standard_mft_record_modification_time_utc", label: "MFT Modified Date/Time" },
+      { key: "fat_created", label: "Created Date/Time" },
+      { key: "fat_modified", label: "Last Modified Date/Time" },
+      { key: "fat_accessed", label: "Accessed Date/Time" }
+    ];
+
+    function timelineSourceEntries() {
+      if (!state.data) {
+        return [];
+      }
+      const byId = new Map();
+      const addEntry = (entry) => {
+        if (!entry || entry.id == null || byId.has(entry.id)) {
+          return;
+        }
+        byId.set(entry.id, { ...entry, logical_path: normalizeLogicalPath(entry.logical_path) });
+      };
+      (state.data.entries || []).forEach(addEntry);
+      (state.cat.entries || []).forEach(addEntry);
+      for (const path in state.idx.dirCache) {
+        (state.idx.dirCache[path] || []).map(idxChildToEntry).forEach(addEntry);
+      }
+      return Array.from(byId.values());
+    }
+
+    function timelineTimestampKey(text) {
+      const parsed = Date.parse(text);
+      return Number.isFinite(parsed) ? String(parsed) : String(text).trim().toLowerCase();
+    }
+
+    function addTimelineCandidate(bucket, label, value) {
+      const text = firstText(value);
+      if (!text) {
+        return;
+      }
+      const key = timelineTimestampKey(text);
+      if (!bucket.has(key)) {
+        bucket.set(key, {
+          timestamp: text,
+          timestampMs: Date.parse(text),
+          labels: []
+        });
+      }
+      const item = bucket.get(key);
+      if (!item.labels.includes(label)) {
+        item.labels.push(label);
+      }
+    }
+
+    function timelineEventsForEntry(entry) {
+      const metadata = entry.metadata_json || {};
+      const bucket = new Map();
+      addTimelineCandidate(bucket, "Artifact Date/Time", categoryTime(entry));
+      addTimelineCandidate(bucket, "Created Date/Time", filesystemCreatedTime(entry));
+      addTimelineCandidate(bucket, "Accessed Date/Time", filesystemAccessedTime(entry));
+      addTimelineCandidate(bucket, "Last Modified Date/Time", filesystemModifiedTime(entry));
+      addTimelineCandidate(bucket, "MFT Modified Date/Time", filesystemMftModifiedTime(entry));
+      addTimelineCandidate(bucket, "Browser Created Date/Time", browserArtifactDisplayTime(metadata, "created"));
+      addTimelineCandidate(bucket, "Browser Accessed Date/Time", browserArtifactDisplayTime(metadata, "accessed"));
+      addTimelineCandidate(bucket, "Browser Modified Date/Time", browserArtifactDisplayTime(metadata, "modified"));
+      TIMELINE_METADATA_TIME_FIELDS.forEach((field) => {
+        addTimelineCandidate(bucket, field.label, metadata[field.key]);
+      });
+      return Array.from(bucket.values()).map((event, index) => ({
+        entry,
+        index,
+        timestamp: event.timestamp,
+        timestampMs: event.timestampMs,
+        attribute: event.labels.join(" / ")
+      }));
+    }
+
+    function collectTimelineEvents(entries) {
+      const events = [];
+      entries.forEach((entry) => {
+        timelineEventsForEntry(entry).forEach((event) => events.push(event));
+      });
+      return events.sort((left, right) => {
+        const leftMissing = !Number.isFinite(left.timestampMs);
+        const rightMissing = !Number.isFinite(right.timestampMs);
+        if (leftMissing !== rightMissing) {
+          return leftMissing ? 1 : -1;
+        }
+        if (!leftMissing && left.timestampMs !== right.timestampMs) {
+          return left.timestampMs - right.timestampMs;
+        }
+        return (left.entry.id || 0) - (right.entry.id || 0) || left.index - right.index;
+      });
+    }
+
+    function rebuildTimelineEvents() {
+      if (!state.data || !state.timeline.built) {
+        return;
+      }
+      // Prefer the dedicated server-fetched set from the last "Build timeline"
+      // click (comprehensive, up to the examiner's Timeline build limit) over
+      // whatever's incidentally cached in client state from ordinary browsing.
+      const entries = state.timeline.entries.length ? state.timeline.entries : timelineSourceEntries();
+      state.timeline.casePath = state.casePath;
+      state.timeline.sourceEntries = entries.length;
+      state.timeline.loadedEntryCount = entries.length;
+      state.timeline.totalEntryCount = Number(state.data.entry_count || entries.length);
+      state.timeline.events = collectTimelineEvents(entries);
+    }
+
+    async function requestTimelineBuild() {
+      if (!state.data) {
+        setNotice("Load a case before building the timeline.", true);
+        return;
+      }
+      const total = Number(state.data.entry_count || 0);
+      const rangeActive = dateFilterActive();
+      // A date range set BEFORE building lets the server filter with SQL
+      // (json_extract over every known timestamp field, see
+      // list_filesystem_entries_for_timeline) instead of shipping every
+      // indexed entry to the browser to scan client-side - that full scan is
+      // what froze the tab on cases with tens of thousands of entries. This
+      // is a real filter, not a row-count preview: nothing whose timestamp
+      // falls inside the chosen window is ever left out, no matter how large
+      // the case is.
+      if (!rangeActive) {
+        const proceed = window.confirm(
+          "No date range is set above, so this will scan all " + total.toLocaleString() +
+          " indexed entries and can be slow or freeze the tab on large cases.\n\n" +
+          "Click Cancel, set a From/To date in the fields above, then click Build timeline again to scan only that window.\n\n" +
+          "Build from all entries anyway?"
+        );
+        if (!proceed) {
+          state.timeline.prompted = true;
+          renderTimeline();
+          return;
+        }
+      }
+      const limit = currentTimelineBuildLimit();
+      state.timeline.prompted = true;
+      setNotice(rangeActive ? "Building timeline for the selected date range..." : "Building timeline for all entries...");
+      try {
+        const params = { case_path: currentCasePath(), max_entries: limit };
+        if (rangeActive) {
+          params.from = state.dateFilter.from ? state.dateFilter.from + "T00:00:00Z" : "0001-01-01T00:00:00Z";
+          params.to = state.dateFilter.to ? state.dateFilter.to + "T23:59:59.999Z" : "9999-12-31T23:59:59Z";
+        }
+        const data = await apiGet("/api/timeline/entries", params);
+        state.timeline.built = true;
+        state.timeline.entries = (data.entries || []).map((entry) => ({ ...entry, logical_path: normalizeLogicalPath(entry.logical_path) }));
+        state.timeline.truncated = Boolean(data.truncated);
+        rebuildTimelineEvents();
+        renderTimeline();
+        const matchedTotal = Number(data.entry_count || total);
+        const scopeNote = rangeActive
+          ? " (" + matchedTotal.toLocaleString() + " indexed entries fell in the selected date range)"
+          : "";
+        const truncatedNote = state.timeline.truncated
+          ? " Scan was truncated - narrow the date range for full coverage."
+          : "";
+        setNotice("Built timeline with " + state.timeline.events.length.toLocaleString() + " timestamped event" + (state.timeline.events.length === 1 ? "" : "s") + "." + scopeNote + truncatedNote, state.timeline.truncated);
+      } catch (err) {
+        state.timeline.prompted = true;
+        renderTimeline();
+        setNotice(err.message, true);
+      }
+    }
+
+    function maybePromptTimelineBuild() {
+      if (!state.data || state.timeline.built || state.timeline.prompted) {
+        return;
+      }
+      state.timeline.prompted = true;
+      window.setTimeout(requestTimelineBuild, 0);
+    }
+
+    function timelineDateFilteredEvents(events) {
+      if (!dateFilterActive()) {
+        return events;
+      }
+      const from = state.dateFilter.from ? Date.parse(state.dateFilter.from + "T00:00:00Z") : -Infinity;
+      const to = state.dateFilter.to ? Date.parse(state.dateFilter.to + "T23:59:59.999Z") : Infinity;
+      return events.filter((event) =>
+        Number.isFinite(event.timestampMs) && event.timestampMs >= from && event.timestampMs <= to
+      );
+    }
+
+    function timelineFocusFilteredEvents(events) {
+      const focus = state.timeline.focusBucket;
+      if (!focus) {
+        return events;
+      }
+      const startMs = Number(focus.startMs);
+      const endMs = Number(focus.endMs);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        return events;
+      }
+      return events.filter((event) =>
+        Number.isFinite(event.timestampMs) && event.timestampMs >= startMs && event.timestampMs < endMs
+      );
+    }
+
+    function timelineBucketStart(timestampMs, unit) {
+      const date = new Date(timestampMs);
+      if (unit === "hour") {
+        return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), date.getUTCHours());
+      }
+      return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+    }
+
+    function timelineBucketLabel(timestampMs, unit) {
+      const date = new Date(timestampMs);
+      const options = unit === "hour"
+        ? { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }
+        : { month: "short", day: "numeric", year: "numeric" };
+      return date.toLocaleString(undefined, options);
+    }
+
+    function timelineAxisLabel(timestampMs, unit) {
+      const date = new Date(timestampMs);
+      const options = unit === "hour"
+        ? { month: "short", day: "numeric", hour: "numeric" }
+        : { month: "short", day: "numeric" };
+      return date.toLocaleString(undefined, options);
+    }
+
+    function timelineGraphData(events) {
+      const validEvents = events.filter((event) => Number.isFinite(event.timestampMs));
+      if (!validEvents.length) {
+        return { buckets: [], unit: "day", maxCount: 0 };
+      }
+      let minMs = Infinity;
+      let maxMs = -Infinity;
+      validEvents.forEach((event) => {
+        minMs = Math.min(minMs, event.timestampMs);
+        maxMs = Math.max(maxMs, event.timestampMs);
+      });
+      const unit = maxMs - minMs <= 3 * TIMELINE_DAY_MS ? "hour" : "day";
+      const intervalMs = unit === "hour" ? TIMELINE_HOUR_MS : TIMELINE_DAY_MS;
+      const bucketsByStart = new Map();
+      validEvents.forEach((event) => {
+        const startMs = timelineBucketStart(event.timestampMs, unit);
+        if (!bucketsByStart.has(startMs)) {
+          bucketsByStart.set(startMs, {
+            startMs,
+            endMs: startMs + intervalMs,
+            unit,
+            count: 0,
+            firstEntryId: null,
+            firstEventIndex: null
+          });
+        }
+        const bucket = bucketsByStart.get(startMs);
+        bucket.count += 1;
+        if (bucket.firstEntryId === null && event.entry && event.entry.id != null) {
+          bucket.firstEntryId = event.entry.id;
+          bucket.firstEventIndex = event.index;
+        }
+      });
+      const buckets = Array.from(bucketsByStart.values()).sort((left, right) => left.startMs - right.startMs);
+      const maxCount = buckets.reduce((max, bucket) => Math.max(max, bucket.count), 0);
+      return { buckets, unit, maxCount };
+    }
+
+    function timelineGraphTickIndexes(count) {
+      if (count <= 0) {
+        return [];
+      }
+      if (count === 1) {
+        return [0];
+      }
+      const indexes = [];
+      const maxTicks = Math.min(6, count);
+      for (let tick = 0; tick < maxTicks; tick += 1) {
+        const index = Math.round(((count - 1) * tick) / (maxTicks - 1));
+        if (!indexes.includes(index)) {
+          indexes.push(index);
+        }
+      }
+      return indexes;
+    }
+
+    function renderTimelineGraph(events) {
+      const graph = $("timelineGraph");
+      if (!graph) {
+        return;
+      }
+      const data = timelineGraphData(events);
+      state.timeline.graphBuckets = data.buckets;
+      if (!data.buckets.length) {
+        graph.innerHTML = empty("No timeline data to plot.");
+        return;
+      }
+      const width = 1000;
+      const height = 145;
+      const left = 34;
+      const right = 22;
+      const top = 12;
+      const bottom = 36;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const maxCount = Math.max(1, data.maxCount);
+      const points = data.buckets.map((bucket, index) => {
+        const x = data.buckets.length === 1
+          ? left + (plotWidth / 2)
+          : left + ((bucket.startMs - data.buckets[0].startMs) / (data.buckets[data.buckets.length - 1].startMs - data.buckets[0].startMs)) * plotWidth;
+        const y = top + (1 - (bucket.count / maxCount)) * plotHeight;
+        return { bucket, index, x, y };
+      });
+      const linePath = points.map((point, index) =>
+        (index === 0 ? "M" : "L") + point.x.toFixed(1) + " " + point.y.toFixed(1)
+      ).join(" ");
+      const areaPath = points.length
+        ? "M" + points[0].x.toFixed(1) + " " + (height - bottom).toFixed(1) + " " + points.map((point, index) =>
+          (index === 0 ? "L" : "L") + point.x.toFixed(1) + " " + point.y.toFixed(1)
+        ).join(" ") + " L" + points[points.length - 1].x.toFixed(1) + " " + (height - bottom).toFixed(1) + " Z"
+        : "";
+      const focus = state.timeline.focusBucket;
+      const focusedPoint = focus
+        ? points.find((point) => point.bucket.startMs === focus.startMs && point.bucket.endMs === focus.endMs)
+        : null;
+      const tickHtml = timelineGraphTickIndexes(points.length).map((index) => {
+        const point = points[index];
+        return `<g>
+          <line x1="${point.x.toFixed(1)}" y1="${top}" x2="${point.x.toFixed(1)}" y2="${height - bottom}" stroke="rgba(148, 163, 184, .32)" stroke-width="1"/>
+          <text class="timeline-axis-label" x="${point.x.toFixed(1)}" y="${height - 14}" text-anchor="middle">${escapeHtml(timelineAxisLabel(point.bucket.startMs, data.unit))}</text>
+        </g>`;
+      }).join("");
+      const pointHtml = points.map((point) => {
+        const previousX = point.index > 0 ? points[point.index - 1].x : left;
+        const nextX = point.index < points.length - 1 ? points[point.index + 1].x : width - right;
+        const hitLeft = point.index === 0 ? left : (previousX + point.x) / 2;
+        const hitRight = point.index === points.length - 1 ? width - right : (point.x + nextX) / 2;
+        const active = focusedPoint && focusedPoint.index === point.index ? " active" : "";
+        return `<circle class="timeline-graph-point${active}" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="5"/>
+          <rect class="timeline-graph-hitbox" x="${hitLeft.toFixed(1)}" y="${top}" width="${Math.max(8, hitRight - hitLeft).toFixed(1)}" height="${plotHeight}"
+            onmouseenter="showTimelineGraphTooltip(event, ${point.index})"
+            onmousemove="moveTimelineGraphTooltip(event)"
+            onmouseleave="hideTimelineGraphTooltip()"
+            onclick="focusTimelineBucket(${point.index})"/>`;
+      }).join("");
+      const cursorHtml = focusedPoint
+        ? `<line class="timeline-graph-cursor" x1="${focusedPoint.x.toFixed(1)}" y1="${top}" x2="${focusedPoint.x.toFixed(1)}" y2="${height - bottom}"/>`
+        : "";
+      const focusHtml = focus
+        ? `<span class="timeline-graph-focus"><span>${escapeHtml(timelineBucketLabel(focus.startMs, focus.unit))} (${Number(focus.count || 0).toLocaleString()} hits)</span><button class="ghost" onclick="clearTimelineBucketFocus()">Clear bucket</button></span>`
+        : `<span>${data.unit === "hour" ? "Hourly" : "Daily"} buckets</span>`;
+      graph.innerHTML = `
+        <div class="timeline-graph-head">
+          <span>Activity density</span>
+          ${focusHtml}
+        </div>
+        <svg class="timeline-graph-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="Timeline activity density">
+          <line x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}" stroke="rgba(100, 116, 139, .45)" stroke-width="1"/>
+          ${tickHtml}
+          <path class="timeline-graph-area" d="${areaPath}"></path>
+          <path class="timeline-graph-line" d="${linePath}"></path>
+          ${cursorHtml}
+          ${pointHtml}
+        </svg>
+        <div id="timelineGraphTooltip" class="timeline-graph-tooltip"></div>`;
+    }
+
+    function showTimelineGraphTooltip(event, index) {
+      const bucket = (state.timeline.graphBuckets || [])[index];
+      const tooltip = $("timelineGraphTooltip");
+      if (!bucket || !tooltip) {
+        return;
+      }
+      tooltip.innerHTML = `<strong>Date: ${escapeHtml(timelineBucketLabel(bucket.startMs, bucket.unit))}</strong><span>Hit count: ${Number(bucket.count || 0).toLocaleString()}</span>`;
+      tooltip.style.display = "block";
+      moveTimelineGraphTooltip(event);
+    }
+
+    function moveTimelineGraphTooltip(event) {
+      const tooltip = $("timelineGraphTooltip");
+      const graph = $("timelineGraph");
+      if (!tooltip || !graph || tooltip.style.display !== "block") {
+        return;
+      }
+      const rect = graph.getBoundingClientRect();
+      let left = event.clientX - rect.left + 12;
+      let top = event.clientY - rect.top + 12;
+      const maxLeft = Math.max(8, rect.width - tooltip.offsetWidth - 8);
+      const maxTop = Math.max(8, rect.height - tooltip.offsetHeight - 8);
+      tooltip.style.left = Math.min(Math.max(8, left), maxLeft) + "px";
+      tooltip.style.top = Math.min(Math.max(8, top), maxTop) + "px";
+    }
+
+    function hideTimelineGraphTooltip() {
+      const tooltip = $("timelineGraphTooltip");
+      if (tooltip) {
+        tooltip.style.display = "none";
+      }
+    }
+
+    function focusTimelineBucket(index) {
+      const bucket = (state.timeline.graphBuckets || [])[index];
+      if (!bucket) {
+        return;
+      }
+      state.timeline.focusBucket = {
+        startMs: bucket.startMs,
+        endMs: bucket.endMs,
+        unit: bucket.unit,
+        label: timelineBucketLabel(bucket.startMs, bucket.unit),
+        count: bucket.count
+      };
+      if (bucket.firstEntryId !== null) {
+        state.timeline.selectedEntryId = bucket.firstEntryId;
+        state.timeline.selectedEventIndex = bucket.firstEventIndex;
+        state.hex = makeHexState(bucket.firstEntryId, 0, numberValue("hexLength", 512));
+        const viewerMode = $("viewerMode");
+        if (viewerMode) {
+          viewerMode.value = "metadata";
+        }
+      }
+      state.timeline.scrollToSelected = true;
+      hideTimelineGraphTooltip();
+      renderTimeline();
+      if (bucket.firstEntryId !== null) {
+        renderHexViewer();
+      }
+      setNotice("Focused timeline table on " + timelineBucketLabel(bucket.startMs, bucket.unit) + ".");
+    }
+
+    function clearTimelineBucketFocus() {
+      state.timeline.focusBucket = null;
+      state.timeline.scrollToSelected = true;
+      renderTimeline();
+    }
+
+    function compareTimelineEventOrder(left, right) {
+      const leftMissing = !Number.isFinite(left.timestampMs);
+      const rightMissing = !Number.isFinite(right.timestampMs);
+      if (leftMissing !== rightMissing) {
+        return leftMissing ? 1 : -1;
+      }
+      if (!leftMissing && left.timestampMs !== right.timestampMs) {
+        return left.timestampMs - right.timestampMs;
+      }
+      return (left.index || 0) - (right.index || 0);
+    }
+
+    function timelineEventsForEntryId(entryId) {
+      const numericEntryId = Number(entryId);
+      return (state.timeline.events || [])
+        .filter((event) => event.entry && Number(event.entry.id) === numericEntryId)
+        .slice()
+        .sort(compareTimelineEventOrder);
+    }
+
+    // Timeline entries come from the dedicated /api/timeline/entries fetch and
+    // may not be in state.data/cat/idx at all on a large (truncated) case, so
+    // findLoadedEntry alone can miss them. Resolve from the timeline's own
+    // fetched set (and the events it built) first, then fall back to the
+    // ordinary loaded-entry lookup.
+    function timelineEntryById(entryId) {
+      const numericEntryId = Number(entryId);
+      if (Number.isFinite(numericEntryId)) {
+        const fetched = (state.timeline.entries || []).find((item) => Number(item.id) === numericEntryId);
+        if (fetched) {
+          return fetched;
+        }
+        const event = (state.timeline.events || []).find((item) => item.entry && Number(item.entry.id) === numericEntryId);
+        if (event && event.entry) {
+          return event.entry;
+        }
+      }
+      return findLoadedEntry(entryId);
+    }
+
+    function timelineSelectedEventPosition(events) {
+      if (!events.length) {
+        return -1;
+      }
+      const selectedIndex = Number(state.timeline.selectedEventIndex);
+      const position = events.findIndex((event) => Number(event.index) === selectedIndex);
+      return position >= 0 ? position : 0;
+    }
+
+    function timelineSelectionNavHtml() {
+      const selectedEntryId = state.timeline.selectedEntryId !== null && state.timeline.selectedEntryId !== undefined
+        ? state.timeline.selectedEntryId
+        : state.hex.entryId;
+      if (!selectedEntryId) {
+        return `<div class="timeline-selection-title muted">Select a timeline event</div>`;
+      }
+      const entry = timelineEntryById(selectedEntryId);
+      if (!entry) {
+        return `<div class="timeline-selection-title muted">Selected timeline item is not loaded</div>`;
+      }
+      const events = timelineEventsForEntryId(entry.id);
+      if (!events.length) {
+        return `<div class="timeline-selection-title">${escapeHtml(timelineItemName(entry))}</div><div class="timeline-timestamp-pager">0 TIMESTAMPS</div>`;
+      }
+      const position = timelineSelectedEventPosition(events);
+      const current = events[position];
+      const title = timelineItemName(entry);
+      const eventTitle = current ? compactParts([current.timestamp, current.attribute]) : "";
+      const pager = events.length > 1
+        ? `<div class="timeline-timestamp-pager" title="${escapeAttr(eventTitle)}">
+            <button type="button" onclick="event.stopPropagation(); stepTimelineTimestamp(-1)" title="Previous timestamp">&lt;</button>
+            <span>${position + 1} OF ${events.length} TIMESTAMPS</span>
+            <button type="button" onclick="event.stopPropagation(); stepTimelineTimestamp(1)" title="Next timestamp">&gt;</button>
+          </div>`
+        : `<div class="timeline-timestamp-pager" title="${escapeAttr(eventTitle)}">1 TIMESTAMP</div>`;
+      return `<div class="timeline-selection-title" title="${escapeAttr(displayPath(entry.logical_path))}">${fileIconHtml(entry)}${escapeHtml(title)}</div>${pager}`;
+    }
+
+    function selectTimelineEvent(entryId, eventIndex, clearFocus) {
+      const entry = timelineEntryById(entryId);
+      if (!entry) {
+        setNotice("Timeline entry is not loaded.", true);
+        return;
+      }
+      const events = timelineEventsForEntryId(entry.id);
+      const numericEventIndex = Number(eventIndex);
+      const selectedEvent = events.find((event) => Number(event.index) === numericEventIndex) || events[0] || null;
+      state.timeline.selectedEntryId = entry.id;
+      state.timeline.selectedEventIndex = selectedEvent ? selectedEvent.index : null;
+      if (clearFocus) {
+        state.timeline.focusBucket = null;
+      }
+      state.timeline.scrollToSelected = true;
+      state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
+      const viewerMode = $("viewerMode");
+      if (viewerMode) {
+        viewerMode.value = "metadata";
+      }
+      renderTimeline();
+      renderHexViewer();
+      setNotice("Selected timeline item " + (entry.name || logicalName(entry.logical_path)) + ".");
+    }
+
+    function stepTimelineTimestamp(delta) {
+      const selectedEntryId = state.timeline.selectedEntryId !== null && state.timeline.selectedEntryId !== undefined
+        ? state.timeline.selectedEntryId
+        : state.hex.entryId;
+      const events = timelineEventsForEntryId(selectedEntryId);
+      if (events.length <= 1) {
+        return;
+      }
+      const position = timelineSelectedEventPosition(events);
+      const nextPosition = (position + delta + events.length) % events.length;
+      selectTimelineEvent(selectedEntryId, events[nextPosition].index, true);
+    }
+
+    function scrollTimelineToSelectedEvent() {
+      if (!state.timeline.scrollToSelected) {
+        return;
+      }
+      state.timeline.scrollToSelected = false;
+      window.setTimeout(() => {
+        const table = $("timelineTable");
+        const entryId = Number(state.timeline.selectedEntryId);
+        const eventIndex = Number(state.timeline.selectedEventIndex);
+        if (!table || !Number.isFinite(entryId) || !Number.isFinite(eventIndex)) {
+          return;
+        }
+        const row = table.querySelector(`.entry-row[data-entry-id="${entryId}"][data-timeline-event-index="${eventIndex}"]`);
+        if (row) {
+          table.scrollTop = Math.max(0, row.offsetTop - Math.round(table.clientHeight / 2));
+        } else {
+          table.scrollTop = 0;
+        }
+      }, 0);
+    }
+
+    function timelineGridColumns() {
+      return [
+        { key: "time", label: "Date/time", sortable: true, filterable: true, sortType: "time" },
+        { key: "attribute", label: "Date/time attribute", sortable: true, filterable: true, sortType: "text" },
+        { key: "timelineCategory", label: "Timeline category", sortable: true, filterable: true, sortType: "text" },
+        { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "item", label: "Item", sortable: true, filterable: true, sortType: "text" },
+        { key: "itemValue", label: "Item value", sortable: true, filterable: true, sortType: "text" }
+      ];
+    }
+
+    function timelineCategoryForEvent(event) {
+      const entry = event.entry;
+      const metadata = entry.metadata_json || {};
+      const category = entryCategory(entry);
+      const text = String(event.attribute || "").toLowerCase();
+      if (isEmailEntry(entry) || category.main === "Email and Communications") {
+        return { label: "User communication", tone: "communication" };
+      }
+      if (/access|visit|last used|opened|started|download/.test(text)
+        || metadata.artifact_kind === "browser_history_visit"
+        || metadata.artifact_kind === "browser_download") {
+        return { label: "File/folder opening", tone: "opening" };
+      }
+      return { label: "File knowledge", tone: "knowledge" };
+    }
+
+    function timelineItemName(entry) {
+      const metadata = entry.metadata_json || {};
+      if (isEmailEntry(entry)) {
+        return emailDisplayName(entry);
+      }
+      return firstText(metadata.title, metadata.file_name, metadata.registry_value_name, metadata.registry_key_name, metadata.url, entry.name, logicalName(entry.logical_path));
+    }
+
+    function timelineItemValue(entry) {
+      const metadata = entry.metadata_json || {};
+      if (isEmailEntry(entry)) {
+        return compactParts([
+          metadata.email_from ? "From: " + metadata.email_from : "",
+          metadata.email_to ? "To: " + metadata.email_to : "",
+          firstText(metadata.email_subject, metadata.email_body_preview)
+        ]);
+      }
+      if (metadata.artifact_kind === "registry_value") {
+        return compactParts([metadata.registry_key_path, metadata.registry_value_data]);
+      }
+      if (metadata.artifact_kind === "evtx_event_record") {
+        return compactParts([metadata.evtx_provider, metadata.evtx_summary]);
+      }
+      if (isBrowserActivityEntry(entry)) {
+        return firstText(metadata.url, metadata.target_path, metadata.tab_url, metadata.source_url, browserActivityPreview(entry));
+      }
+      return firstText(entrySummary(entry), displayPath(entry.logical_path));
+    }
+
+    function timelineGridRow(event) {
+      const entry = event.entry;
+      const timelineCategory = timelineCategoryForEvent(event);
+      const item = timelineItemName(entry);
+      const itemValue = timelineItemValue(entry);
+      return {
+        event,
+        values: {
+          time: event.timestamp,
+          attribute: event.attribute,
+          timelineCategory: timelineCategory.label,
+          category: entryCategoryLabel(entry),
+          type: activityLabel(entry),
+          item,
+          itemValue
+        },
+        sortValues: {
+          time: event.timestampMs
+        },
+        timelineCategory
+      };
+    }
+
+    function renderTimelineGridRow(row) {
+      const event = row.event;
+      const entry = event.entry;
+      const category = entryCategory(entry);
+      const selected = Number(state.timeline.selectedEntryId) === Number(entry.id)
+        && Number(state.timeline.selectedEventIndex) === Number(event.index)
+        ? " selected"
+        : "";
+      const tone = row.timelineCategory.tone || "knowledge";
+      return `
+          <tr class="entry-row${selected}" data-entry-id="${entry.id}" data-timeline-event-index="${event.index}" onclick="selectTimelineEntry(${entry.id}, ${event.index})" ondblclick="goToEntryFolder(${entry.id})">
+            <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>
+            <td title="${escapeAttr(row.values.attribute)}">${escapeHtml(row.values.attribute)}</td>
+            <td><span class="timeline-badge timeline-${escapeAttr(tone)}">${escapeHtml(row.values.timelineCategory)}</span></td>
+            <td title="${escapeAttr(row.values.category)}">${categoryIconHtml(category.main)}<span class="entry-category">${escapeHtml(row.values.category)}</span></td>
+            <td class="entry-kind">${escapeHtml(row.values.type)}</td>
+            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="timeline-item-name">${escapeHtml(row.values.item)}</span><span class="timeline-item-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
+            <td class="timeline-item-value" title="${escapeAttr(row.values.itemValue)}">${escapeHtml(row.values.itemValue)}</td>
+          </tr>`;
+    }
+
+    function selectTimelineEntry(entryId, eventIndex) {
+      selectTimelineEvent(entryId, eventIndex, false);
+    }
+
+    // Which plotted graph bucket holds a given timestamp, so the detail pane's
+    // per-timestamp "jump" action can move the graph cursor to it.
+    function timelineBucketIndexForMs(timestampMs) {
+      if (!Number.isFinite(timestampMs)) {
+        return -1;
+      }
+      const buckets = state.timeline.graphBuckets || [];
+      return buckets.findIndex((bucket) => timestampMs >= bucket.startMs && timestampMs < bucket.endMs);
+    }
+
+    // "Jump to this timestamp on the timeline": select the exact event AND move
+    // the graph focus to the bucket containing it (same focus mechanism the
+    // graph points use), so the cursor and the filtered table both land on it.
+    function jumpTimelineToEvent(entryId, eventIndex) {
+      const events = timelineEventsForEntryId(entryId);
+      const numericEventIndex = Number(eventIndex);
+      const target = events.find((event) => Number(event.index) === numericEventIndex) || null;
+      if (target && Number.isFinite(target.timestampMs)) {
+        const bucketIndex = timelineBucketIndexForMs(target.timestampMs);
+        if (bucketIndex >= 0) {
+          // focusTimelineBucket lands on the bucket's first event; re-select the
+          // specific one afterwards so the examiner's chosen timestamp stays
+          // selected, not just the bucket.
+          focusTimelineBucket(bucketIndex);
+        }
+      }
+      selectTimelineEvent(entryId, eventIndex, false);
+    }
+
+    // One clickable chip per timestamp facet of the selected entry (Created /
+    // Accessed / Modified / MFT modified / artifact times), each a clock-icon
+    // "jump to this timestamp on the timeline" action per the reference design.
+    function timelineEventJumpChips(entry) {
+      const events = timelineEventsForEntryId(entry.id);
+      if (!events.length) {
+        return "";
+      }
+      const selectedIndex = Number(state.timeline.selectedEventIndex);
+      const chips = events.map((event) => {
+        const active = Number(event.index) === selectedIndex ? " active" : "";
+        const stamp = escapeHtml(event.timestamp || "(no timestamp)");
+        const attr = escapeHtml(event.attribute || "Timestamp");
+        return `<button type="button" class="timeline-jump${active}" title="Jump to this timestamp on the timeline"
+            onclick="jumpTimelineToEvent(${entry.id}, ${event.index})">
+            <span class="timeline-jump-clock" aria-hidden="true">&#128340;</span>
+            <span class="timeline-jump-stamp">${stamp}</span>
+            <span class="timeline-jump-attr">${attr}</span>
+          </button>`;
+      }).join("");
+      return `<div class="timeline-detail-jumps"><h4>Timestamps (${events.length})</h4>${chips}</div>`;
+    }
+
+    // Right-hand detail pane. Reuses the shared metadataView inspector, which
+    // already adapts by artifact type (file entries -> Forensic Location +
+    // MAC Times; email/browser records -> their artifact info sections), so the
+    // "detail pane adapts by type" requirement is satisfied without a bespoke
+    // variant. A timeline-specific header adds the selected timestamp and the
+    // per-timestamp jump chips on top.
+    function renderTimelineDetail() {
+      const pane = $("timelineDetail");
+      if (!pane) {
+        return;
+      }
+      if (!state.data || !state.timeline.built) {
+        pane.innerHTML = `<div class="timeline-detail-empty">Build the timeline, then select an event to see file details or artifact information.</div>`;
+        return;
+      }
+      const selectedEntryId = state.timeline.selectedEntryId !== null && state.timeline.selectedEntryId !== undefined
+        ? state.timeline.selectedEntryId
+        : null;
+      if (selectedEntryId === null) {
+        pane.innerHTML = `<div class="timeline-detail-empty">Select a timeline event to see file details or artifact information.</div>`;
+        return;
+      }
+      const entry = timelineEntryById(selectedEntryId);
+      if (!entry) {
+        pane.innerHTML = `<div class="timeline-detail-empty">The selected timeline item is not loaded.</div>`;
+        return;
+      }
+      const events = timelineEventsForEntryId(entry.id);
+      const position = timelineSelectedEventPosition(events);
+      const current = position >= 0 ? events[position] : null;
+      const selectedLine = current
+        ? `<div class="timeline-detail-selected">${fileIconHtml(entry)}<span>${escapeHtml(current.timestamp || "(no timestamp)")}</span><span class="timeline-jump-attr">${escapeHtml(current.attribute || "")}</span></div>`
+        : `<div class="timeline-detail-selected">${fileIconHtml(entry)}<span>${escapeHtml(timelineItemName(entry))}</span></div>`;
+      const head = `<div class="timeline-detail-head">${selectedLine}${timelineEventJumpChips(entry)}</div>`;
+      pane.innerHTML = head + metadataView(entry);
+    }
+
+    // Single-entry "Create export/report": bookmark this one entry, then export
+    // the case report - reuses the same exportReport() the selection flow uses.
+    async function bookmarkEntryAndExportReport(entryId) {
+      try {
+        await bookmarkEntry(entryId, false);
+      } catch (err) {
+        setNotice(err.message || String(err), true);
+        return;
+      }
+      await refresh();
+      await exportReport();
+    }
+
+    // Single-entry "Save artifact to...": write this file's bytes out via the
+    // same /api/entry/recover path exportSelectedEntries uses.
+    async function exportTimelineEntryFile(entryId) {
+      const entry = timelineEntryById(entryId);
+      if (!entry) {
+        setNotice("Timeline entry is not loaded.", true);
+        return;
+      }
+      if (entry.entry_kind !== "file") {
+        setNotice("Only file entries have bytes to save. This row is a " + (entry.entry_kind || "record") + ".", true);
+        return;
+      }
+      setNotice("Saving " + (entry.name || logicalName(entry.logical_path)) + "...");
+      try {
+        const data = await apiPost("/api/entry/recover", {
+          case_path: currentCasePath(),
+          entry_id: entry.id,
+          output_path: defaultRecoveryPath(entry)
+        });
+        setNotice("Saved " + (entry.name || logicalName(entry.logical_path)) + " to " + (data.output_path || "ui-output") + ".");
+      } catch (err) {
+        setNotice(err.message || String(err), true);
+      }
+    }
+
+    // Timeline-specific right-click menu (reference design: Create export/report
+    // | Add/remove tag | Save artifact to...), reusing the shared ctxItem/
+    // openContextMenu/entrySelectionCtxRows machinery.
+    function showTimelineContextMenu(event, entryId, eventIndex) {
+      const entry = timelineEntryById(entryId);
+      const menu = $("ctxMenu");
+      if (!entry || !menu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const numericEventIndex = Number(eventIndex);
+      const rows = [];
+      if (Number.isFinite(numericEventIndex)) {
+        rows.push(ctxItem("Select event", `selectTimelineEvent(${entryId}, ${numericEventIndex}, false)`));
+        rows.push(ctxItem("Jump to this timestamp", `jumpTimelineToEvent(${entryId}, ${numericEventIndex})`));
+      }
+      if (entry.entry_kind === "file" && entry.id != null) {
+        rows.push(ctxItem("View bytes", `openEntry(${entryId})`));
+      }
+      rows.push(ctxItem("Go to folder", `goToEntryFolder(${entryId})`));
+      rows.push('<div class="sep"></div>');
+      rows.push(ctxItem("Add/remove tag (bookmark)", `bookmarkEntry(${entryId})`));
+      rows.push(ctxItem("Create export/report", `bookmarkEntryAndExportReport(${entryId})`));
+      if (entry.entry_kind === "file" && entry.id != null) {
+        rows.push(ctxItem("Save artifact to...", `exportTimelineEntryFile(${entryId})`));
+      }
+      entrySelectionCtxRows(rows);
+      openContextMenu(menu, rows, event);
+    }
+
+    function timelineScopeNoticeHtml() {
+      if (!state.data || !state.data.entries_truncated) {
+        return "";
+      }
+      const loaded = Number(state.timeline.loadedEntryCount || 0).toLocaleString();
+      const total = Number(state.timeline.totalEntryCount || state.data.entry_count || 0).toLocaleString();
+      return `<div class="analysis-status">Timeline is built client-side from ${loaded} loaded entries out of ${total} indexed entries.</div>`;
+    }
+
+    function renderTimeline() {
+      const table = $("timelineTable");
+      const graph = $("timelineGraph");
+      const timestampNav = $("timelineTimestampNav");
+      const count = $("timelineCount");
+      const summary = $("timelineSummary");
+      if (!table || !graph || !timestampNav || !count || !summary) {
+        return;
+      }
+      syncDateFilterInputs();
+      if (!state.data) {
+        count.textContent = "not built";
+        summary.textContent = "No case loaded.";
+        graph.innerHTML = empty("No timeline data to plot.");
+        timestampNav.innerHTML = `<div class="timeline-selection-title muted">Select a timeline event</div>`;
+        table.innerHTML = empty("Load or create a case to build a timeline.");
+        renderTimelineDetail();
+        return;
+      }
+      if (state.timeline.casePath && state.timeline.casePath !== state.casePath) {
+        state.timeline = newTimelineState();
+      }
+      if (!state.timeline.built) {
+        count.textContent = "not built";
+        summary.innerHTML = `<span><strong>${Number(state.data.entry_count || 0).toLocaleString()}</strong> indexed entries available</span>`;
+        graph.innerHTML = empty("No timeline data to plot.");
+        timestampNav.innerHTML = `<div class="timeline-selection-title muted">Build the timeline to select timestamped events</div>`;
+        table.innerHTML = empty("Build the timeline to aggregate timestamped events from loaded entries.");
+        renderTimelineDetail();
+        return;
+      }
+      const allEvents = state.timeline.events || [];
+      const dateFilteredEvents = timelineDateFilteredEvents(allEvents);
+      const tableEvents = timelineFocusFilteredEvents(dateFilteredEvents);
+      renderTimelineGraph(dateFilteredEvents);
+      timestampNav.innerHTML = timelineSelectionNavHtml();
+      const rows = tableEvents.map(timelineGridRow);
+      const columns = timelineGridColumns();
+      const tableResult = sortableGridTable("timeline", columns, rows, "timeline-table", renderTimelineGridRow);
+      count.textContent = tableResult.visibleRows.length.toLocaleString() + " events";
+      const baseText = dateFilterActive()
+        ? "date filtered from " + allEvents.length.toLocaleString() + " total events"
+        : allEvents.length.toLocaleString() + " total events";
+      const focusText = state.timeline.focusBucket
+        ? "bucket " + timelineBucketLabel(state.timeline.focusBucket.startMs, state.timeline.focusBucket.unit)
+        : "";
+      summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> shown</span><span>${escapeHtml(focusText || baseText)}</span><span>${Number(state.timeline.sourceEntries || 0).toLocaleString()} loaded entries scanned</span>`;
+      const filterStatus = gridFilterStatusHtml("timeline", columns, tableResult.visibleRows.length, tableEvents.length, "events");
+      const noRows = tableResult.visibleRows.length
+        ? ""
+        : empty(tableEvents.length ? "No timeline events match the column filters." : "No timestamped events match the active date or bucket filter.");
+      table.innerHTML = timelineScopeNoticeHtml() + filterStatus + tableResult.html + noRows;
+      renderTimelineDetail();
+      scrollTimelineToSelectedEvent();
     }
 
     function categoryKey(main, sub) {
@@ -8856,6 +13191,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         metadata.email_from ? "From: " + metadata.email_from : "",
         metadata.email_to ? "To: " + metadata.email_to : "",
         metadata.email_subject ? "Subject: " + metadata.email_subject : "",
+        metadata.email_attachment_names ? "Attachments: " + arrayText(metadata.email_attachment_names) : "",
         metadata.email_body_preview
       ]);
     }
@@ -8888,7 +13224,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "email_format", "email_parser", "email_parser_status", "email_parser_error",
         "email_from", "email_to", "email_cc", "email_bcc", "email_subject",
         "email_date", "email_message_id", "email_reply_to", "email_in_reply_to",
-        "email_body_preview", "source_entry_name", "filesystem_parser", "ntfs_path",
+        "email_body_preview", "email_attachment_names", "pst_folder_path", "pst_parser_scope",
+        "pst_attachment_content_extraction", "pst_deleted_recovery", "source_entry_name", "filesystem_parser", "ntfs_path",
         "fat_path", "ntfs_standard_modification_time_utc", "ntfs_modification_time_utc"
       ].forEach((key) => {
         if (metadata[key] !== undefined && metadata[key] !== null && String(metadata[key]).length > 0) {
@@ -9066,6 +13403,111 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
 
+    // Builds a court-ready record for a specific byte range highlighted in the
+    // hex viewer: works for indexed entries, live-browse files (no DB entry
+    // yet), and raw container offsets alike, since currentHexEntry() already
+    // normalizes those three sources into one shape.
+    function hexSelectionItemRef(entry, range, bytes) {
+      const metadata = entry.metadata_json || {};
+      const evidence = evidenceSourceForEntry(entry) || {};
+      const isRaw = metadata.source === "raw_image";
+      const isLive = metadata.source === "live_browse";
+      const filesystemContext = isRaw || (!isLive && state.hex.entryId === entry.id && state.hex.byteContext === "filesystem");
+      const liveEntry = isLive ? (liveEntryByPath(metadata.volume, metadata.image_path) || {}) : {};
+      const containerStartOffset = isRaw ? (Number(metadata.start_offset) || 0) : null;
+      const fileDataPhysicalOffset = firstDefined(isLive ? liveEntry.file_data_physical_offset : metadata.file_data_physical_offset);
+      const fileDataFileOffset = Number(firstDefined(isLive ? liveEntry.file_data_file_offset : metadata.file_data_file_offset) || 0);
+      const fileDataContiguousBytes = Number(firstDefined(isLive ? liveEntry.file_data_contiguous_bytes : metadata.file_data_contiguous_bytes));
+      const diskLocation = !isRaw && !isLive ? resolvedDiskLocation() : null;
+      const selectionLength = range.end - range.start + 1;
+      let selectionFileStart = range.start;
+      let selectionFileEnd = range.end;
+      let selectionDecodedStart = null;
+      let selectionDecodedEnd = null;
+      let physicalBasis = "unknown - offset within source could not be resolved";
+      if (filesystemContext) {
+        selectionDecodedStart = range.start;
+        selectionDecodedEnd = range.end;
+        physicalBasis = isRaw
+          ? "direct decoded-media offsets in raw view"
+          : "direct decoded-media offsets in file-system view";
+        if (isRaw) {
+          selectionFileStart = range.start - containerStartOffset;
+          selectionFileEnd = range.end - containerStartOffset;
+        } else if (diskLocation && decodedRangeWithinDiskLocation(diskLocation, range.start, range.end)) {
+          selectionFileStart = Number(diskLocation.file_relative_offset || 0)
+            + range.start - Number(diskLocation.decoded_media_offset);
+          selectionFileEnd = selectionFileStart + selectionLength - 1;
+          physicalBasis = diskLocation.basis + " (verified contiguous mapping)";
+        } else {
+          selectionFileStart = null;
+          selectionFileEnd = null;
+        }
+      } else if (diskLocation && fileRangeWithinDiskLocation(diskLocation, range.start, range.end)) {
+        selectionDecodedStart = Number(diskLocation.decoded_media_offset)
+          + range.start - Number(diskLocation.file_relative_offset || 0);
+        selectionDecodedEnd = selectionDecodedStart + selectionLength - 1;
+        physicalBasis = diskLocation.basis + " (verified contiguous mapping)";
+      } else if (fileDataPhysicalOffset != null) {
+        const delta = range.start - fileDataFileOffset;
+        const rangeIsVerified = delta >= 0 && Number.isFinite(fileDataContiguousBytes)
+          && range.end < fileDataFileOffset + fileDataContiguousBytes;
+        if (rangeIsVerified || (delta === 0 && selectionLength === 1)) {
+          selectionDecodedStart = Number(fileDataPhysicalOffset) + delta;
+          selectionDecodedEnd = selectionDecodedStart + selectionLength - 1;
+          physicalBasis = rangeIsVerified
+            ? "parser-recorded file-data range (verified contiguous mapping)"
+            : "parser-recorded exact file-data start";
+        }
+      }
+      const createdUtc = firstDefined(isLive ? liveEntry.created_utc : metadata.created_utc);
+      const modifiedUtc = firstDefined(isLive ? liveEntry.modified_utc : metadata.modified_utc);
+      const accessedUtc = firstDefined(isLive ? liveEntry.accessed_utc : metadata.accessed_utc);
+      return {
+        kind: "highlighted_bytes",
+        entry_kind: entry.entry_kind,
+        evidence_id: entry.evidence_id,
+        entry_id: entry.id || null,
+        logical_path: entry.logical_path,
+        relative_path: isLive ? metadata.image_path : entry.logical_path,
+        display_name: entry.name || logicalName(entry.logical_path),
+        evidence_source: evidence.display_name || evidence.source_path || "",
+        source: isRaw ? "raw_image_container" : (isLive ? "live_browse_unindexed" : "indexed_case_entry"),
+        volume: metadata.volume == null ? null : metadata.volume,
+        size_bytes: isLive ? (liveEntry.size_bytes == null ? null : liveEntry.size_bytes) : entry.size_bytes,
+        is_deleted: Boolean(entry.is_deleted),
+        storage_area: metadata.storage_area || "",
+        is_file_slack: Boolean(metadata.is_file_slack),
+        is_unallocated: Boolean(metadata.is_unallocated),
+        has_macb_times: Boolean(createdUtc || modifiedUtc || accessedUtc),
+        created_utc: createdUtc || null,
+        modified_utc: modifiedUtc || null,
+        accessed_utc: accessedUtc || null,
+        mft_record_logical_offset: isLive ? liveEntry.mft_record_logical_offset : metadata.mft_record_logical_offset,
+        mft_record_physical_offset: isLive ? liveEntry.mft_record_physical_offset : metadata.mft_record_physical_offset,
+        file_data_logical_offset: isLive ? liveEntry.file_data_logical_offset : metadata.file_data_logical_offset,
+        file_data_physical_offset: fileDataPhysicalOffset,
+        container_start_offset: containerStartOffset,
+        byte_context: filesystemContext ? "filesystem" : "file",
+        selection_view_offset_start: range.start,
+        selection_view_offset_end: range.end,
+        selection_file_offset_start: selectionFileStart,
+        selection_file_offset_end: selectionFileEnd,
+        selection_logical_offset_start: selectionFileStart,
+        selection_logical_offset_end: selectionFileEnd,
+        selection_length_bytes: selectionLength,
+        selection_decoded_media_offset_start: selectionDecodedStart,
+        selection_decoded_media_offset_end: selectionDecodedEnd,
+        selection_physical_offset_start: selectionDecodedStart,
+        selection_physical_offset_end: selectionDecodedEnd,
+        physical_offset_basis: physicalBasis,
+        file_extension: filesystemFileExtension(entry),
+        hex_preview: bytes.map(byteHex).join(" "),
+        ascii_preview: printableAsciiPreview(bytes),
+        metadata: reportMetadata(metadata)
+      };
+    }
+
     function reportMetadata(metadata) {
       const copy = {};
       Object.keys(metadata || {}).forEach((key) => {
@@ -9073,6 +13515,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
           copy[key] = metadata[key];
         }
       });
+      if (isBrowserActivityKind(copy.artifact_kind)) {
+        if (!firstText(copy.created_utc)) {
+          const created = browserArtifactDisplayTime(copy, "created");
+          if (created) {
+            copy.created_utc = created;
+          }
+        }
+        if (!firstText(copy.accessed_utc)) {
+          const accessed = browserArtifactDisplayTime(copy, "accessed");
+          if (accessed) {
+            copy.accessed_utc = accessed;
+          }
+        }
+        if (!firstText(copy.modified_utc)) {
+          const modified = browserArtifactDisplayTime(copy, "modified");
+          if (modified) {
+            copy.modified_utc = modified;
+          }
+        }
+      }
       return copy;
     }
 
@@ -9097,6 +13559,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function compactParts(values) {
       return values.map((value) => String(value ?? "").trim()).filter(Boolean).join(" | ");
+    }
+
+    function arrayText(value) {
+      if (Array.isArray(value)) {
+        return value.map((part) => String(part ?? "").trim()).filter(Boolean).join(", ");
+      }
+      return String(value ?? "").trim();
     }
 
     function compactJson(value) {
@@ -9253,8 +13722,59 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
 
+    function hexViewerStatus(entry, data) {
+      const path = entry ? entry.logical_path + " | " : "";
+      const bytesRead = Number(data.bytes_read || 0);
+      if (isFilesystemByteContext()) {
+        const location = resolvedDiskLocation();
+        const offset = Number(data.offset || 0);
+        const end = offset + Math.max(0, bytesRead - 1);
+        let mapping = "";
+        if (location) {
+          const mappedStart = Number(location.decoded_media_offset);
+          const mappedEnd = mappedStart + diskLocationMappedLength(location) - 1;
+          if (offset >= mappedStart && offset <= mappedEnd) {
+            const fileOffset = Number(location.file_relative_offset || 0) + offset - mappedStart;
+            const verifiedBytes = Math.min(bytesRead, mappedEnd - offset + 1);
+            mapping = " | mapped file offset " + formatOffsetPair(fileOffset);
+            if (verifiedBytes < bytesRead) {
+              mapping += " | first " + verifiedBytes + " bytes in verified file-data range";
+            }
+          } else if (bytesRead > 0 && end >= mappedStart && offset <= mappedEnd) {
+            mapping = " | window overlaps resolved file-data range";
+          } else {
+            mapping = " | outside resolved file-data range";
+          }
+        }
+        return path + "File system view | decoded-media offset " + formatOffsetPair(offset)
+          + mapping + " | " + bytesRead + " media bytes read";
+      }
+      return path + "File view | file-relative offset " + formatOffsetPair(data.offset)
+        + " | " + bytesRead + " bytes read | " + formatBytes(data.total_size) + " file total"
+        + (data.eof ? " | EOF" : "");
+    }
+
+    function byteContextNotice() {
+      if (!state.hex || !state.hex.data) {
+        return "";
+      }
+      if (!isFilesystemByteContext()) {
+        return `<div class="hex-info"><strong>File view:</strong> logical file bytes; offsets are file-relative.</div>`;
+      }
+      const location = resolvedDiskLocation();
+      if (!location) {
+        return `<div class="hex-info"><strong>File system view:</strong> decoded evidence bytes; offsets are absolute decoded-media offsets.</div>`;
+      }
+      const mappedStart = Number(location.decoded_media_offset);
+      const mappedEnd = mappedStart + diskLocationMappedLength(location) - 1;
+      const fileStart = Number(location.file_relative_offset || 0);
+      const warning = location.warning ? `<br>${escapeHtml(location.warning)}` : "";
+      return `<div class="hex-info"><strong>File system view:</strong> decoded-media range ${escapeHtml(formatOffsetPair(mappedStart))}-${escapeHtml(formatOffsetPair(mappedEnd))} maps to file offset ${escapeHtml(formatOffsetPair(fileStart))}. Basis: ${escapeHtml(location.basis)}.${warning}</div>`;
+    }
+
     function renderHexViewer(error) {
       updateDataInterpreter();
+      updateByteContextControls();
       const data = state.hex.data;
       const entry = currentHexEntry();
       const mode = $("viewerMode").value;
@@ -9285,13 +13805,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setInspectorState("detail");
         $("hexStatus").textContent = state.hex.fetching
           ? entry.logical_path + " | reading bytes..."
-          : entry.logical_path + " | choose View to read bytes.";
+          : entry.logical_path + (isFilesystemByteContext()
+            ? " | File system view | choose View to read decoded-media bytes."
+            : " | File view | choose View to read file bytes.");
         $("hexView").className = "hex-view";
         $("hexView").innerHTML = "";
         return;
       }
       setInspectorState("active");
-      $("hexStatus").textContent = `${entry ? entry.logical_path + " | " : ""}${formatBytes(data.total_size)} total | ${data.bytes_read} bytes read | offset ${data.offset}${data.eof ? " | EOF" : ""}`;
+      $("hexStatus").textContent = hexViewerStatus(entry, data);
       if (mode === "text") {
         $("hexView").className = "text-view";
         $("hexView").textContent = decodeText(data.bytes);
@@ -9306,6 +13828,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const decode = currentHexDecode(data);
       return [
         rawFindBar(),
+        byteContextNotice(),
         containerByteNotice(),
         hexCurrentBar(decode),
         `<div class="hex-grid">${hexRows(data.bytes, data.offset)}</div>`,
@@ -9771,6 +14294,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return (Number(value) & 255).toString(16).padStart(2, "0").toUpperCase();
     }
 
+    function printableAsciiPreview(bytes) {
+      return (bytes || []).map((value) => (value >= 32 && value <= 126 ? String.fromCharCode(value) : ".")).join("");
+    }
+
     function formatOffsetPair(value) {
       const offset = Number(value) || 0;
       return `${offset} (0x${offset.toString(16).toUpperCase().padStart(8, "0")})`;
@@ -9887,6 +14414,62 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderHexViewer();
     }
 
+    // The hex viewer's "Bookmark" button: if bytes are highlighted, bookmark
+    // that exact range as a highlighted_data bookmark item (works for indexed
+    // entries, live-browse files, and raw container offsets alike, since none
+    // of those previously produced a bookmarkable "entry" for a byte range).
+    // With no byte selection it falls back to whole-item bookmarking.
+    async function bookmarkHexTarget() {
+      const entry = currentHexEntry();
+      if (!entry) {
+        setNotice("Select a file before bookmarking.", true);
+        return;
+      }
+      const range = selectedHexRangeForData(state.hex.data);
+      if (!range) {
+        if (state.hex.entryId) {
+          await bookmarkEntry(state.hex.entryId);
+        } else if (state.hex.live) {
+          try {
+            await postLiveBookmark(state.hex.live.volume, state.hex.live.path, state.hex.live.name, false);
+            await refresh();
+            setNotice("Bookmarked " + state.hex.live.name + ".");
+          } catch (err) {
+            setNotice(err.message, true);
+          }
+        } else {
+          setNotice("Select bytes to bookmark a highlighted range, or bookmark the whole file from its tree row.", true);
+        }
+        return;
+      }
+      const bytes = hexBytesForRange(state.hex.data, range);
+      const displayName = entry.name || logicalName(entry.logical_path);
+      const offsetLabel = "0x" + range.start.toString(16).toUpperCase() + "-0x" + range.end.toString(16).toUpperCase();
+      const offsetKind = isFilesystemByteContext() ? "decoded-media offset" : "file offset";
+      try {
+        await apiPost("/api/bookmark/quick", {
+          case_path: currentCasePath(),
+          folder_name: "Highlighted Data",
+          title: "Highlight: " + displayName + " @ " + offsetKind + " " + offsetLabel,
+          comment: bytes.length + " byte(s) selected at " + offsetKind + " " + offsetLabel + ".",
+          bookmark_type: "highlighted_data",
+          data_type: "Highlighted Bytes",
+          evidence_id: entry.evidence_id,
+          entry_id: entry.id || null,
+          display_name: displayName,
+          logical_path: entry.logical_path,
+          selection_offset: range.start,
+          selection_length: bytes.length,
+          data_preview: printableAsciiPreview(bytes),
+          item_ref_json: hexSelectionItemRef(entry, range, bytes)
+        });
+        await refresh();
+        setNotice("Bookmarked " + bytes.length + " selected byte(s) from " + displayPath(entry.logical_path) + ".");
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
     async function copyHexSelection() {
       const range = selectedHexRangeForData(state.hex.data);
       if (!range) {
@@ -9918,7 +14501,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const entry = currentHexEntry();
       const baseName = entry ? (entry.name || logicalName(entry.logical_path)) : "entry-" + state.hex.entryId;
       const safeName = String(baseName).replace(/[^A-Za-z0-9._-]+/g, "_");
-      const fileName = safeName + "-0x" + range.start.toString(16).toUpperCase() + "-" + bytes.length + "b.bin";
+      const contextName = isFilesystemByteContext() ? "media" : "file";
+      const fileName = safeName + "-" + contextName + "-0x" + range.start.toString(16).toUpperCase() + "-" + bytes.length + "b.bin";
       const blob = new Blob([new Uint8Array(bytes)], { type: "application/octet-stream" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -9982,6 +14566,69 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    function artifactTimestampRows(raw) {
+      return [
+        ["Email Date", raw.email_date],
+        ["Visit Time", raw.visit_time_utc],
+        ["Last Visit", raw.last_visit_time_utc],
+        ["First Used", raw.first_used_utc],
+        ["Last Used", raw.last_used_utc || raw.date_last_used_utc || raw.time_last_used_utc],
+        ["Added", raw.date_added_utc],
+        ["Started", raw.start_time_utc],
+        ["Ended", raw.end_time_utc],
+        ["Account Created", raw.date_created_utc || raw.time_created_utc],
+        ["Password Changed", raw.time_password_changed_utc],
+        ["Cookie Created", raw.creation_utc],
+        ["Last Access", raw.last_access_utc || raw.last_accessed_utc],
+        ["Expires", raw.expires_utc || raw.expiry_utc],
+        ["Registry Last Write", raw.registry_key_last_write_utc],
+        ["Event Logged", raw.evtx_logged_utc],
+        ["Cache Created", raw.artifact_kind === "browser_cache_entry" ? raw.created_utc : ""]
+      ];
+    }
+
+    function sourceFileTimesSection(raw) {
+      const basis = raw.source_file_time_basis || "";
+      const path = raw.source_artifact_path_exact || raw.source_artifact_path;
+      const hasSource = path || raw.source_file_created_utc || raw.source_file_modified_utc || raw.source_file_accessed_utc;
+      if (!hasSource) return "";
+      let title = "Source File Times";
+      let basisLabel = "Basis not recorded";
+      if (basis === "original_evidence_filesystem") {
+        title = "Original Source File MACB";
+        basisLabel = "Indexed source filesystem metadata";
+      } else if (basis === "local_source_filesystem") {
+        title = "Imported Local Source File Times";
+        basisLabel = "Local filesystem metadata captured at import";
+      } else if (basis === "original_evidence_path_resolved_times_unavailable") {
+        title = "Original Source File";
+        basisLabel = "Source path resolved; filesystem times unavailable";
+      }
+      return detailSection(title, [
+        ["Path", path],
+        ["Source Entry ID", raw.source_entry_id],
+        ["Timestamp Basis", basisLabel],
+        ["Created", raw.source_file_created_utc],
+        ["Modified", raw.source_file_modified_utc],
+        ["Accessed", raw.source_file_accessed_utc],
+        ["MFT Modified", raw.source_file_mft_modified_utc],
+        ["SHA-256", raw.source_file_sha256],
+        ["Size", raw.source_file_size_bytes == null ? "" : formatBytes(raw.source_file_size_bytes)]
+      ]);
+    }
+
+    function stagingCopyTimesSection(raw) {
+      const hasStaging = raw.source_artifact_staging_path || raw.staging_file_created_utc || raw.staging_file_modified_utc || raw.staging_file_accessed_utc;
+      if (!hasStaging) return "";
+      return detailSection("Staging Copy Times (not evidence MACB)", [
+        ["Path", raw.source_artifact_staging_path],
+        ["Created", raw.staging_file_created_utc],
+        ["Modified", raw.staging_file_modified_utc],
+        ["Accessed", raw.staging_file_accessed_utc],
+        ["Size", raw.staging_file_size_bytes == null ? "" : formatBytes(raw.staging_file_size_bytes)]
+      ]);
+    }
+
     function metadataView(entry) {
       const metadata = JSON.stringify(entry.metadata_json || {}, null, 2);
       const raw = entry.metadata_json || {};
@@ -10026,18 +14673,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Tags", Array.isArray(raw.category_tags) ? raw.category_tags.join(", ") : raw.category_tags]
         ]),
         recordDetails(entry),
-        detailSection("MAC Times", [
-          ["NTFS Created", raw.ntfs_creation_time_utc || raw.ntfs_standard_creation_time_utc],
-          ["NTFS Modified", raw.ntfs_modification_time_utc || raw.ntfs_standard_modification_time_utc],
-          ["NTFS Accessed", raw.ntfs_access_time_utc || raw.ntfs_standard_access_time_utc],
-          ["NTFS MFT Modified", raw.ntfs_mft_record_modification_time_utc || raw.ntfs_standard_mft_record_modification_time_utc],
-          ["FAT Created", raw.fat_created],
-          ["FAT Modified", raw.fat_modified],
-          ["FAT Accessed", raw.fat_accessed],
-          ["Source Created", raw.source_file_created_utc],
-          ["Source Modified", raw.source_file_modified_utc],
-          ["Source Accessed", raw.source_file_accessed_utc]
+        detailSection("Artifact Timestamps", artifactTimestampRows(raw)),
+        detailSection("File-system MACB", [
+          ["Created", filesystemCreatedTime(entry)],
+          ["Modified", filesystemModifiedTime(entry)],
+          ["Accessed", filesystemAccessedTime(entry)],
+          ["MFT Modified", filesystemMftModifiedTime(entry)]
         ]),
+        sourceFileTimesSection(raw),
+        stagingCopyTimesSection(raw),
         detailSection("Parser And Source", [
           ["Artifact Kind", raw.artifact_kind],
           ["Filesystem Parser", raw.filesystem_parser],
@@ -10049,8 +14693,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["NTFS Path", raw.ntfs_path],
           ["FAT Path", raw.fat_path],
           ["Source Artifact", raw.source_artifact],
-          ["Source Path", raw.source_artifact_path || raw.source_path],
-          ["Source Modified", raw.source_file_modified_utc]
+          ["Source Path", raw.source_artifact_path_exact || raw.source_artifact_path || raw.source_path],
+          ["Source Profile", raw.source_profile_path_exact],
+          ["Derived From Evidence", raw.source_evidence_id]
         ]),
         `<section class="metadata-section"><details><summary>Metadata JSON</summary><pre>${escapeHtml(metadata)}</pre></details></section>`
       ].filter(Boolean).join("");
@@ -10102,7 +14747,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         metadata.visit_time_utc ? "Visited: " + metadata.visit_time_utc : "",
         metadata.date_added_utc ? "Added: " + metadata.date_added_utc : "",
         metadata.folder ? "Folder: " + metadata.folder : "",
-        metadata.source_artifact_path ? "Source: " + metadata.source_artifact_path : ""
+        (metadata.source_artifact_path_exact || metadata.source_artifact_path) ? "Source: " + (metadata.source_artifact_path_exact || metadata.source_artifact_path) : ""
       ].filter(Boolean).map((value) => `<span>${escapeHtml(value)}</span>`).join("");
       const body = firstText(browserActivityPreview(entry), compactJson(metadata));
       return `<section class="metadata-section"><h3>Preview</h3><div class="preview-card">
@@ -10139,6 +14784,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       ].filter(Boolean).join("");
       const actions = [
         canViewBytes ? `<button class="secondary" onclick="openEntry(${entry.id})">View bytes</button>` : "",
+        canOpenEntryExternally(entry) ? `<button class="ghost" onclick="openSelectedEntryExternal(${entry.id})">Open file</button>` : "",
         canAnalyze ? `<button class="secondary" onclick="analyzeDiskImageEntry(${entry.id})">Analyze image</button>` : "",
         entry.entry_kind === "file" && !synthetic ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
         !synthetic ? `<button class="ghost" onclick="bookmarkEntry(${entry.id})">Bookmark</button>` : ""
@@ -10201,6 +14847,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Reply-To", metadata.email_reply_to],
           ["In Reply To", metadata.email_in_reply_to],
           ["Body Preview", metadata.email_body_preview],
+          ["Attachment Names", arrayText(metadata.email_attachment_names)],
+          ["PST Folder", metadata.pst_folder_path],
+          ["PST Parser Scope", metadata.pst_parser_scope],
+          ["PST Attachment Content", metadata.pst_attachment_content_extraction],
+          ["PST Deleted Recovery", metadata.pst_deleted_recovery],
           ["Parser Error", metadata.email_parser_error]
         ]);
       }
@@ -10231,11 +14882,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Transition Code", metadata.transition],
           ["Hidden", metadata.hidden],
           ["Source Artifact", metadata.source_artifact],
-          ["Source Path", metadata.source_artifact_path],
-          ["Source Created", metadata.source_file_created_utc],
-          ["Source Modified", metadata.source_file_modified_utc],
-          ["Source Accessed", metadata.source_file_accessed_utc],
-          ["Source Size", metadata.source_file_size_bytes == null ? "" : formatBytes(metadata.source_file_size_bytes)]
+          ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
       if (metadata.artifact_kind === "browser_bookmark") {
@@ -10251,11 +14898,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Chrome Last Used", metadata.date_last_used_chrome],
           ["GUID", metadata.guid],
           ["Source Artifact", metadata.source_artifact],
-          ["Source Path", metadata.source_artifact_path],
-          ["Source Created", metadata.source_file_created_utc],
-          ["Source Modified", metadata.source_file_modified_utc],
-          ["Source Accessed", metadata.source_file_accessed_utc],
-          ["Source Size", metadata.source_file_size_bytes == null ? "" : formatBytes(metadata.source_file_size_bytes)]
+          ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
       if (metadata.artifact_kind === "browser_preference") {
@@ -10273,11 +14916,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Homepage Is New Tab", metadata.homepage_is_newtabpage],
           ["Prompt For Download", metadata.prompt_for_download],
           ["Source Artifact", metadata.source_artifact],
-          ["Source Path", metadata.source_artifact_path],
-          ["Source Created", metadata.source_file_created_utc],
-          ["Source Modified", metadata.source_file_modified_utc],
-          ["Source Accessed", metadata.source_file_accessed_utc],
-          ["Source Size", metadata.source_file_size_bytes == null ? "" : formatBytes(metadata.source_file_size_bytes)]
+          ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
       return "";
@@ -10303,63 +14942,876 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("searchEvidence").value = current;
     }
 
+    // Bitwise hits from the unified search's "All" mode. Sector is offset/512
+    // (BitLocker/NTFS/most media logical sector size); the backend
+    // court-admissibility pass adds authoritative sector size + partition/volume
+    // containment and makes hits bookmarkable into the report.
+    function rawSearchResultColumns() {
+      const columns = [];
+      if (state.rawSearchResult && state.rawSearchResult.multiSource) {
+        columns.push({ key: "evidence", label: "Evidence", sortable: true, filterable: true, sortType: "text" });
+      }
+      columns.push(
+        { key: "offset", label: "Offset", sortable: true, filterable: true, sortType: "number" },
+        { key: "sector", label: "Sector (512B)", sortable: true, filterable: true, sortType: "number" },
+        { key: "partition", label: "Partition", sortable: true, filterable: true, sortType: "text" },
+        { key: "region", label: "Region", sortable: true, filterable: true, sortType: "text" },
+        { key: "encoding", label: "Encoding", sortable: true, filterable: true, sortType: "text" },
+        { key: "length", label: "Length", sortable: true, filterable: true, sortType: "number" },
+        { key: "preview", label: "Hex", sortable: false, filterable: true, sortType: "text" },
+        { key: "ascii", label: "ASCII", sortable: false, filterable: true, sortType: "text" }
+      );
+      return columns;
+    }
+
+    function rawSearchGridRow(hit, hitIndex) {
+      const offset = Number(hit.offset) || 0;
+      // The backend now reports the authoritative sector; keep the local
+      // computation only as a fallback for older results.
+      const sector = hit.sector != null ? Number(hit.sector) : Math.floor(offset / 512);
+      const partition = hit.volume_name || (hit.partition_index != null ? "#" + hit.partition_index : "");
+      const partitionTitle = [
+        hit.volume_name ? "Volume: " + hit.volume_name : "",
+        hit.filesystem ? "Filesystem: " + hit.filesystem : "",
+        hit.partition_start_offset != null ? "Partition start: " + Number(hit.partition_start_offset).toLocaleString() : ""
+      ].filter(Boolean).join(" | ");
+      return {
+        hit,
+        hitIndex,
+        partitionTitle,
+        values: {
+          evidence: hit.evidence_name || (hit.evidence_id != null ? String(hit.evidence_id) : ""),
+          offset: offset.toLocaleString() + " (0x" + offset.toString(16).toUpperCase() + ")",
+          sector: sector.toLocaleString(),
+          partition: partition,
+          region: hit.region || "",
+          encoding: hit.encoding,
+          length: String(hit.length),
+          preview: hit.data_preview,
+          ascii: hit.ascii_preview || "",
+          actions: ""
+        },
+        sortValues: {
+          offset,
+          sector,
+          length: Number(hit.length) || 0
+        }
+      };
+    }
+
+    function renderRawSearchGridRow(row) {
+      const multi = state.rawSearchResult && state.rawSearchResult.multiSource;
+      const evidenceCell = multi
+        ? `<td title="${escapeAttr(row.values.evidence)}">${escapeHtml(row.values.evidence)}</td>`
+        : "";
+      // Offset and both previews are clickable: they open the whole-device hex
+      // viewer positioned on these exact bytes, with the hit pre-selected, so
+      // the examiner can widen the selection and bookmark it manually from the
+      // full hex/ASCII view (this is the "bigger preview" affordance).
+      const openTitle = "Open this offset in the hex/ASCII viewer (hit bytes pre-selected; drag to extend, then Bookmark selection)";
+      return `
+      <tr data-raw-hit-index="${row.hitIndex}">
+        ${evidenceCell}
+        <td class="entry-offset"><button class="offset-link" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.offset)}</button></td>
+        <td>${escapeHtml(row.values.sector)}</td>
+        <td title="${escapeAttr(row.partitionTitle || row.values.partition)}">${escapeHtml(row.values.partition)}</td>
+        <td class="tiny" title="${escapeAttr(row.values.region)}">${escapeHtml(row.values.region)}</td>
+        <td>${escapeHtml(row.values.encoding)}</td>
+        <td>${escapeHtml(row.values.length)}</td>
+        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.preview)}</td>
+        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.ascii)}</td>
+      </tr>`;
+    }
+
+    // Opens the whole-device raw hex viewer at a hit's absolute disk offset and
+    // pre-selects the hit bytes, so a bitwise-search offset is a click-through
+    // to the exact location in hex/ASCII. Selection offsets are absolute and the
+    // whole-device container base is 0, so a bookmark of the (possibly widened)
+    // selection records the correct absolute decoded-media offset.
+    async function openRawHitInHex(hitIndex) {
+      const result = state.rawSearchResult;
+      const hit = result && result.hits ? result.hits[hitIndex] : null;
+      if (!hit) {
+        setNotice("This bitwise hit is no longer loaded - re-run the search.", true);
+        return;
+      }
+      const evidenceId = hit.evidence_id;
+      const evidence = state.data && state.data.evidence.find((item) => item.id === evidenceId);
+      if (evidence && evidence.source_kind !== "image" && evidence.source_kind !== "file") {
+        setNotice("Only image/file evidence has a raw byte stream to open in hex.", true);
+        return;
+      }
+      const prov = (result.provenance || {})[evidenceId] || {};
+      const offset = Number(hit.offset) || 0;
+      const length = Math.max(1, Number(hit.length) || 1);
+      const bpr = numberValue("bytesPerRow", 16);
+      // Land a little before the hit so it has visible context, aligned to the
+      // row width so columns line up.
+      let viewStart = Math.max(0, offset - 128);
+      viewStart -= viewStart % bpr;
+      const viewLength = Math.max(numberValue("hexLength", 512), (offset - viewStart) + length + 128);
+      const name = (prov.evidence_display_name || (evidence && evidence.display_name) || "evidence");
+      state.hex = makeHexState(null, viewStart, viewLength);
+      state.hex.raw = {
+        evidenceId: evidenceId,
+        name: name + " @ " + offset,
+        logicalPath: "[raw] " + name + " whole-disk @ offset " + offset,
+        startOffset: 0,
+        volume: null,
+        sizeBytes: prov.total_size != null ? Number(prov.total_size) : (evidence && evidence.size_bytes != null ? evidence.size_bytes : null)
+      };
+      $("viewerMode").value = "hex";
+      switchView("analyzeView");
+      try {
+        await fetchEntryBytes();
+      } catch (err) {
+        setNotice("Could not read bytes at offset " + offset + ": " + (err.message || err), true);
+        return;
+      }
+      // Pre-select the hit bytes (absolute offsets) - same mechanism the raw
+      // find uses - so the examiner can immediately see and extend the match.
+      state.hex.selStart = offset;
+      state.hex.selEnd = offset + length - 1;
+      renderHexViewer();
+      setInspectorCollapsed(false);
+      setNotice("Opened " + name + " at disk offset " + offset.toLocaleString() + " (0x" + offset.toString(16).toUpperCase() + "). Hit bytes are selected - drag to extend, then use Bookmark selection.");
+    }
+
+    function renderRawSearchResults() {
+      const container = $("rawSearchResults");
+      const count = $("rawSearchCount");
+      const status = $("rawSearchStatus");
+      if (!container || !count) {
+        return;
+      }
+      const result = state.rawSearchResult;
+      if (!result) {
+        count.textContent = "0";
+        if (status) {
+          status.textContent = state.rawSearchRunning ? "Scanning evidence bytes..." : "";
+        }
+        container.innerHTML = state.rawSearchRunning
+          ? empty("Bitwise whole-disk scan running - reading real evidence bytes; a large scan limit can take a while...")
+          : empty("Run a search in \"All\" mode to scan evidence byte-for-byte.");
+        return;
+      }
+      const sources = result.sources || [];
+      const errored = sources.filter((source) => source.error);
+      if (status) {
+        const sourceText = sources.length
+          ? " across " + sources.length + " source" + (sources.length === 1 ? "" : "s")
+          : "";
+        status.textContent = formatBytes(result.bytes_scanned) + " scanned" + sourceText +
+          bitwiseStopReasonNote(result) +
+          (errored.length ? "; " + errored.length + " errored" : "");
+      }
+      const columns = rawSearchResultColumns();
+      const rows = (result.hits || []).map(rawSearchGridRow);
+      const tableResult = sortableGridTable("rawSearch", columns, rows, "raw-search-table", renderRawSearchGridRow);
+      count.textContent = tableResult.visibleRows.length.toLocaleString();
+      const filterStatus = gridFilterStatusHtml("rawSearch", columns, tableResult.visibleRows.length, rows.length, "hits");
+      // Honest provenance warning: a raw hit's offsets are only as strong as the
+      // evidence identity behind them. Surface any scanned source that has no
+      // acquisition SHA-256 yet, so the examiner hashes it before relying on
+      // (or reporting) these results. The report renderer shows the same
+      // warning if such a bookmark is exported.
+      const unhashed = sources.filter((source) => !source.error && !source.evidence_sha256_hex);
+      const hashWarning = rows.length && unhashed.length
+        ? `<div class="analysis-status" style="color:var(--warn, #b58900)">Evidence not yet hashed: ${escapeHtml(unhashed.map((source) => source.name || String(source.evidence_id)).join(", "))}. Compute the evidence SHA-256 (Evidence tab &gt; Hash) before relying on these offsets in court - bookmarked hits will carry this warning into the report.</div>`
+        : "";
+      const errorNote = errored.length
+        ? empty("Could not scan: " + errored.map((source) => (source.name || source.evidence_id) + " (" + source.error + ")").join("; "))
+        : "";
+      const emptyNote = sources.length === 0
+        ? empty("No image or file evidence to scan byte-for-byte. Attach a disk image or file source.")
+        : empty("No bitwise hits found in the scanned range" + bitwiseStopReasonNote(result) + ".");
+      container.innerHTML = rows.length
+        ? hashWarning + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No hits match the column filters.")) + errorNote
+        : emptyNote + errorNote;
+    }
+
+    // Builds the court-ready item_ref_json for one whole-disk bitwise hit, in
+    // the highlighted_bytes family the report renderer already understands
+    // (kind "highlighted_bytes" + source "raw_image_whole_disk_scan"). All
+    // provenance comes from the per-source RawSearchResult captured at scan
+    // time: evidence identity/hash, scan params, sector/partition containment.
+    function rawSearchHitItemRef(hit, prov) {
+      const offset = Number(hit.offset) || 0;
+      const length = Number(hit.length) || 0;
+      return {
+        kind: "highlighted_bytes",
+        source: "raw_image_whole_disk_scan",
+        evidence_id: prov.evidence_id,
+        entry_id: null,
+        logical_path: "raw image whole-disk scan",
+        relative_path: prov.source_path,
+        display_name: (prov.evidence_display_name || prov.source_path || "evidence") + " @ offset " + offset,
+        evidence_source: prov.evidence_display_name || prov.source_path || "",
+        source_path: prov.source_path,
+        evidence_sha256_hex: prov.evidence_sha256_hex || null,
+        evidence_hashed_at: prov.evidence_hashed_at || null,
+        selection_logical_offset_start: offset,
+        selection_logical_offset_end: offset + Math.max(length, 1) - 1,
+        selection_physical_offset_start: offset,
+        selection_physical_offset_end: offset + Math.max(length, 1) - 1,
+        selection_length_bytes: length,
+        physical_offset_basis: "decoded-media byte offset (within the decoded image stream, not the container/segment file); whole-image scan from offset 0 - exact, not fragment-approximate",
+        sector: hit.sector != null ? Number(hit.sector) : Math.floor(offset / 512),
+        sector_size: prov.sector_size != null ? Number(prov.sector_size) : 512,
+        partition_index: hit.partition_index == null ? null : hit.partition_index,
+        volume_name: hit.volume_name || null,
+        partition_start_offset: hit.partition_start_offset == null ? null : hit.partition_start_offset,
+        filesystem: hit.filesystem || null,
+        region: hit.region || "",
+        encoding: hit.encoding,
+        hex_preview: hit.data_preview,
+        ascii_preview: hit.ascii_preview || "",
+        query: prov.query,
+        encodings: prov.encodings || [],
+        scan_start: prov.scan_start != null ? Number(prov.scan_start) : 0,
+        max_scan_bytes: prov.max_scan_bytes,
+        max_results: prov.max_results,
+        bytes_scanned: prov.bytes_scanned,
+        total_size: prov.total_size,
+        truncated: Boolean(prov.truncated),
+        searched_at: prov.searched_at,
+        actor: prov.actor
+      };
+    }
+
+    async function bookmarkRawSearchHit(hitIndex) {
+      const result = state.rawSearchResult;
+      const hit = result && result.hits ? result.hits[hitIndex] : null;
+      if (!hit) {
+        setNotice("This bitwise hit is no longer loaded - re-run the search.", true);
+        return;
+      }
+      const prov = (result.provenance || {})[hit.evidence_id];
+      if (!prov) {
+        setNotice("No scan provenance is loaded for this hit's evidence - re-run the search.", true);
+        return;
+      }
+      const itemRef = rawSearchHitItemRef(hit, prov);
+      const offsetLabel = Number(hit.offset).toLocaleString() + " (0x" + Number(hit.offset).toString(16).toUpperCase() + ")";
+      const hashNote = prov.evidence_sha256_hex
+        ? ""
+        : " WARNING: evidence had no acquisition SHA-256 at search time - hash the evidence before relying on this offset in court.";
+      try {
+        await apiPost("/api/bookmark/quick", {
+          case_path: currentCasePath(),
+          folder_name: "Raw Search Hits",
+          title: "Raw hit: " + (prov.evidence_display_name || "evidence " + hit.evidence_id) + " @ " + offsetLabel,
+          comment: "Whole-disk bitwise hit for query \"" + (prov.query || result.query || "") + "\" (" + hit.encoding + ") at byte offset " + offsetLabel + ", sector " + itemRef.sector + ", " + (itemRef.region || "unclassified region") + "." + hashNote,
+          bookmark_type: "highlighted_data",
+          data_type: "Highlighted Bytes",
+          evidence_id: hit.evidence_id,
+          entry_id: null,
+          display_name: itemRef.display_name,
+          logical_path: itemRef.logical_path,
+          selection_offset: Number(hit.offset) || 0,
+          selection_length: Number(hit.length) || 0,
+          data_preview: hit.data_preview,
+          item_ref_json: itemRef
+        });
+        await refresh();
+        setNotice("Bookmarked bitwise hit at offset " + offsetLabel + " into \"Raw Search Hits\"." + hashNote, Boolean(hashNote));
+      } catch (err) {
+        setNotice(err.message, true);
+      }
+    }
+
+    function searchResultColumns() {
+      return [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
+        { key: "entry", label: "Entry", sortable: true, filterable: true, sortType: "text" },
+        { key: "match", label: "Match", sortable: true, filterable: true, sortType: "text" },
+        { key: "host", label: "Host", sortable: true, filterable: true, sortType: "text" },
+        { key: "referrer", label: "Referrer", sortable: true, filterable: true, sortType: "text" },
+        { key: "time", label: "Time", sortable: true, filterable: true, sortType: "time" },
+        { key: "offset", label: "Offset", sortable: true, filterable: true, sortType: "number" },
+        { key: "preview", label: "Preview", sortable: true, filterable: true, sortType: "text" }
+      ];
+    }
+
+    function gridColumns(gridId) {
+      switch (gridId) {
+        case "search": return searchResultColumns();
+        case "rawSearch": return rawSearchResultColumns();
+        case "category": return categoryGridColumns();
+        case "folder": return folderGridColumns();
+        case "bookmarks": return bookmarksGridColumns();
+        case "email": return emailGridColumns();
+        case "live": return liveGridColumns();
+        case "indexed": return indexedGridColumns();
+        case "evidence": return evidenceGridColumns();
+        case "attached": return attachedEvidenceGridColumns();
+        case "timeline": return timelineGridColumns();
+        default: return [];
+      }
+    }
+
+    function defaultGridViewState() {
+      return { sort: { column: "", direction: "asc" }, filters: {} };
+    }
+
+    function gridViewState(gridId) {
+      state.gridViews = state.gridViews || {};
+      if (!state.gridViews[gridId]) {
+        const view = defaultGridViewState();
+        if (gridId === "search") {
+          view.sort = state.searchSort || view.sort;
+          view.filters = state.searchColumnFilters || {};
+        }
+        state.gridViews[gridId] = view;
+      }
+      if (gridId === "search") {
+        state.searchSort = state.gridViews[gridId].sort;
+        state.searchColumnFilters = state.gridViews[gridId].filters;
+      }
+      return state.gridViews[gridId];
+    }
+
+    function resetGridView(gridId) {
+      state.gridViews = state.gridViews || {};
+      state.gridViews[gridId] = defaultGridViewState();
+      if (gridId === "search") {
+        state.searchSort = state.gridViews[gridId].sort;
+        state.searchColumnFilters = state.gridViews[gridId].filters;
+      }
+    }
+
+    function gridColumnByKey(gridId, key) {
+      return gridColumns(gridId).find((column) => column.key === key) || null;
+    }
+
+    function gridColumnFilterValue(gridId, key) {
+      const view = gridViewState(gridId);
+      return String((view.filters || {})[key] || "");
+    }
+
+    function gridColumnFiltersActive(gridId, columns = gridColumns(gridId)) {
+      return columns.some((column) =>
+        column.filterable && gridColumnFilterValue(gridId, column.key).trim().length > 0
+      );
+    }
+
+    function activeGridFilters(gridId, columns) {
+      return columns
+        .filter((column) => column.filterable)
+        .map((column) => ({
+          key: column.key,
+          text: gridColumnFilterValue(gridId, column.key).trim().toLowerCase()
+        }))
+        .filter((filter) => filter.text.length > 0);
+    }
+
+    function gridFilteredRows(gridId, columns, rows) {
+      const activeFilters = activeGridFilters(gridId, columns);
+      if (activeFilters.length === 0) {
+        return rows;
+      }
+      return rows.filter((row) => activeFilters.every((filter) =>
+        String((row.values || {})[filter.key] || "").toLowerCase().includes(filter.text)
+      ));
+    }
+
+    function gridNumericValue(value) {
+      if (value === undefined || value === null || String(value).length === 0) {
+        return NaN;
+      }
+      if (typeof value === "number") {
+        return Number.isFinite(value) ? value : NaN;
+      }
+      const text = String(value).trim();
+      if (/^0x[0-9a-f]+$/i.test(text)) {
+        return Number.parseInt(text.slice(2), 16);
+      }
+      if (/^\d+$/.test(text)) {
+        return Number(text);
+      }
+      const match = text.match(/^\d+(?:\.\d+)?/);
+      return match ? Number(match[0]) : NaN;
+    }
+
+    function gridSortValue(row, column) {
+      const key = column.key;
+      if (row.sortValues && Object.prototype.hasOwnProperty.call(row.sortValues, key)) {
+        return row.sortValues[key];
+      }
+      const value = (row.values || {})[key];
+      if (column.sortType === "number") {
+        return gridNumericValue(value);
+      }
+      if (column.sortType === "time") {
+        return Date.parse(value);
+      }
+      return value;
+    }
+
+    function gridSortValueMissing(row, column) {
+      const value = gridSortValue(row, column);
+      if (column.sortType === "number" || column.sortType === "time") {
+        return !Number.isFinite(value);
+      }
+      return String(value || "").trim().length === 0;
+    }
+
+    function compareGridSortValues(left, right, column) {
+      if (typeof column.compare === "function") {
+        return column.compare(left, right);
+      }
+      if (column.sortType === "number" || column.sortType === "time") {
+        return rowSortNumber(left, column) - rowSortNumber(right, column);
+      }
+      return String(gridSortValue(left, column) || "").localeCompare(
+        String(gridSortValue(right, column) || ""),
+        undefined,
+        { sensitivity: "base", numeric: true }
+      );
+    }
+
+    function rowSortNumber(row, column) {
+      const value = gridSortValue(row, column);
+      return Number.isFinite(value) ? value : 0;
+    }
+
+    function gridSortedRows(gridId, columns, rows) {
+      const sort = gridViewState(gridId).sort || {};
+      const column = sort.column ? columns.find((item) => item.key === sort.column) : null;
+      if (!column || !column.sortable) {
+        return rows;
+      }
+      const descending = sort.direction === "desc";
+      return rows.slice().sort((left, right) => {
+        const leftMissing = gridSortValueMissing(left, column);
+        const rightMissing = gridSortValueMissing(right, column);
+        if (leftMissing !== rightMissing) {
+          return leftMissing ? 1 : -1;
+        }
+        const compared = compareGridSortValues(left, right, column);
+        if (compared !== 0) {
+          return descending ? -compared : compared;
+        }
+        return (left.index || 0) - (right.index || 0);
+      });
+    }
+
+    function visibleGridRows(gridId, columns, rows) {
+      const indexedRows = rows.map((row, index) => ({ index, ...row }));
+      return gridSortedRows(gridId, columns, gridFilteredRows(gridId, columns, indexedRows));
+    }
+
+    function rerenderGrid(gridId) {
+      if (gridId === "search") {
+        renderSearchResults();
+        return;
+      }
+      if (gridId === "bookmarks") {
+        renderBookmarks();
+        return;
+      }
+      if (gridId === "evidence") {
+        renderEvidence();
+        return;
+      }
+      if (gridId === "timeline") {
+        renderTimeline();
+        return;
+      }
+      renderEvidenceBrowserEntries();
+    }
+
+    function toggleGridSort(gridId, columnKey) {
+      const column = gridColumnByKey(gridId, columnKey);
+      if (!column || !column.sortable) {
+        return;
+      }
+      const view = gridViewState(gridId);
+      const current = view.sort || {};
+      view.sort = {
+        column: columnKey,
+        direction: current.column === columnKey && current.direction === "asc" ? "desc" : "asc"
+      };
+      if (gridId === "search") {
+        state.searchSort = view.sort;
+      }
+      rerenderGrid(gridId);
+    }
+
+    function gridFilterInputId(gridId, columnKey) {
+      return "gridFilter_" + gridId + "_" + columnKey;
+    }
+
+    function setGridColumnFilter(gridId, columnKey, value) {
+      const view = gridViewState(gridId);
+      view.filters = view.filters || {};
+      if (String(value || "").trim()) {
+        view.filters[columnKey] = value;
+      } else {
+        delete view.filters[columnKey];
+      }
+      if (gridId === "search") {
+        state.searchColumnFilters = view.filters;
+      }
+      rerenderGrid(gridId);
+      const input = $(gridFilterInputId(gridId, columnKey));
+      if (input) {
+        input.focus();
+        const position = input.value.length;
+        input.setSelectionRange(position, position);
+      }
+    }
+
+    function gridSortIndicator(gridId, column) {
+      const sort = gridViewState(gridId).sort || {};
+      if (sort.column !== column.key) {
+        return "";
+      }
+      if (column.sortType === "number") {
+        return sort.direction === "desc" ? "9-0" : "0-9";
+      }
+      if (column.sortType === "time") {
+        return sort.direction === "desc" ? "New-Old" : "Old-New";
+      }
+      return sort.direction === "desc" ? "Z-A" : "A-Z";
+    }
+
+    function gridHeaderCell(gridId, column) {
+      const columnClass = "grid-col-" + String(column.key || "column").replace(/[^A-Za-z0-9_-]/g, "-");
+      if (!column.sortable && !column.filterable) {
+        return `<th class="${escapeAttr(columnClass)}">${escapeHtml(column.label)}</th>`;
+      }
+      const indicator = gridSortIndicator(gridId, column);
+      const active = indicator ? " active" : "";
+      const grid = escapeAttr(escapeJs(gridId));
+      const key = escapeAttr(escapeJs(column.key));
+      const label = escapeHtml(column.label);
+      const indicatorHtml = indicator ? `<span class="grid-sort-indicator">${escapeHtml(indicator)}</span>` : "";
+      const filter = column.filterable
+        ? `<input id="${escapeAttr(gridFilterInputId(gridId, column.key))}" class="grid-column-filter" value="${escapeAttr(gridColumnFilterValue(gridId, column.key))}" placeholder="filter" title="Filter ${escapeAttr(column.label)}" oninput="setGridColumnFilter('${grid}', '${key}', this.value)" onclick="event.stopPropagation()" onkeydown="event.stopPropagation()">`
+        : "";
+      return `<th class="${escapeAttr(columnClass)}"><div class="grid-header-cell"><button type="button" class="grid-sort-button${active}" title="Sort ${escapeAttr(column.label)}" onclick="toggleGridSort('${grid}', '${key}')">${label}${indicatorHtml}</button>${filter}</div></th>`;
+    }
+
+    function sortableGridTable(gridId, columns, rows, className, renderRow) {
+      const visibleRows = visibleGridRows(gridId, columns, rows);
+      const classAttr = className ? ` class="${escapeAttr(className)}"` : "";
+      const headers = columns.map((column) => gridHeaderCell(gridId, column)).join("");
+      const body = visibleRows.map(renderRow).join("");
+      return {
+        visibleRows,
+        html: `<table${classAttr}><thead><tr>${headers}</tr></thead><tbody>${body}</tbody></table>`
+      };
+    }
+
+    function gridFilterStatusHtml(gridId, columns, visibleCount, totalCount, noun = "rows") {
+      if (!gridColumnFiltersActive(gridId, columns)) {
+        return "";
+      }
+      return `<div class="analysis-status">Column filters active: ${Number(visibleCount).toLocaleString()} of ${Number(totalCount).toLocaleString()} ${escapeHtml(noun)} shown.</div>`;
+    }
+
+    function setCurrentEntryGrid(gridId, entries) {
+      state.currentEntryGrid = {
+        gridId,
+        entries: entries || []
+      };
+    }
+
+    function setCurrentLiveGrid(gridId, items) {
+      state.currentLiveGrid = {
+        gridId,
+        items: items || []
+      };
+    }
+
+    function searchResultKey(hit) {
+      return JSON.stringify([
+        hit.evidence_id,
+        hit.entry_id,
+        hit.match_kind,
+        hit.selection_offset,
+        hit.selection_length,
+        hit.logical_path,
+        hit.display_name,
+        hit.data_preview
+      ]);
+    }
+
+    function searchResultHost(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstText(metadata.host, metadata.hostname);
+    }
+
+    function searchResultReferrer(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstText(metadata.referrer, metadata.source_url, metadata.tab_url);
+    }
+
+    function searchResultTime(entry) {
+      if (!entry) {
+        return "";
+      }
+      return firstText(
+        categoryTime(entry),
+        filesystemCreatedTime(entry),
+        filesystemAccessedTime(entry),
+        filesystemModifiedTime(entry),
+        filesystemMftModifiedTime(entry)
+      );
+    }
+
+    function searchResultOffsetRaw(hit, entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstDefined(
+        metadata.file_data_physical_offset,
+        metadata.file_data_logical_offset,
+        metadata.mft_record_physical_offset,
+        metadata.mft_record_logical_offset,
+        metadata.physical_offset,
+        metadata.logical_offset,
+        metadata.partition_start_offset,
+        metadata.start_offset,
+        hit ? hit.selection_offset : null
+      );
+    }
+
+    function searchNumericValue(value) {
+      return gridNumericValue(value);
+    }
+
+    function loadedSearchEntryMap() {
+      const entries = new Map();
+      const addEntry = (entry) => {
+        if (entry && entry.id != null && !entries.has(entry.id)) {
+          entries.set(entry.id, entry);
+        }
+      };
+      if (state.data && Array.isArray(state.data.entries)) {
+        state.data.entries.forEach(addEntry);
+      }
+      (state.cat.entries || []).forEach(addEntry);
+      for (const path in state.idx.dirCache) {
+        (state.idx.dirCache[path] || []).forEach((child) => addEntry(idxChildToEntry(child)));
+      }
+      return entries;
+    }
+
+    function searchResultRow(hit, index, entryMap = null) {
+      const entry = entryMap ? entryMap.get(hit.entry_id) : findLoadedEntry(hit.entry_id);
+      const offsetRaw = searchResultOffsetRaw(hit, entry);
+      const offset = formatOffsetValue(offsetRaw);
+      const host = searchResultHost(entry);
+      const referrer = searchResultReferrer(entry);
+      const time = searchResultTime(entry);
+      const match = compactParts([hit.match_kind, entry && entry.is_deleted ? "deleted" : ""]);
+      const values = {
+        entry: compactParts([hit.display_name, hit.logical_path]),
+        match,
+        host,
+        referrer,
+        time,
+        offset,
+        preview: hit.data_preview || ""
+      };
+      return {
+        hit,
+        index,
+        entry,
+        key: searchResultKey(hit),
+        values,
+        sortValues: {
+          offset: searchNumericValue(offsetRaw),
+          time: Date.parse(time)
+        }
+      };
+    }
+
+    function searchColumnFiltersActive() {
+      return gridColumnFiltersActive("search", searchResultColumns());
+    }
+
+    function visibleSearchResultRows() {
+      const entryMap = loadedSearchEntryMap();
+      const rows = state.searchResults.map((hit, index) => searchResultRow(hit, index, entryMap));
+      return visibleGridRows("search", searchResultColumns(), rows);
+    }
+
+    function selectedVisibleSearchResultRows() {
+      const selected = state.selectedSearchKeys || new Set();
+      return visibleSearchResultRows().filter((row) => selected.has(row.key));
+    }
+
+    function searchResultsTable(rows) {
+      const headers = searchResultColumns().map((column) => gridHeaderCell("search", column)).join("");
+      return `<table class="search-results-table"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    // Evidence in the current search scope whose latest index was run
+    // metadata-only: content matching cannot see those files, and pretending
+    // the search covered them would be a silent coverage gap.
+    function metadataOnlySearchWarningHtml() {
+      if (!state.data) {
+        return "";
+      }
+      const scoped = $("searchEvidence").value ? Number($("searchEvidence").value) : null;
+      const affected = (state.data.evidence || []).filter((item) =>
+        item.content_indexed === false && (scoped === null || item.id === scoped));
+      if (!affected.length) {
+        return "";
+      }
+      const names = affected.map((item) => item.display_name).join(", ");
+      return `<div class="analysis-status" style="color:var(--warn, #9a6700)">Content matching is unavailable for ${escapeHtml(names)}: the latest index was metadata-only (Capture file content was off). Path/metadata hits still work; re-process with content on for content search.</div>`;
+    }
+
     function renderSearchResults() {
-      $("searchCount").textContent = state.searchResults.length;
+      const visibleRows = visibleSearchResultRows();
+      const filterOn = searchColumnFiltersActive();
+      $("searchCount").textContent = String(visibleRows.length);
+      const filterStatus = $("searchFilterStatus");
+      if (filterStatus) {
+        filterStatus.textContent = filterOn
+          ? "Column filters active: " + visibleRows.length + " of " + state.searchResults.length + " shown"
+          : "";
+      }
+      if (state.searchError) {
+        // The indexed pass failed - say so in the results area itself, not
+        // only in a transient notice (in All mode the bitwise pass still runs
+        // below this message).
+        $("searchResults").innerHTML = `<div class="analysis-status" style="color:var(--bad, #c0392b)">Indexed search failed: ${escapeHtml(state.searchError)}</div>`;
+        renderSearchSelectionCount();
+        return;
+      }
       if (state.searchResults.length === 0 && state.data && Number(state.data.entry_count || 0) === 0) {
         $("searchResults").innerHTML = `<div class="analysis-status">This case has no indexed entries; Deep Search only searches processed evidence. Process evidence first, or use the raw find in Live browse.</div>`;
         renderSearchSelectionCount();
         return;
       }
-      const rows = state.searchResults.map((hit, index) => {
-        const checked = state.selectedSearchIndexes.has(index) ? " checked" : "";
-        const entry = findLoadedEntry(hit.entry_id);
-        const deleted = entry && entry.is_deleted ? ' <span class="pill bad">deleted</span>' : "";
-        const offset = entry ? entryPrimaryOffset(entry) : "";
+      const rows = visibleRows.map((row) => {
+        const hit = row.hit;
+        const index = row.index;
+        const checked = (state.selectedSearchKeys || new Set()).has(row.key) ? " checked" : "";
+        const deleted = row.entry && row.entry.is_deleted ? ' <span class="pill bad">deleted</span>' : "";
         return `
         <tr class="entry-row" onclick="goToSearchResult(${index})" data-entry-id="${hit.entry_id}" data-search-index="${index}">
           <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleSearchResultSelection(${index}, this.checked)"></td>
-          <td><strong>${escapeHtml(hit.display_name)}</strong><br><span class="muted tiny">${escapeHtml(hit.logical_path)}</span></td>
+          <td title="${escapeAttr(row.values.entry)}"><strong>${escapeHtml(hit.display_name)}</strong><br><span class="muted tiny">${escapeHtml(hit.logical_path)}</span></td>
           <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${deleted}</td>
-          <td class="entry-offset" title="${escapeAttr(offset)}">${escapeHtml(offset)}</td>
-          <td>${escapeHtml(hit.data_preview || "")}</td>
-          <td class="actions"><div class="toolbar">
-            <button class="secondary" onclick="event.stopPropagation(); goToSearchResult(${index})">Source</button>
-            <button class="ghost" onclick="event.stopPropagation(); bookmarkSearchResult(${index})">Bookmark</button>
-          </div></td>
+          <td title="${escapeAttr(row.values.host)}">${escapeHtml(row.values.host)}</td>
+          <td title="${escapeAttr(row.values.referrer)}">${escapeHtml(row.values.referrer)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>
+          <td class="entry-offset" title="${escapeAttr(row.values.offset)}">${escapeHtml(row.values.offset)}</td>
+          <td>${escapeHtml(row.values.preview)}</td>
         </tr>`;
       }).join("");
-      $("searchResults").innerHTML = rows ? table(["", "Entry", "Match", "Offset", "Preview", ""], rows) : empty("No results.");
+      if (state.searchResults.length === 0) {
+        $("searchResults").innerHTML = metadataOnlySearchWarningHtml() + empty("No results.");
+      } else {
+        $("searchResults").innerHTML = metadataOnlySearchWarningHtml() + searchResultsTable(rows) + (rows ? "" : empty("No results match the column filters."));
+      }
       renderSearchSelectionCount();
     }
 
     function renderSearchSelectionCount() {
-      $("searchSelectedCount").textContent = (state.selectedSearchIndexes ? state.selectedSearchIndexes.size : 0) + " selected";
+      $("searchSelectedCount").textContent = selectedVisibleSearchResultRows().length + " selected";
+    }
+
+    function bookmarksGridColumns() {
+      return [
+        { key: "bookmark", label: "Bookmark", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "items", label: "Items", sortable: true, filterable: true, sortType: "number" },
+        { key: "comment", label: "Comment", sortable: true, filterable: true, sortType: "text" },
+        { key: "actions", label: "", sortable: false, filterable: false, sortType: "none" }
+      ];
+    }
+
+    function bookmarkGridRow(bookmark, folderNames) {
+      const items = state.data.items.filter((item) => item.bookmark_id === bookmark.id);
+      const title = bookmark.title || bookmark.bookmark_type;
+      const itemLabels = items.map((item) => item.display_name || item.logical_path || ("Item " + item.id));
+      return {
+        bookmark,
+        items,
+        itemLabels,
+        title,
+        folderName: folderNames.get(bookmark.folder_id) || "",
+        values: {
+          bookmark: compactParts([title, folderNames.get(bookmark.folder_id) || ""]),
+          type: bookmark.bookmark_type,
+          items: itemLabels.join(" | ") || "No items",
+          comment: bookmark.examiner_comment || ""
+        },
+        sortValues: {
+          items: items.length
+        }
+      };
+    }
+
+    function renderBookmarkGridRow(row) {
+      const itemRows = row.items.length
+        ? `<ul class="bookmark-items">${row.items.map((item, index) => {
+            const itemLabel = row.itemLabels[index];
+            return `<li>
+                <span>${escapeHtml(itemLabel)}</span>
+                <button class="ghost danger" onclick="removeBookmarkItemUi(${item.id}, '${escapeAttr(escapeJs(itemLabel))}')">Remove item</button>
+              </li>`;
+          }).join("")}</ul>`
+        : '<span class="muted tiny">No items</span>';
+      return `
+          <tr>
+            <td><strong>${escapeHtml(row.title)}</strong><br><span class="muted tiny">${escapeHtml(row.folderName)}</span></td>
+            <td><span class="pill">${escapeHtml(row.bookmark.bookmark_type)}</span></td>
+            <td>${itemRows}</td>
+            <td>${escapeHtml(row.bookmark.examiner_comment || "")}</td>
+            <td class="actions"><button class="ghost danger" onclick="removeBookmarkUi(${row.bookmark.id}, '${escapeAttr(escapeJs(row.title))}')">Remove</button></td>
+          </tr>`;
+    }
+
+    // Folders with no bookmarks and no child folders can be removed (audited).
+    // Rendered as a small management strip so leftover/accidental folders can
+    // finally be cleaned up without touching the case database by hand.
+    function emptyBookmarkFolderStripHtml() {
+      const usedFolderIds = new Set(state.data.bookmarks.map((bookmark) => bookmark.folder_id));
+      const parentIds = new Set(state.data.folders.filter((folder) => folder.parent_id != null).map((folder) => folder.parent_id));
+      const removable = state.data.folders.filter((folder) => !usedFolderIds.has(folder.id) && !parentIds.has(folder.id));
+      if (!removable.length) {
+        return "";
+      }
+      const chips = removable.map((folder) =>
+        `<span class="pill">${escapeHtml(folder.name)} <a href="#" onclick="removeBookmarkFolder(${folder.id}); return false;" title="Remove this empty folder (recorded in the audit trail)">remove</a></span>`
+      ).join(" ");
+      return `<div class="muted tiny" style="margin:4px 0 8px">Empty folders: ${chips}</div>`;
+    }
+
+    async function removeBookmarkFolder(folderId) {
+      if (!confirm("Remove this empty bookmark folder? The removal is recorded in the case audit trail.")) {
+        return;
+      }
+      try {
+        const data = await apiPost("/api/bookmark/folder/remove", {
+          case_path: currentCasePath(),
+          folder_id: folderId
+        });
+        await refresh();
+        setNotice("Removed empty folder \"" + data.name + "\".");
+      } catch (err) {
+        setNotice("Folder removal failed: " + err.message, true);
+      }
     }
 
     function renderBookmarks() {
       const folderNames = new Map(state.data.folders.map((folder) => [folder.id, folder.name]));
-      const rows = state.data.bookmarks.map((bookmark) => {
-        const items = state.data.items.filter((item) => item.bookmark_id === bookmark.id);
-        const title = bookmark.title || bookmark.bookmark_type;
-        const itemRows = items.length
-          ? `<ul class="bookmark-items">${items.map((item) => {
-              const itemLabel = item.display_name || item.logical_path || ("Item " + item.id);
-              return `<li>
-                <span>${escapeHtml(itemLabel)}</span>
-                <button class="ghost danger" onclick="removeBookmarkItemUi(${item.id}, '${escapeAttr(escapeJs(itemLabel))}')">Remove item</button>
-              </li>`;
-            }).join("")}</ul>`
-          : '<span class="muted tiny">No items</span>';
-        return `
-          <tr>
-            <td><strong>${escapeHtml(title)}</strong><br><span class="muted tiny">${escapeHtml(folderNames.get(bookmark.folder_id) || "")}</span></td>
-            <td><span class="pill">${escapeHtml(bookmark.bookmark_type)}</span></td>
-            <td>${itemRows}</td>
-            <td>${escapeHtml(bookmark.examiner_comment || "")}</td>
-            <td class="actions"><button class="ghost danger" onclick="removeBookmarkUi(${bookmark.id}, '${escapeAttr(escapeJs(title))}')">Remove</button></td>
-          </tr>`;
-      }).join("");
-      $("bookmarksTable").innerHTML = rows ? table(["Bookmark", "Type", "Items", "Comment", ""], rows) : empty("No bookmarks.");
+      const folderStrip = emptyBookmarkFolderStripHtml();
+      const rows = state.data.bookmarks.map((bookmark) => bookmarkGridRow(bookmark, folderNames));
+      if (rows.length === 0) {
+        $("bookmarksTable").innerHTML = folderStrip + empty("No bookmarks.");
+        return;
+      }
+      const columns = bookmarksGridColumns();
+      const tableResult = sortableGridTable("bookmarks", columns, rows, "", renderBookmarkGridRow);
+      const filterStatus = gridFilterStatusHtml("bookmarks", columns, tableResult.visibleRows.length, rows.length, "bookmarks");
+      $("bookmarksTable").innerHTML = folderStrip + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No bookmarks match the column filters."));
     }
 
     function renderReport() {
@@ -10379,6 +15831,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function numberValue(id, fallback) {
       const value = Number($(id).value);
       return Number.isFinite(value) && value > 0 ? value : fallback;
+    }
+
+    // Clamps an examiner-typed limit to the range the backend actually honors
+    // and writes the clamped value back into the field, so the UI never
+    // implies a bigger number did something. Numbers past ~2^53 also stop
+    // surviving the JSON round-trip as integers (they serialize as scientific
+    // notation), which used to fail the whole search request.
+    function boundedNumberValue(id, fallback, min, max) {
+      const field = $(id);
+      const raw = String(field.value).trim() === "" ? NaN : Number(field.value);
+      const base = Number.isFinite(raw) ? raw : fallback;
+      const value = Math.min(Math.max(Math.floor(base), min), max);
+      if (String(field.value) !== String(value)) {
+        field.value = String(value);
+      }
+      return value;
     }
 
     function nonNegativeNumberValue(id, fallback) {
@@ -10432,10 +15900,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function shortcutDigit(event) {
-      if (/^[1-6]$/.test(event.key)) {
+      if (/^[1-7]$/.test(event.key)) {
         return event.key;
       }
-      const match = String(event.code || "").match(/^(Digit|Numpad)([1-6])$/);
+      const match = String(event.code || "").match(/^(Digit|Numpad)([1-7])$/);
       return match ? match[2] : "";
     }
 
@@ -10446,7 +15914,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "3": "analyzeView",
         "4": "searchView",
         "5": "bookmarksView",
-        "6": "reportView"
+        "6": "reportView",
+        "7": "timelineView"
       }[digit] || "";
     }
 
@@ -10482,6 +15951,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       document.querySelectorAll(".view").forEach((view) => {
         view.classList.toggle("active", view.id === viewId);
       });
+      if (viewId === "timelineView") {
+        renderTimeline();
+        maybePromptTimelineBuild();
+      }
     }
 
     // Draggable column widths on every rendered table. Widths persist per
@@ -10565,6 +16038,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("casePath").value = normalizePathInput(state.casePath);
     $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
+    const storedMaxEntries = localStorage.getItem("kdft.processMaxEntries");
+    if (storedMaxEntries !== null && Number.isFinite(Number(storedMaxEntries))) {
+      $("processMaxEntries").value = storedMaxEntries;
+    }
+    $("processMaxEntries").addEventListener("change", () => {
+      const value = Math.max(0, Math.floor(Number($("processMaxEntries").value) || 0));
+      $("processMaxEntries").value = value;
+      localStorage.setItem("kdft.processMaxEntries", String(value));
+    });
+    PROCESSING_OPTION_CHECKBOXES.forEach((id) => {
+      const stored = localStorage.getItem("kdft." + id);
+      if (stored !== null) {
+        $(id).checked = stored === "true";
+      }
+      $(id).addEventListener("change", () => {
+        localStorage.setItem("kdft." + id, String($(id).checked));
+      });
+    });
     if (localStorage.getItem("kdft.dataInterpreter.open") === "1") {
       toggleDataInterpreter(true);
     }
@@ -10588,36 +16079,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("selectedAction").addEventListener("change", handleSelectedAction);
     // "input" fires as soon as a complete date is typed or picked - no Enter
     // needed; the value stays "" until the date is complete.
-    ["input", "change"].forEach((eventName) => {
-      $("dateFilterFrom").addEventListener(eventName, () => {
-        if (state.dateFilter.from !== $("dateFilterFrom").value) {
-          state.dateFilter.from = $("dateFilterFrom").value;
-          renderEvidenceBrowserEntries();
-        }
-      });
-      $("dateFilterTo").addEventListener(eventName, () => {
-        if (state.dateFilter.to !== $("dateFilterTo").value) {
-          state.dateFilter.to = $("dateFilterTo").value;
-          renderEvidenceBrowserEntries();
-        }
+    [
+      ["dateFilterFrom", "from"],
+      ["dateFilterTo", "to"],
+      ["timelineDateFrom", "from"],
+      ["timelineDateTo", "to"]
+    ].forEach(([id, field]) => {
+      ["input", "change"].forEach((eventName) => {
+        $(id).addEventListener(eventName, () => setDateFilterValue(field, $(id).value));
       });
     });
-    $("dateFilterClear").addEventListener("click", () => {
-      state.dateFilter = { from: "", to: "" };
-      $("dateFilterFrom").value = "";
-      $("dateFilterTo").value = "";
-      renderEvidenceBrowserEntries();
-    });
+    $("dateFilterClear").addEventListener("click", clearDateFilter);
+    $("timelineDateFilterClear").addEventListener("click", clearDateFilter);
+    $("buildTimeline").addEventListener("click", requestTimelineBuild);
     $("toggleInspector").addEventListener("click", toggleInspectorPane);
     $("analyzeBack").addEventListener("click", analyzeBack);
     $("analyzeForward").addEventListener("click", analyzeForward);
     $("exportReportFromAnalyze").addEventListener("click", exportReport);
+    $("recategorizeBtn").addEventListener("click", recategorizeCase);
     $("openAnalyzeWindow").addEventListener("click", openAnalyzeWindow);
     $("liveBrowse").addEventListener("click", toggleLiveBrowse);
     $("treeModeFilesystem").addEventListener("click", () => setBrowserTreeMode("filesystem"));
     $("treeModeCategories").addEventListener("click", () => setBrowserTreeMode("categories"));
     $("browseEvidence").addEventListener("click", pickEvidencePath);
     $("runSearch").addEventListener("click", runSearch);
+    $("searchMode").addEventListener("change", updateSearchModeUi);
     $("selectAllSearchResults").addEventListener("click", selectAllSearchResults);
     $("bookmarkSelectedSearchResults").addEventListener("click", bookmarkSelectedSearchResults);
     $("clearSelectedSearchResults").addEventListener("click", clearSelectedSearchResults);
@@ -10627,15 +16113,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("hexPrev").addEventListener("click", () => stepHex(-1));
     $("hexGo").addEventListener("click", gotoHexOffset);
     $("hexNext").addEventListener("click", () => stepHex(1));
+    $("byteContextFile").addEventListener("click", () => setByteContext("file"));
+    $("byteContextFilesystem").addEventListener("click", () => setByteContext("filesystem"));
+    $("openSelectedEntry").addEventListener("click", () => openSelectedEntryExternal());
     $("showEntryDetails").addEventListener("click", showEntryDetails);
     $("toggleViewerFullscreen").addEventListener("click", toggleViewerFullscreen);
-    $("bookmarkSelectedEntry").addEventListener("click", () => {
-      if (state.hex.entryId) {
-        bookmarkEntry(state.hex.entryId);
-      } else {
-        setNotice("Select an entry before bookmarking.", true);
-      }
-    });
+    $("bookmarkSelectedEntry").addEventListener("click", bookmarkHexTarget);
     $("viewerMode").addEventListener("change", () => {
       if ((state.hex.entryId || state.hex.live || state.hex.raw) && $("viewerMode").value !== "metadata" && !state.hex.data && !state.hex.fetching) {
         fetchEntryBytes();

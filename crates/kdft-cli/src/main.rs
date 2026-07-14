@@ -4,11 +4,10 @@ use kdft_case::{
     add_bookmark_item, add_evidence, analyze_signatures, case_info, create_bookmark,
     create_bookmark_folder, create_case, deep_search, filesystem_entry_count, global_options,
     import_browser_history, list_bookmark_folders, list_bookmark_items, list_bookmarks,
-    list_evidence, list_installed_resources, process_evidence, remove_bookmark,
-    remove_bookmark_item, render_report_html, report_data, update_global_options,
-    AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType, CreateBookmarkItemOptions,
-    CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions, EvidenceKind,
-    GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
+    list_evidence, list_installed_resources, remove_bookmark, remove_bookmark_item, report_data,
+    update_global_options, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
+    CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions,
+    EvidenceKind, GlobalOptionPathUpdate, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
     UpdateGlobalOptions,
 };
 use std::fs;
@@ -130,6 +129,13 @@ struct ProcessEvidenceArgs {
     evidence_id: i64,
     #[arg(long, default_value_t = 5000)]
     max_entries: usize,
+    /// Skip every per-file content read (fast metadata-only index). Content
+    /// search stays unavailable for this evidence until re-processed.
+    #[arg(long)]
+    metadata_only: bool,
+    /// Skip parsing .eml / RFC-822 messages into email metadata.
+    #[arg(long)]
+    skip_emails: bool,
     #[arg(long)]
     json: bool,
 }
@@ -414,11 +420,16 @@ fn main() -> Result<()> {
                 }
             }
             EvidenceCommand::Process(args) => {
-                let result = process_evidence(
+                let result = kdft_case::process_evidence_with_profile(
                     &args.case,
                     ProcessEvidenceOptions {
                         evidence_id: args.evidence_id,
                         max_entries: args.max_entries,
+                    },
+                    kdft_case::ProcessingProfile {
+                        capture_content: !args.metadata_only,
+                        parse_emails: !args.metadata_only && !args.skip_emails,
+                        parse_browsers: !args.metadata_only,
                     },
                 )?;
                 print_json_or_debug(args.json, &result)?;
@@ -564,7 +575,7 @@ fn main() -> Result<()> {
             }
             ReportCommand::Export(args) => {
                 let report = report_data(&args.case)?;
-                let html = render_report_html(&report);
+                let rendered = kdft_case::render_report(&report);
                 if let Some(parent) = args
                     .output
                     .parent()
@@ -574,18 +585,35 @@ fn main() -> Result<()> {
                         format!("creating report directory {}", parent.display())
                     })?;
                 }
-                fs::write(&args.output, html)
+                fs::write(&args.output, &rendered.html)
                     .with_context(|| format!("writing report {}", args.output.display()))?;
+                // KDFT-EA-008: report the standard whole-file digest alongside
+                // the embedded footer prefix digest, hashed from disk.
+                let report_file_sha256 = kdft_case::sha256_hex(&fs::read(&args.output)?);
+                // Parity with the workbench export: a CLI-produced report is
+                // just as court-facing, so it must leave the same
+                // report.export audit event in the case.
+                kdft_case::record_report_export(
+                    &args.case,
+                    &args.output.to_string_lossy(),
+                    &rendered.content_prefix_sha256,
+                    &report_file_sha256,
+                )?;
                 if args.json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "report": args.output,
-                            "folders": report.folders.len()
+                            "folders": report.folders.len(),
+                            "content_prefix_sha256": rendered.content_prefix_sha256,
+                            "report_file_sha256": report_file_sha256
                         })
                     );
                 } else {
-                    println!("Wrote report {}", args.output.display());
+                    println!(
+                        "Wrote report {} (file SHA-256 {report_file_sha256})",
+                        args.output.display()
+                    );
                 }
             }
         },

@@ -6,11 +6,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bitlocker-decrypt = { path = "../bitlocker-decrypt" }
 chrono.workspace = true
+chrome-cache-parser.workspace = true
 disk-forensic.workspace = true
-ext4-view.workspace = true
+evtx.workspace = true
+ext4.workspace = true
 fatfs.workspace = true
 ntfs.workspace = true
+nom.workspace = true
+notatin.workspace = true
+outlook-pst.workspace = true
+positioned-io.workspace = true
 positioned-io2.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
