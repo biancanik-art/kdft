@@ -13,6 +13,7 @@ disk-forensic.workspace = true
 evtx.workspace = true
 ext4.workspace = true
 fatfs.workspace = true
+mft.workspace = true
 ntfs.workspace = true
 nom.workspace = true
 notatin.workspace = true

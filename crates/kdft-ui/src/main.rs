@@ -10,16 +10,16 @@ use kdft_case::{
     import_browser_history_for_family, list_bookmark_folders, list_bookmark_items, list_bookmarks,
     list_entries_by_category, list_evidence, list_filesystem_entries_for_timeline,
     list_filesystem_entries_limited, list_image_tree_files, list_local_tree_files,
-    max_filesystem_entry_id, read_filesystem_entry_bytes, record_live_export,
-    record_live_export_with_source_kind, record_live_tree_export,
-    record_live_tree_export_with_source_kind, record_processing_pass_failure_audit,
-    record_report_export, recover_filesystem_entry, remove_bookmark, remove_bookmark_item,
-    remove_evidence, render_report, report_data, report_data_with_directory_structure,
-    AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType, BrowserDatabaseDetected,
-    BrowserFamily, CarveOptions, CreateBookmarkItemOptions, CreateBookmarkOptions,
-    CreateCaseOptions, DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
-    ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
-    RecoverEntryOptions,
+    max_filesystem_entry_id, parse_embedded_mailboxes, parse_identity_artifacts,
+    read_filesystem_entry_bytes, record_live_export, record_live_export_with_source_kind,
+    record_live_tree_export, record_live_tree_export_with_source_kind,
+    record_processing_pass_failure_audit, record_report_export, recover_filesystem_entry,
+    remove_bookmark, remove_bookmark_item, remove_evidence, render_report, report_data,
+    report_data_with_directory_structure, AddEvidenceOptions, AnalyzeSignaturesOptions,
+    BookmarkType, BrowserDatabaseDetected, BrowserFamily, CarveOptions, CreateBookmarkItemOptions,
+    CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions, EvidenceKind,
+    ImportBrowserArtifactsIntoEvidenceOptions, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
+    ReadEntryBytesOptions, RecoverEntryOptions,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,7 @@ struct ProcessEvidenceRequest {
     capture_content: Option<bool>,
     parse_emails: Option<bool>,
     parse_browsers: Option<bool>,
+    parse_identities: Option<bool>,
     run_hash: Option<bool>,
     run_file_hash: Option<bool>,
     run_signature_analysis: Option<bool>,
@@ -1937,6 +1938,17 @@ fn append_optional_processing_passes(
             })?,
         );
     }
+    if request.parse_emails.unwrap_or(true) {
+        extras.insert(
+            "email_parsing".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "embedded mailbox parsing",
+                || parse_embedded_mailboxes(case_path, request.evidence_id, 0),
+            )?,
+        );
+    }
     if request.parse_browsers.unwrap_or(true) {
         // ext volumes auto-import during the walk itself; this post-index pass
         // covers NTFS/FAT images and local folder evidence.
@@ -1947,6 +1959,17 @@ fn append_optional_processing_passes(
                 request.evidence_id,
                 "browser parsing",
                 || run_browser_parsing_pass(&case_path.to_path_buf(), request.evidence_id),
+            )?,
+        );
+    }
+    if request.parse_identities.unwrap_or(true) {
+        extras.insert(
+            "identity_parsing".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "identity parsing",
+                || parse_identity_artifacts(case_path, request.evidence_id),
             )?,
         );
     }
@@ -3320,6 +3343,7 @@ mod tests {
             capture_content: Some(true),
             parse_emails: Some(false),
             parse_browsers: Some(true),
+            parse_identities: Some(true),
             run_hash: Some(true),
             run_file_hash: Some(true),
             run_signature_analysis: Some(true),
@@ -3339,6 +3363,7 @@ mod tests {
             ("carve", "carve"),
             ("file_hash", "file hashing"),
             ("browser_parsing", "browser parsing"),
+            ("identity_parsing", "identity parsing"),
         ] {
             assert_eq!(
                 response[field]["error"],
@@ -3641,6 +3666,16 @@ mod tests {
             normalize_request_path("file:///C:/Users/xt/Downloads/case%20file.E01"),
             "C:/Users/xt/Downloads/case file.E01"
         );
+    }
+
+    #[test]
+    fn timeline_client_extracts_last_access_time_used_by_server_range_filter() {
+        // kdft-case includes this key in TIMELINE_TIME_FIELD_KEYS. If the UI
+        // omits it, a ranged query can return matching entries whose only
+        // in-range timestamp is then discarded client-side, yielding an empty
+        // timeline despite a non-zero server match count.
+        assert!(super::INDEX_HTML
+            .contains(r#"{ key: "last_access_time_utc", label: "Last Access Date/Time" }"#));
     }
 }
 
@@ -3945,7 +3980,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       0% { margin-left: -42%; }
       100% { margin-left: 100%; }
     }
+    .analyzing-ascii {
+      min-height: 58px;
+      margin: 0 0 12px;
+      color: var(--accent, #1b887f);
+      font: 600 13px/1.15 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      white-space: pre;
+      user-select: none;
+    }
     .analyzing-note { font-size: 12px; opacity: .82; line-height: 1.45; }
+    @media (prefers-reduced-motion: reduce) {
+      .analyzing-bar-fill { animation: none; width: 100%; opacity: .65; }
+    }
     button.ghost.danger {
       color: var(--bad);
       border-color: rgba(180,35,24,.35);
@@ -6196,6 +6242,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                   <label class="check-option" title="Verify file types by content signature after indexing and stamp match/mismatch/alias per entry."><input type="checkbox" id="optRunSignatures"> Verify file types (signatures)</label>
                   <label class="check-option" title="Signature-carve the whole decoded media after indexing (can take long on large images). Carved lengths are marked verified or not-verified per file."><input type="checkbox" id="optRunCarve"> Carve by file signature</label>
                   <label class="check-option" title="Detect browser profiles among the indexed entries (Chromium History, Firefox places.sqlite, Safari History.db) and parse their visit/download/login records into the case."><input type="checkbox" id="optRunBrowserParse" checked> Parse browser artifacts</label>
+                  <label class="check-option" title="Extract account names and SID-to-profile mappings from allocated Windows SAM and SOFTWARE hives. Identity metadata only: password hashes, encrypted values, DPAPI material, tokens, and secrets are not accessed."><input type="checkbox" id="optParseIdentities" checked> Parse accounts and identities (no secrets)</label>
                 </div>
                 <div class="processing-options-grid muted">
                   <label class="check-option" title="Not yet supported in KDFT - planned next. Archive contents are not expanded into child entries."><input type="checkbox" disabled> Expand archive contents (not yet supported)</label>
@@ -6459,15 +6506,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // (resolve_unlimited_max_entries in kdft-ui) honors 0 as "no cap at all",
     // not just a high number. The "Recursive bookmark limit" input can still
     // NO ARBITRARY LIMITS (Cristina, 2026-07-13): recursive bookmarking and
-    // Timeline builds always cover the whole selected scope. The former limit
-    // inputs are gone; these helpers stay for their call sites and always
-    // report "unlimited".
+    // Timeline event expansion happens in the browser and produces several
+    // events per entry. Keep one build bounded; examiners can use the date
+    // range to page through the complete case without freezing the tab.
     function currentRecursiveBookmarkLimit() {
       return 0;
     }
 
     function currentTimelineBuildLimit() {
-      return 0;
+      return 20000;
     }
     if (ANALYSIS_MODE) {
       document.body.classList.add("analysis-fullscreen");
@@ -6552,7 +6599,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectedEventIndex: null,
         graphBuckets: [],
         focusBucket: null,
-        scrollToSelected: false
+        scrollToSelected: false,
+        building: false,
+        buildGeneration: 0
       };
     }
 
@@ -6701,6 +6750,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
         body: JSON.stringify(body)
       });
       return readApiResponse(response);
+    }
+
+    async function apiPostReadOnlyWithNetworkRetry(path, body) {
+      try {
+        return await apiPost(path, body);
+      } catch (err) {
+        // A tab can survive a local server rebuild/restart while its pooled
+        // keep-alive connection does not. Chromium reports that stale-socket
+        // failure only as TypeError: Failed to fetch and does not necessarily
+        // replay a POST. Indexed search is read-only, so one fresh retry is
+        // safe; mutating or audited POST operations must never use this helper.
+        const networkFailure = err instanceof TypeError && /failed to fetch|network/i.test(String(err.message || err));
+        if (!networkFailure) {
+          throw err;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+        return apiPost(path, body);
+      }
     }
 
     async function readApiResponse(response) {
@@ -7034,6 +7101,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function addEvidence() {
+      const pathDetails = currentEvidencePathDetails();
+      const pathParts = String(pathDetails.value || "evidence").split(/[\\/]/);
+      const displayName = pathParts[pathParts.length - 1] || "evidence";
+      return runAnalyze(displayName, addEvidenceInner, {
+        mode: "attach",
+        title: "Adding evidence ",
+        note: "Discovering split segments and opening the evidence container. If processing was selected, indexing continues in this same protected operation. Please wait and do not open other views or click Add Evidence again."
+      });
+    }
+
+    async function addEvidenceInner() {
       const type = currentEvidenceType();
       if (type === "browser_history") {
         await importHistory();
@@ -7157,21 +7235,49 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const secs = Math.max(0, Math.floor((Date.now() - state.analyzing.startedAt) / 1000));
       const mins = Math.floor(secs / 60);
       const elapsed = mins > 0 ? mins + "m " + (secs % 60) + "s" : secs + "s";
+      const asciiFrames = [
+        "  /\\_/\\   🔎\\n ( o.o )  [·  ]\\n  > ^ <   indexing",
+        "  /\\_/\\    🔎\\n ( o.o )  [·· ]\\n  > ^ <   indexing",
+        "  /\\_/\\     🔎\\n ( -.- )  [···]\\n  > ^ <   indexing",
+        "  /\\_/\\    🔎\\n ( o.o )  [ ··]\\n  > ^ <   indexing"
+      ];
+      const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const asciiFrame = asciiFrames[reducedMotion ? 0 : (secs % asciiFrames.length)];
       el.innerHTML =
         '<div class="analyzing-card" role="alertdialog" aria-busy="true">' +
           '<div class="analyzing-title">Analyzing ' + escapeHtml(state.analyzing.name) + '…</div>' +
+          '<pre class="analyzing-ascii" aria-hidden="true">' + escapeHtml(asciiFrame) + '</pre>' +
           '<div class="analyzing-bar"><div class="analyzing-bar-fill"></div></div>' +
           '<div class="analyzing-note">Reading and indexing the whole disk. This can take a while on a large image - ' +
           'please wait and do not click Analyze again or open other views until it finishes. Elapsed: ' + escapeHtml(elapsed) + '</div>' +
         '</div>';
+      if (state.analyzing.mode === "attach") {
+        const attachingFrames = [
+          "  /\\_/\\    .--.\n ( o.o )  [E01]--\n  > ^ <   gathering",
+          "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering",
+          "  /\\_/\\        .--.\n ( -.- )  [E01][E02][...]\n  > ^ <   gathering",
+          "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering"
+        ];
+        const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        el.querySelector(".analyzing-title").textContent = state.analyzing.title + state.analyzing.name + "…";
+        el.querySelector(".analyzing-ascii").textContent = attachingFrames[reducedMotion ? 0 : (secs % attachingFrames.length)];
+        el.querySelector(".analyzing-note").textContent = state.analyzing.note + " Elapsed: " + elapsed;
+      }
     }
 
-    async function runAnalyze(name, worker) {
+    async function runAnalyze(name, worker, options = {}) {
       if (state.analyzing) {
-        setNotice("An analysis is already running - wait for it to finish before starting another.", true);
+        setNotice("A protected evidence operation is already running - wait for it to finish before starting another.", true);
         return undefined;
       }
-      state.analyzing = { name: name || "evidence", startedAt: Date.now(), timer: null };
+      state.analyzing = {
+        name: name || "evidence",
+        mode: options.mode || "analyze",
+        title: options.title || "Analyzing ",
+        note: options.note || "Reading and indexing the whole disk. This can take a while on a large image - please wait and do not click Analyze again or open other views until it finishes.",
+        startedAt: Date.now(),
+        timer: null
+      };
       renderAnalyzingOverlay();
       state.analyzing.timer = window.setInterval(renderAnalyzingOverlay, 1000);
       try {
@@ -7186,13 +7292,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // Examiner-selected processing options (professional-suite style), sent
     // with every Process / Analyze run. Checkbox state persists in
     // localStorage so a chosen profile sticks across sessions.
-    const PROCESSING_OPTION_CHECKBOXES = ["optCaptureContent", "optParseEmails", "optRunHash", "optRunFileHash", "optRunSignatures", "optRunCarve", "optRunBrowserParse"];
+    const PROCESSING_OPTION_CHECKBOXES = ["optCaptureContent", "optParseEmails", "optRunHash", "optRunFileHash", "optRunSignatures", "optRunCarve", "optRunBrowserParse", "optParseIdentities"];
 
     function processingOptionsPayload() {
       return {
         capture_content: $("optCaptureContent").checked,
         parse_emails: $("optParseEmails").checked,
         parse_browsers: $("optRunBrowserParse").checked,
+        parse_identities: $("optParseIdentities").checked,
         run_hash: $("optRunHash").checked,
         run_file_hash: $("optRunFileHash").checked,
         run_signature_analysis: $("optRunSignatures").checked,
@@ -7237,6 +7344,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
             + ((bp.errors || []).length ? ", " + bp.errors.length + " failed" : "")
             + (parseErrors ? ", " + parseErrors + " parser error" + (parseErrors === 1 ? "" : "s") + " disclosed in the job record" : ""));
         }
+      }
+      if (data.identity_parsing) {
+        const ip = data.identity_parsing;
+        parts.push(ip.error
+          ? "identity parsing FAILED: " + ip.error
+          : "identities: " + Number(ip.local_accounts_indexed || 0).toLocaleString() + " local account(s), "
+            + Number(ip.user_profiles_indexed || 0).toLocaleString() + " user profile(s), "
+            + Number(ip.browser_accounts_indexed || 0).toLocaleString() + " browser account(s)"
+            + ((ip.parse_errors || []).length ? ", " + ip.parse_errors.length + " hive error(s) disclosed" : ""));
       }
       return parts.length ? " " + parts.join("; ") + "." : "";
     }
@@ -8502,6 +8618,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function runSearch() {
+      if (state.searchRunning) {
+        setNotice("A search is already running.");
+        return;
+      }
+      state.searchRunning = true;
+      const runButton = $("runSearch");
+      if (runButton) {
+        runButton.disabled = true;
+        runButton.textContent = "Searching...";
+      }
       const mode = currentSearchMode();
       state.searchResults = [];
       state.searchError = null;
@@ -8517,7 +8643,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       renderRawSearchResults();
       try {
-        state.searchResults = await apiPost("/api/search/deep", {
+        state.searchResults = await apiPostReadOnlyWithNetworkRetry("/api/search/deep", {
           case_path: currentCasePath(),
           query: $("searchQuery").value,
           evidence_id: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
@@ -8546,10 +8672,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
             : "Indexed search returned " + state.searchResults.length + " result" + (state.searchResults.length === 1 ? "" : "s") + ".",
           Boolean(state.searchError)
         );
+        state.searchRunning = false;
+        if (runButton) {
+          runButton.disabled = false;
+          runButton.textContent = "Run Search";
+        }
         return;
       }
       setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError));
-      await runBitwiseForUnifiedSearch();
+      try {
+        await runBitwiseForUnifiedSearch();
+      } finally {
+        state.searchRunning = false;
+        if (runButton) {
+          runButton.disabled = false;
+          runButton.textContent = "Run Search";
+        }
+      }
     }
 
     // Which evidence sources the bitwise pass scans: the one selected in the
@@ -11856,6 +11995,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return "ads";
       }
       const ext = filesystemFileExtension(entry);
+      const pathText = (String(entry.logical_path || "") + "/" + name).toLowerCase();
+      if (ext === "img" && /\/tencent\/|\/qq_games\/|\/qqgames\//.test(pathText.replaceAll("\\\\", "/"))) {
+        return "image";
+      }
       return FILE_EXTENSION_ICON_SLUG[ext] || "generic";
     }
 
@@ -12538,6 +12681,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
       const text = (String(entry.logical_path || "") + "/" + String(entry.name || "")).toLowerCase();
       const ext = fileExtension(entry.name || entry.logical_path);
+      if (ext === "img" && /[\\\/]tencent[\\\/]|[\\\/]qq_games[\\\/]|[\\\/]qqgames[\\\/]/.test(text)) return { main: "Pictures and Media", sub: "Graphics and design" };
       if (hasExt(ext, ["jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "heic", "heif", "webp", "cr2", "nef", "arw", "dng", "svg", "ico", "psd", "ai", "emf", "wmf", "jfif", "raf", "orf"])) return { main: "Pictures and Media", sub: "Pictures" };
       if (hasExt(ext, ["mp4", "mov", "avi", "mkv", "wmv", "m4v", "3gp", "webm", "flv", "mpg", "mpeg", "ts", "m2ts", "vob", "ogv", "asf", "rm"])) return { main: "Pictures and Media", sub: "Video" };
       if (hasExt(ext, ["mp3", "wav", "m4a", "aac", "flac", "ogg", "wma", "amr", "mid", "midi", "aif", "aiff", "ape", "opus", "ra", "au"])) return { main: "Pictures and Media", sub: "Audio" };
@@ -12590,6 +12734,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     const TIMELINE_HOUR_MS = 60 * 60 * 1000;
     const TIMELINE_DAY_MS = 24 * TIMELINE_HOUR_MS;
+    const TIMELINE_TABLE_RENDER_LIMIT = 2000;
     const TIMELINE_METADATA_TIME_FIELDS = [
       { key: "email_date", label: "Email Date/Time" },
       { key: "visit_time_utc", label: "Visit Date/Time" },
@@ -12605,6 +12750,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       { key: "time_last_used_utc", label: "Last Used Date/Time" },
       { key: "time_password_changed_utc", label: "Password Changed Date/Time" },
       { key: "creation_utc", label: "Created Date/Time" },
+      { key: "last_access_time_utc", label: "Last Access Date/Time" },
       { key: "last_access_utc", label: "Last Access Date/Time" },
       { key: "last_accessed_utc", label: "Last Access Date/Time" },
       { key: "expires_utc", label: "Expires Date/Time" },
@@ -12746,6 +12892,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Load a case before building the timeline.", true);
         return;
       }
+      if (state.timeline.building) {
+        setNotice("A timeline build is already running.");
+        return;
+      }
       const total = Number(state.data.entry_count || 0);
       const rangeActive = dateFilterActive();
       // A date range set BEFORE building lets the server filter with SQL
@@ -12771,6 +12921,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const limit = currentTimelineBuildLimit();
       state.timeline.prompted = true;
+      state.timeline.building = true;
+      const buildGeneration = Number(state.timeline.buildGeneration || 0) + 1;
+      state.timeline.buildGeneration = buildGeneration;
+      renderTimeline();
       setNotice(rangeActive ? "Building timeline for the selected date range..." : "Building timeline for all entries...");
       try {
         const params = { case_path: currentCasePath(), max_entries: limit };
@@ -12779,6 +12933,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           params.to = state.dateFilter.to ? state.dateFilter.to + "T23:59:59.999Z" : "9999-12-31T23:59:59Z";
         }
         const data = await apiGet("/api/timeline/entries", params);
+        if (buildGeneration !== state.timeline.buildGeneration) {
+          return;
+        }
         state.timeline.built = true;
         state.timeline.entries = (data.entries || []).map((entry) => ({ ...entry, logical_path: normalizeLogicalPath(entry.logical_path) }));
         state.timeline.truncated = Boolean(data.truncated);
@@ -12794,8 +12951,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Built timeline with " + state.timeline.events.length.toLocaleString() + " timestamped event" + (state.timeline.events.length === 1 ? "" : "s") + "." + scopeNote + truncatedNote, state.timeline.truncated);
       } catch (err) {
         state.timeline.prompted = true;
-        renderTimeline();
         setNotice(err.message, true);
+      } finally {
+        if (buildGeneration === state.timeline.buildGeneration) {
+          state.timeline.building = false;
+          renderTimeline();
+        }
       }
     }
 
@@ -13478,8 +13639,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const timestampNav = $("timelineTimestampNav");
       const count = $("timelineCount");
       const summary = $("timelineSummary");
+      const buildButton = $("buildTimeline");
       if (!table || !graph || !timestampNav || !count || !summary) {
         return;
+      }
+      if (buildButton) {
+        buildButton.disabled = Boolean(state.timeline.building);
+        buildButton.textContent = state.timeline.building ? "Building..." : "Build timeline";
       }
       syncDateFilterInputs();
       if (!state.data) {
@@ -13508,7 +13674,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const tableEvents = timelineFocusFilteredEvents(dateFilteredEvents);
       renderTimelineGraph(dateFilteredEvents);
       timestampNav.innerHTML = timelineSelectionNavHtml();
-      const rows = tableEvents.map(timelineGridRow);
+      // Never create hundreds of thousands of DOM rows. The complete bounded
+      // event set remains available for the graph/date/bucket calculations;
+      // the table shows a safe window and asks for a narrower range/bucket.
+      const renderedEvents = tableEvents.slice(0, TIMELINE_TABLE_RENDER_LIMIT);
+      const rows = renderedEvents.map(timelineGridRow);
       const columns = timelineGridColumns();
       const tableResult = sortableGridTable("timeline", columns, rows, "timeline-table", renderTimelineGridRow);
       count.textContent = tableResult.visibleRows.length.toLocaleString() + " events";
@@ -13518,12 +13688,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const focusText = state.timeline.focusBucket
         ? "bucket " + timelineBucketLabel(state.timeline.focusBucket.startMs, state.timeline.focusBucket.unit)
         : "";
-      summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> shown</span><span>${escapeHtml(focusText || baseText)}</span><span>${Number(state.timeline.sourceEntries || 0).toLocaleString()} loaded entries scanned</span>`;
-      const filterStatus = gridFilterStatusHtml("timeline", columns, tableResult.visibleRows.length, tableEvents.length, "events");
+      summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> table rows</span><span>${tableEvents.length.toLocaleString()} matching events</span><span>${escapeHtml(focusText || baseText)}</span><span>${Number(state.timeline.sourceEntries || 0).toLocaleString()} loaded entries scanned</span>`;
+      const filterStatus = gridFilterStatusHtml("timeline", columns, tableResult.visibleRows.length, renderedEvents.length, "rendered events");
+      const renderLimitNotice = tableEvents.length > renderedEvents.length
+        ? `<div class="analysis-status">Showing the first ${TIMELINE_TABLE_RENDER_LIMIT.toLocaleString()} of ${tableEvents.length.toLocaleString()} matching events to keep the browser responsive. Narrow the date range or select a graph bucket to inspect another window.</div>`
+        : "";
       const noRows = tableResult.visibleRows.length
         ? ""
         : empty(tableEvents.length ? "No timeline events match the column filters." : "No timestamped events match the active date or bucket filter.");
-      table.innerHTML = timelineScopeNoticeHtml() + filterStatus + tableResult.html + noRows;
+      table.innerHTML = timelineScopeNoticeHtml() + renderLimitNotice + filterStatus + tableResult.html + noRows;
       renderTimelineDetail();
       scrollTimelineToSelectedEvent();
     }

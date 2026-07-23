@@ -12,7 +12,9 @@ use outlook_pst::ltp::table_context::{
     TableContext as PstTableContext, TableRowData as PstTableRowData,
 };
 use outlook_pst::messaging::{
-    folder::Folder as PstFolder, message::Message as PstMessage, store::Store as PstStore,
+    folder::Folder as PstFolder,
+    message::Message as PstMessage,
+    store::{AnsiStore as PstAnsiStore, Store as PstStore, UnicodeStore as PstUnicodeStore},
 };
 use outlook_pst::ndb::node_id::NodeId as PstNodeId;
 use rusqlite::{
@@ -1712,6 +1714,551 @@ pub struct BrowserProfileCandidate {
     pub profile_path: String,
     pub db_name: String,
     pub filesystem_parser: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddedMailboxParseResult {
+    pub evidence_id: i64,
+    pub mailboxes_found: usize,
+    pub mailboxes_parsed: usize,
+    pub messages_indexed: usize,
+    pub entries_indexed: usize,
+    pub parse_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentityParseResult {
+    pub evidence_id: i64,
+    pub hives_found: usize,
+    pub hives_parsed: usize,
+    pub local_accounts_indexed: usize,
+    pub user_profiles_indexed: usize,
+    pub browser_accounts_indexed: usize,
+    pub parse_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct EmbeddedIdentityHiveCandidate {
+    entry_id: i64,
+    source_job_id: i64,
+    logical_path: String,
+    name: String,
+}
+
+#[derive(Debug)]
+struct DerivedIdentityEntry {
+    logical_path: String,
+    display_name: String,
+    metadata: serde_json::Value,
+}
+
+/// Extracts identity metadata from allocated SAM and SOFTWARE hives discovered
+/// inside indexed evidence. This pass deliberately does not read password
+/// hashes, encrypted credential values, DPAPI material, or secret/token data.
+pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<IdentityParseResult> {
+    let candidates = {
+        let conn = open_existing_case(case_path)?;
+        let case_id = active_case_id(&conn)?;
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, discovered_by_job_id, logical_path, name
+             FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+               AND is_deleted = 0 AND lower(name) IN ('sam', 'software')
+               AND (lower(replace(logical_path, '\\', '/')) LIKE '%/windows/system32/config/%'
+                    OR lower(replace(logical_path, '\\', '/')) LIKE '%/winnt/system32/config/%')
+             ORDER BY CASE lower(name) WHEN 'sam' THEN 0 ELSE 1 END, id",
+        )?;
+        let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+            Ok(EmbeddedIdentityHiveCandidate {
+                entry_id: row.get(0)?,
+                source_job_id: row.get(1)?,
+                logical_path: row.get(2)?,
+                name: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut result = IdentityParseResult {
+        evidence_id,
+        hives_found: candidates.len(),
+        hives_parsed: 0,
+        local_accounts_indexed: 0,
+        user_profiles_indexed: 0,
+        browser_accounts_indexed: 0,
+        parse_errors: Vec::new(),
+    };
+    for candidate in &candidates {
+        match parse_one_identity_hive(case_path, evidence_id, candidate) {
+            Ok((accounts, profiles)) => {
+                result.hives_parsed += 1;
+                result.local_accounts_indexed += accounts;
+                result.user_profiles_indexed += profiles;
+            }
+            Err(err) => result.parse_errors.push(format!(
+                "{} (entry {}): {err:#}",
+                candidate.logical_path, candidate.entry_id
+            )),
+        }
+    }
+    result.browser_accounts_indexed = derive_browser_account_identities(case_path, evidence_id)?;
+    Ok(result)
+}
+
+fn derive_browser_account_identities(case_path: &Path, evidence_id: i64) -> Result<usize> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let source_rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, discovered_by_job_id, logical_path, metadata_json
+             FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.artifact_kind') = 'browser_login'
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.artifact_kind') = 'browser_account'",
+        params![case_id, evidence_id],
+    )?;
+    let mut seen = HashSet::new();
+    let mut indexed = 0_usize;
+    for (source_entry_id, source_job_id, source_path, metadata_text) in source_rows {
+        let source: serde_json::Value = serde_json::from_str(&metadata_text).unwrap_or_default();
+        let username = source["username"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(username) = username else { continue };
+        let host = source["host"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown service");
+        let browser_family = source["browser_family"].as_str().unwrap_or("browser");
+        let dedupe_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            browser_family.to_ascii_lowercase(),
+            host.to_ascii_lowercase(),
+            username.to_ascii_lowercase()
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        let display_name = format!("{username} @ {host}");
+        let logical_path = format!(
+            "/Parsed identities/Browser accounts/{}/{:08}-{}.record",
+            sanitize_logical_segment(browser_family),
+            source_entry_id,
+            sanitize_logical_segment(&display_name)
+        );
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_account",
+            "account_identifier": username,
+            "account_service": host,
+            "browser_family": browser_family,
+            "identity_source": "saved browser login metadata",
+            "identity_confidence": "high",
+            "date_created_utc": source["date_created_utc"],
+            "date_last_used_utc": source["date_last_used_utc"],
+            "times_used": source["times_used"],
+            "secrets_accessed": false,
+            "secret_scope_note": "username and service only; encrypted password value was not read",
+            "derived_from_entry_id": source_entry_id,
+            "source_artifact_path": source_path,
+        });
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            &logical_path,
+            &display_name,
+            "record",
+            None,
+            &metadata.to_string(),
+            source_job_id,
+        )?;
+        indexed += 1;
+    }
+    tx.commit()?;
+    Ok(indexed)
+}
+
+fn parse_one_identity_hive(
+    case_path: &Path,
+    evidence_id: i64,
+    candidate: &EmbeddedIdentityHiveCandidate,
+) -> Result<(usize, usize)> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging_path = std::env::temp_dir().join(format!(
+        "kdft-identity-hive-{}-{}-{}-{}",
+        std::process::id(),
+        candidate.entry_id,
+        nonce,
+        candidate.name
+    ));
+    recover_filesystem_entry(
+        case_path,
+        RecoverEntryOptions {
+            entry_id: candidate.entry_id,
+            output_path: staging_path.clone(),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "exporting embedded identity hive {}",
+            candidate.logical_path
+        )
+    })?;
+    let parsed = collect_registry_hive_import(&staging_path, &candidate.name, usize::MAX);
+    let _ = fs::remove_file(&staging_path);
+    let import = parsed?;
+
+    let hive_name = candidate.name.to_ascii_lowercase();
+    let mut derived = Vec::new();
+    if hive_name == "sam" {
+        for entry in &import.entries {
+            if entry.metadata["artifact_kind"] != "registry_key" {
+                continue;
+            }
+            let key_path = entry.metadata["registry_key_path"]
+                .as_str()
+                .unwrap_or("")
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if !key_path.contains("/domains/account/users/names/") {
+                continue;
+            }
+            let username = entry.display_name.trim();
+            if username.is_empty() || username.eq_ignore_ascii_case("names") {
+                continue;
+            }
+            let logical_path = format!(
+                "/Parsed identities/Windows local accounts/{:08}-{}.record",
+                candidate.entry_id,
+                sanitize_logical_segment(username)
+            );
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "windows_local_account",
+                "account_name": username,
+                "account_scope": "local Windows account",
+                "identity_source": "SAM\\Domains\\Account\\Users\\Names",
+                "registry_key_path": entry.metadata["registry_key_path"],
+                "registry_key_last_write_utc": entry.metadata["registry_key_last_write_utc"],
+                "artifact_time_utc": entry.metadata["registry_key_last_write_utc"],
+                "identity_confidence": "high",
+                "secrets_accessed": false,
+                "secret_scope_note": "identity metadata only; password hashes and credential material were not read",
+                "derived_from_entry_id": candidate.entry_id,
+                "source_artifact_path": candidate.logical_path,
+                "identity_parser": REGISTRY_PARSER_NAME,
+            });
+            add_entry_category(&mut metadata, &logical_path, username, "record");
+            derived.push(DerivedIdentityEntry {
+                logical_path,
+                display_name: username.to_string(),
+                metadata,
+            });
+        }
+    } else if hive_name == "software" {
+        for entry in &import.entries {
+            if entry.metadata["artifact_kind"] != "registry_value"
+                || !entry.display_name.eq_ignore_ascii_case("ProfileImagePath")
+            {
+                continue;
+            }
+            let key_path = entry.metadata["registry_key_path"]
+                .as_str()
+                .unwrap_or("")
+                .replace('\\', "/");
+            let key_path_lower = key_path.to_ascii_lowercase();
+            if !key_path_lower.contains("/microsoft/windows nt/currentversion/profilelist/") {
+                continue;
+            }
+            let sid = key_path.rsplit('/').next().unwrap_or("").trim();
+            let profile_path = entry.metadata["registry_value_data"]
+                .as_str()
+                .unwrap_or("")
+                .trim();
+            if sid.is_empty() || profile_path.is_empty() {
+                continue;
+            }
+            let profile_name = profile_path
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            let display_name = if profile_name.is_empty() {
+                sid.to_string()
+            } else {
+                format!("{profile_name} ({sid})")
+            };
+            let logical_path = format!(
+                "/Parsed identities/Windows user profiles/{:08}-{}.record",
+                candidate.entry_id,
+                sanitize_logical_segment(sid)
+            );
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "windows_user_profile",
+                "profile_sid": sid,
+                "profile_path": profile_path,
+                "profile_name": profile_name,
+                "identity_source": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList",
+                "registry_key_path": entry.metadata["registry_key_path"],
+                "registry_key_last_write_utc": entry.metadata["registry_key_last_write_utc"],
+                "artifact_time_utc": entry.metadata["registry_key_last_write_utc"],
+                "identity_confidence": "high",
+                "secrets_accessed": false,
+                "secret_scope_note": "identity metadata only; credential material was not read",
+                "derived_from_entry_id": candidate.entry_id,
+                "source_artifact_path": candidate.logical_path,
+                "identity_parser": REGISTRY_PARSER_NAME,
+            });
+            add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+            derived.push(DerivedIdentityEntry {
+                logical_path,
+                display_name,
+                metadata,
+            });
+        }
+    }
+
+    let accounts = derived
+        .iter()
+        .filter(|entry| entry.metadata["artifact_kind"] == "windows_local_account")
+        .count();
+    let profiles = derived.len().saturating_sub(accounts);
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3
+           AND json_extract(metadata_json, '$.artifact_kind') IN ('windows_local_account','windows_user_profile')",
+        params![case_id, evidence_id, candidate.entry_id],
+    )?;
+    for entry in derived {
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            &entry.logical_path,
+            &entry.display_name,
+            "record",
+            None,
+            &entry.metadata.to_string(),
+            candidate.source_job_id,
+        )?;
+    }
+    tx.commit()?;
+    Ok((accounts, profiles))
+}
+
+#[derive(Debug)]
+struct EmbeddedMailboxCandidate {
+    entry_id: i64,
+    source_job_id: i64,
+    logical_path: String,
+    name: String,
+    email_format: String,
+}
+
+/// Parses allocated PST/OST files discovered inside an already-indexed image
+/// or folder. The source stream is exported read-only to a short-lived staging
+/// file because `outlook-pst` requires `Read + Seek`; derived records stay in
+/// the original evidence and retain the exact source entry/path provenance.
+pub fn parse_embedded_mailboxes(
+    case_path: &Path,
+    evidence_id: i64,
+    max_messages_per_mailbox: usize,
+) -> Result<EmbeddedMailboxParseResult> {
+    let candidates = {
+        let conn = open_existing_case(case_path)?;
+        let case_id = active_case_id(&conn)?;
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, discovered_by_job_id, logical_path, name,
+                    COALESCE(json_extract(metadata_json, '$.email_format'), '')
+             FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+               AND is_deleted = 0
+               AND json_extract(metadata_json, '$.artifact_kind') = 'email_store'
+               AND lower(COALESCE(json_extract(metadata_json, '$.email_format'), '')) IN ('pst','ost')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![case_id, evidence_id], |row| {
+            Ok(EmbeddedMailboxCandidate {
+                entry_id: row.get(0)?,
+                source_job_id: row.get(1)?,
+                logical_path: row.get(2)?,
+                name: row.get(3)?,
+                email_format: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut result = EmbeddedMailboxParseResult {
+        evidence_id,
+        mailboxes_found: candidates.len(),
+        mailboxes_parsed: 0,
+        messages_indexed: 0,
+        entries_indexed: 0,
+        parse_errors: Vec::new(),
+    };
+    let max_messages = unlimited_if_zero(max_messages_per_mailbox);
+    for candidate in candidates {
+        match parse_one_embedded_mailbox(case_path, evidence_id, &candidate, max_messages) {
+            Ok(import) => {
+                result.mailboxes_parsed += 1;
+                result.messages_indexed += import.messages_indexed;
+                result.entries_indexed += import.entries.len();
+            }
+            Err(err) => result.parse_errors.push(format!(
+                "{} (entry {}): {err:#}",
+                candidate.logical_path, candidate.entry_id
+            )),
+        }
+    }
+    Ok(result)
+}
+
+fn parse_one_embedded_mailbox(
+    case_path: &Path,
+    evidence_id: i64,
+    candidate: &EmbeddedMailboxCandidate,
+    max_messages: usize,
+) -> Result<MailboxImportData> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging_path = std::env::temp_dir().join(format!(
+        "kdft-mailbox-{}-{}-{}.{}",
+        std::process::id(),
+        candidate.entry_id,
+        nonce,
+        candidate.email_format
+    ));
+    recover_filesystem_entry(
+        case_path,
+        RecoverEntryOptions {
+            entry_id: candidate.entry_id,
+            output_path: staging_path.clone(),
+        },
+    )
+    .with_context(|| format!("exporting embedded mailbox {}", candidate.logical_path))?;
+
+    let parsed = (|| -> Result<MailboxImportData> {
+        let header = detect_pst_header(&staging_path)?;
+        if matches!(header.kind, PstHeaderKind::Unsupported) {
+            bail!(
+                "unsupported PST/OST: {}",
+                header.reason.as_deref().unwrap_or("unrecognized header")
+            );
+        }
+        collect_pst_mailbox_import(
+            &staging_path,
+            &candidate.email_format,
+            max_messages,
+            header.kind,
+        )
+    })();
+    let _ = fs::remove_file(&staging_path);
+    let mut import = parsed?;
+
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let prefix = format!(
+        "/Parsed mailboxes/{:08}-{}",
+        candidate.entry_id,
+        sanitize_logical_segment(&candidate.name)
+    );
+    tx.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3",
+        params![case_id, evidence_id, candidate.entry_id],
+    )?;
+    for entry in &mut import.entries {
+        entry.logical_path = format!("{prefix}{}", entry.logical_path);
+        if let Some(object) = entry.metadata.as_object_mut() {
+            object.insert(
+                "derived_from_entry_id".to_string(),
+                serde_json::json!(candidate.entry_id),
+            );
+            object.insert(
+                "source_artifact_path".to_string(),
+                serde_json::json!(candidate.logical_path),
+            );
+            object.insert(
+                "embedded_evidence_id".to_string(),
+                serde_json::json!(evidence_id),
+            );
+            object.insert(
+                "pst_variant_dispatch".to_string(),
+                serde_json::json!("embedded mailbox post-index pass"),
+            );
+        }
+        add_entry_category(
+            &mut entry.metadata,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+        );
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            &entry.logical_path,
+            &entry.display_name,
+            entry.entry_kind,
+            entry.size_bytes,
+            &entry.metadata.to_string(),
+            candidate.source_job_id,
+        )?;
+    }
+    tx.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_set(metadata_json,
+             '$.email_parser', ?1,
+             '$.email_parser_status', 'parsed',
+             '$.pst_messages_indexed', ?2,
+             '$.pst_folders_indexed', ?3,
+             '$.pst_derived_root', ?4)
+         WHERE case_id = ?5 AND evidence_id = ?6 AND id = ?7",
+        params![
+            PST_PARSER_NAME,
+            i64::try_from(import.messages_indexed).unwrap_or(i64::MAX),
+            i64::try_from(import.folders_indexed).unwrap_or(i64::MAX),
+            prefix,
+            case_id,
+            evidence_id,
+            candidate.entry_id
+        ],
+    )?;
+    tx.commit()?;
+    Ok(import)
 }
 
 /// Detects browser profiles among an evidence's INDEXED entries by their
@@ -9794,6 +10341,33 @@ fn classify_entry(
                 &["email", "mailbox", "store"],
             );
         }
+        "windows_local_account" => {
+            return category(
+                "Accounts and Identity",
+                "Local and domain accounts",
+                "Windows local account recovered from the SAM account-name index",
+                "high",
+                &["accounts", "identity", "windows", "sam"],
+            );
+        }
+        "windows_user_profile" => {
+            return category(
+                "Accounts and Identity",
+                "User profiles",
+                "Windows SID-to-profile mapping recovered from SOFTWARE ProfileList",
+                "high",
+                &["accounts", "identity", "windows", "profile"],
+            );
+        }
+        "browser_account" => {
+            return category(
+                "Accounts and Identity",
+                "Browser and web accounts",
+                "Account identifier recovered from saved browser login metadata",
+                "high",
+                &["accounts", "identity", "browser", "web"],
+            );
+        }
         "registry_hive" | "registry_key" | "registry_value" => {
             return category(
                 "Operating System",
@@ -9869,6 +10443,21 @@ fn classify_entry(
     let filename = entry_filename_lower(logical_path, name);
     let combined = normalized_entry_full_path(&normalized_path, &filename);
     let ext = extension_lower(&filename).or_else(|| extension_lower(&normalized_path));
+
+    // Tencent QQ games use .img for proprietary DIMG graphic/resource
+    // containers. Recognize the application context before the broad OS-root
+    // rule classifies everything under Program Files as a system file.
+    if ext.as_deref() == Some("img")
+        && contains_any(&combined, &["/tencent/", "/qq_games/", "/qqgames/"])
+    {
+        return category(
+            "Pictures and Media",
+            "Graphics and design",
+            "Tencent QQ DIMG graphic/resource container",
+            "medium",
+            &["graphics", "application-resource", "tencent-dimg"],
+        );
+    }
 
     if let Some(category) =
         precise_forensic_artifact_category(&combined, &filename, ext.as_deref(), entry_kind)
@@ -10694,6 +11283,38 @@ fn is_registry_hive_candidate(logical_path: &str, name: &str) -> bool {
 
 fn is_registry_hive_evidence_candidate(path: &Path, display_name: &str) -> bool {
     registry_hive_candidate(path.to_string_lossy().as_ref(), display_name, true)
+}
+
+fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool {
+    let is_named_mft = [
+        display_name,
+        path.file_name().and_then(|v| v.to_str()).unwrap_or(""),
+    ]
+    .iter()
+    .any(|name| {
+        let name = name.to_ascii_lowercase();
+        name == "$mft"
+            || name == "mft"
+            || name.ends_with("-$mft")
+            || name.ends_with("_$mft")
+            || name.ends_with(".mft")
+    });
+    if !is_named_mft {
+        return false;
+    }
+    let mut header = [0_u8; 32];
+    if fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_err()
+        || &header[0..4] != b"FILE"
+    {
+        return false;
+    }
+    let first_attribute_offset = u16::from_le_bytes([header[20], header[21]]);
+    let record_size = u32::from_le_bytes(header[28..32].try_into().unwrap_or_default());
+    matches!(record_size, 1024 | 2048 | 4096)
+        && usize::from(first_attribute_offset) >= 48
+        && usize::from(first_attribute_offset) < record_size as usize
 }
 
 fn registry_hive_candidate(
@@ -12311,9 +12932,7 @@ fn detect_pst_header(path: &Path) -> Result<PstHeaderStatus> {
     } else if version > 0 {
         Ok(PstHeaderStatus {
             kind: PstHeaderKind::Ansi { version },
-            reason: Some(format!(
-                "ANSI PST/OST header detected (wVer {version}); this slice supports Unicode PST/OST only"
-            )),
+            reason: None,
         })
     } else {
         Ok(PstHeaderStatus {
@@ -12343,9 +12962,7 @@ fn process_pst_mailbox_evidence(
         .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
         .unwrap_or_else(|| "pst".to_string());
     let header = detect_pst_header(&path)?;
-    if header.kind != (PstHeaderKind::Unicode { version: 23 })
-        && !matches!(header.kind, PstHeaderKind::Unicode { .. })
-    {
+    if matches!(header.kind, PstHeaderKind::Unsupported) {
         let reason = header
             .reason
             .unwrap_or_else(|| "unsupported PST/OST variant".to_string());
@@ -12361,7 +12978,7 @@ fn process_pst_mailbox_evidence(
         );
     }
 
-    match collect_pst_mailbox_import(&path, &email_format, max_messages) {
+    match collect_pst_mailbox_import(&path, &email_format, max_messages, header.kind) {
         Ok(import_data) => persist_pst_mailbox_import(conn, case_id, evidence, job_id, import_data),
         Err(err) => persist_unsupported_mailbox_status(
             conn,
@@ -12371,9 +12988,7 @@ fn process_pst_mailbox_evidence(
             metadata.len(),
             &email_format,
             &header.kind,
-            &format!(
-                "Unicode PST/OST was detected, but the mailbox parser could not read it: {err}"
-            ),
+            &format!("PST/OST was detected, but the mailbox parser could not read it: {err}"),
         ),
     }
 }
@@ -12400,8 +13015,8 @@ fn persist_unsupported_mailbox_status(
         "email_parser_status": "unsupported",
         "email_parser_error": reason,
         "pst_parser_scope": pst_parser_scope_text(),
-        "pst_deleted_recovery": "not attempted",
-        "pst_attachment_content_extraction": "not attempted",
+        "pst_deleted_recovery": "folder-visible Deleted Items are included; orphaned/deallocated PST node recovery is not attempted",
+        "pst_attachment_content_extraction": "attachment names and counts are parsed; attachment payload bytes are not extracted",
     });
     if let Some(object) = metadata.as_object_mut() {
         match header_kind {
@@ -12490,14 +13105,24 @@ fn collect_pst_mailbox_import(
     path: &Path,
     email_format: &str,
     max_messages: usize,
+    header_kind: PstHeaderKind,
 ) -> Result<MailboxImportData> {
     let file = fs::File::open(path)
         .with_context(|| format!("opening PST/OST read-only {}", path.display()))?;
-    let pst_file = outlook_pst::UnicodePstFile::read_from(Box::new(file))
-        .with_context(|| format!("reading Unicode PST/OST {}", path.display()))?;
-    let store: Rc<dyn PstStore> =
-        outlook_pst::messaging::store::UnicodeStore::read(Rc::new(pst_file))
-            .context("opening PST/OST message store")?;
+    let store: Rc<dyn PstStore> = match header_kind {
+        PstHeaderKind::Unicode { .. } => {
+            let pst_file = outlook_pst::UnicodePstFile::read_from(Box::new(file))
+                .with_context(|| format!("reading Unicode PST/OST {}", path.display()))?;
+            PstUnicodeStore::read(Rc::new(pst_file))
+                .context("opening Unicode PST/OST message store")?
+        }
+        PstHeaderKind::Ansi { .. } => {
+            let pst_file = outlook_pst::AnsiPstFile::read_from(Box::new(file))
+                .with_context(|| format!("reading ANSI PST/OST {}", path.display()))?;
+            PstAnsiStore::read(Rc::new(pst_file)).context("opening ANSI PST/OST message store")?
+        }
+        PstHeaderKind::Unsupported => bail!("unsupported PST/OST header"),
+    };
     let store_display_name = store.properties().display_name().ok();
     let mut collector = PstImportCollector {
         entries: Vec::new(),
@@ -12550,8 +13175,8 @@ impl PstImportCollector {
             "email_parser": PST_PARSER_NAME,
             "email_parser_status": "parsed",
             "pst_parser_scope": pst_parser_scope_text(),
-            "pst_deleted_recovery": "not attempted",
-            "pst_attachment_content_extraction": "not attempted",
+            "pst_deleted_recovery": "folder-visible Deleted Items are included; orphaned/deallocated PST node recovery is not attempted",
+            "pst_attachment_content_extraction": "attachment names and counts are parsed; attachment payload bytes are not extracted",
             "source_artifact_path": self.source_path.as_str(),
         });
         if let Some(object) = metadata.as_object_mut() {
@@ -12800,8 +13425,8 @@ fn pst_message_metadata(
         "pst_plain_text_body_supported": true,
         "pst_body_html_present": message.properties().get(0x1013).is_some(),
         "pst_body_rtf_present": message.properties().get(0x1009).is_some(),
-        "pst_attachment_content_extraction": "not attempted",
-        "pst_deleted_recovery": "not attempted",
+        "pst_attachment_content_extraction": "attachment names and counts are parsed; attachment payload bytes are not extracted",
+        "pst_deleted_recovery": "folder-visible Deleted Items are included; orphaned/deallocated PST node recovery is not attempted",
         "source_artifact_path": source_path,
     });
     if let Some(object) = metadata.as_object_mut() {
@@ -12883,7 +13508,7 @@ fn pst_message_error_metadata(
 }
 
 fn pst_parser_scope_text() -> &'static str {
-    "Unicode PST/OST folder and message metadata, display recipients, plain-text body preview, and attachment names only; ANSI PST, HTML/RTF rendering, attachment content extraction, and PST deleted-item recovery are deferred"
+    "ANSI and Unicode PST/OST folder and message metadata, display recipients, plain-text body preview, and attachment names/counts; HTML/RTF rendering, attachment payload extraction, and orphaned/deallocated PST node recovery are deferred"
 }
 
 fn pst_message_string(message: &dyn PstMessage, prop_id: u16) -> Option<String> {
@@ -13854,6 +14479,9 @@ fn process_file_evidence(
     if !metadata.is_file() {
         bail!("file evidence path is no longer a file: {}", path.display());
     }
+    if is_standalone_mft_evidence_candidate(&path, &evidence.display_name) {
+        return process_standalone_mft_evidence(conn, case_id, evidence, job_id, max_entries);
+    }
     if is_registry_hive_evidence_candidate(&path, &evidence.display_name) {
         return process_registry_hive_evidence(conn, case_id, evidence, job_id, max_entries);
     }
@@ -13899,6 +14527,173 @@ fn process_file_evidence(
         content_head.as_deref(),
     )?;
     Ok((1, false))
+}
+
+fn process_standalone_mft_evidence(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    max_entries: usize,
+) -> Result<(usize, bool)> {
+    let path = PathBuf::from(&evidence.source_path);
+    let mut parser = mft::MftParser::from_path(&path)
+        .with_context(|| format!("opening standalone MFT {}", path.display()))?;
+    let record_count = parser.get_entry_count();
+    let limit = record_count.min(max_entries as u64);
+    let mut indexed = 0_usize;
+    for record_number in 0..limit {
+        let Ok(entry) = parser.get_entry(record_number) else {
+            continue;
+        };
+        if !entry.header.is_valid() {
+            continue;
+        }
+        let in_use = entry.is_allocated();
+        let is_directory = entry.is_dir();
+        let sequence_number = entry.header.sequence;
+        let best_name = entry.find_best_name_attribute();
+        let name = best_name
+            .as_ref()
+            .map(|attr| attr.name.clone())
+            .unwrap_or_else(|| format!("MFT record {record_number}"));
+        let entry_kind = if is_directory { "directory" } else { "file" };
+        let reconstructed = parser.get_full_path_for_entry(&entry).ok().flatten();
+        let parent_status = if let Some(file_name) = best_name.as_ref() {
+            match parser.get_entry(file_name.parent.entry) {
+                Ok(parent) if parent.header.sequence == file_name.parent.sequence => "resolved",
+                Ok(_) => "parent sequence mismatch",
+                Err(_) => "missing parent",
+            }
+        } else {
+            "missing file name"
+        };
+        let reconstructed_text = reconstructed
+            .as_ref()
+            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let logical_path = reconstructed_text
+            .as_ref()
+            .filter(|value| !value.is_empty() && parent_status == "resolved")
+            .map(|value| {
+                format!(
+                    "/Reconstructed filesystem/{}",
+                    value.trim_start_matches('/')
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "/{}/{}-{}",
+                    if in_use {
+                        "Orphaned records"
+                    } else {
+                        "Deleted records"
+                    },
+                    record_number,
+                    sanitize_logical_segment(&name)
+                )
+            });
+        let attributes = entry
+            .iter_attributes()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        let standard = attributes
+            .iter()
+            .find_map(|attribute| attribute.data.clone().into_standard_info());
+        let data_attributes = attributes
+            .iter()
+            .filter(|attribute| {
+                attribute.header.type_code == mft::attribute::MftAttributeType::DATA
+            })
+            .collect::<Vec<_>>();
+        let default_data = data_attributes
+            .iter()
+            .find(|attribute| attribute.header.name.is_empty());
+        let (data_size, allocated_size, data_resident) = default_data
+            .map(|attribute| match &attribute.header.residential_header {
+                mft::attribute::header::ResidentialHeader::Resident(header) => (
+                    u64::from(header.data_size),
+                    u64::from(header.data_size),
+                    true,
+                ),
+                mft::attribute::header::ResidentialHeader::NonResident(header) => {
+                    (header.file_size, header.allocated_length, false)
+                }
+            })
+            .unwrap_or((
+                best_name.as_ref().map(|v| v.logical_size).unwrap_or(0),
+                best_name.as_ref().map(|v| v.physical_size).unwrap_or(0),
+                false,
+            ));
+        let alternate_data_streams = data_attributes
+            .iter()
+            .filter(|attribute| !attribute.header.name.is_empty())
+            .map(|attribute| serde_json::json!({
+                "name": attribute.header.name,
+                "resident": matches!(attribute.header.residential_header, mft::attribute::header::ResidentialHeader::Resident(_)),
+            }))
+            .collect::<Vec<_>>();
+        let record_size = u64::from(entry.header.total_entry_size);
+        let metadata = serde_json::json!({
+            "artifact_kind": if in_use { "ntfs_mft_record" } else { "deleted_file_record" },
+            "filesystem_parser": "mft crate 0.7.0",
+            "virtual_filesystem": "standalone_mft_reconstruction",
+            "source_path_exact": evidence.display_name,
+            "ntfs_file_record_number": record_number,
+            "ntfs_parent_record_number": best_name.as_ref().map(|v| v.parent.entry),
+            "ntfs_parent_sequence_number": best_name.as_ref().map(|v| v.parent.sequence),
+            "ntfs_sequence_number": sequence_number,
+            "ntfs_hard_link_count": entry.header.hard_link_count,
+            "mft_record_logical_offset": record_number * record_size,
+            "mft_record_physical_offset": record_number * record_size,
+            "mft_record_size": record_size,
+            "mft_fixup_valid": entry.valid_fixup,
+            "mft_path_reconstruction_status": parent_status,
+            "mft_reconstructed_path": reconstructed_text,
+            "ntfs_allocated_size": allocated_size,
+            "ntfs_data_size": data_size,
+            "ntfs_default_data_resident": data_resident,
+            "ntfs_alternate_data_streams": alternate_data_streams,
+            "ntfs_standard_creation_time_utc": standard.as_ref().map(|v| v.created.to_string()),
+            "ntfs_standard_modification_time_utc": standard.as_ref().map(|v| v.modified.to_string()),
+            "ntfs_standard_mft_record_modification_time_utc": standard.as_ref().map(|v| v.mft_modified.to_string()),
+            "ntfs_standard_access_time_utc": standard.as_ref().map(|v| v.accessed.to_string()),
+            "ntfs_creation_time_utc": best_name.as_ref().map(|v| v.created.to_string()),
+            "ntfs_modification_time_utc": best_name.as_ref().map(|v| v.modified.to_string()),
+            "ntfs_mft_record_modification_time_utc": best_name.as_ref().map(|v| v.mft_modified.to_string()),
+            "ntfs_access_time_utc": best_name.as_ref().map(|v| v.accessed.to_string()),
+            "ntfs_filename_namespace": best_name.as_ref().map(|v| format!("{:?}", v.namespace)),
+            "recovery_source": if in_use { serde_json::Value::Null } else { serde_json::json!("standalone_ntfs_mft") },
+        });
+        let size = (!is_directory).then(|| i64::try_from(data_size).unwrap_or(i64::MAX));
+        if in_use {
+            upsert_filesystem_entry(
+                conn,
+                case_id,
+                evidence.id,
+                &logical_path,
+                &name,
+                entry_kind,
+                size,
+                &metadata.to_string(),
+                job_id,
+            )?;
+        } else {
+            upsert_deleted_filesystem_entry_with_content(
+                conn,
+                case_id,
+                evidence.id,
+                &logical_path,
+                &name,
+                entry_kind,
+                size,
+                &metadata.to_string(),
+                job_id,
+                None,
+            )?;
+        }
+        indexed += 1;
+    }
+    Ok((indexed, record_count > limit))
 }
 
 fn process_folder_evidence(
@@ -19623,7 +20418,7 @@ fn process_ntfs_partition_entries(
         }
     }
 
-    let mut truncated = walk_ntfs_volume(
+    let walk_result = walk_ntfs_volume(
         conn,
         case_id,
         evidence_id,
@@ -19638,7 +20433,15 @@ fn process_ntfs_partition_entries(
         size_bytes,
         indexed,
         max_entries,
-    )?;
+    );
+    let mut truncated = match walk_result {
+        Ok(value) => value,
+        Err(error) => {
+            enrich_ntfs_entries_with_shared_mft_parser(conn, evidence_id, &ntfs, &mut slice)
+                .context("normalizing partial disk NTFS records through shared MFT parser")?;
+            return Err(error);
+        }
+    };
     if !truncated && *indexed < max_entries {
         truncated |= process_deleted_ntfs_mft_records(
             conn,
@@ -19655,6 +20458,8 @@ fn process_ntfs_partition_entries(
             max_entries,
         )?;
     }
+    enrich_ntfs_entries_with_shared_mft_parser(conn, evidence_id, &ntfs, &mut slice)
+        .context("normalizing disk NTFS records through shared MFT parser")?;
     Ok(truncated)
 }
 
@@ -20567,6 +21372,174 @@ fn ntfs_mft_record_count<T: Read + Seek>(ntfs: &ntfs::Ntfs, fs: &mut T) -> Optio
     let mft_size = ntfs_default_data_size(&mft, fs)?;
     let record_size = u64::from(ntfs.file_record_size()).max(1);
     Some(mft_size / record_size)
+}
+
+fn mft_crate_record_summary(entry: &mft::MftEntry) -> serde_json::Value {
+    let attributes = entry
+        .iter_attributes()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let standard = attributes
+        .iter()
+        .find_map(|attribute| attribute.data.clone().into_standard_info());
+    let names = attributes
+        .iter()
+        .filter_map(|attribute| attribute.data.clone().into_file_name())
+        .map(|name| {
+            serde_json::json!({
+                "name": name.name,
+                "namespace": format!("{:?}", name.namespace),
+                "parent_record": name.parent.entry,
+                "parent_sequence": name.parent.sequence,
+                "logical_size": name.logical_size,
+                "physical_size": name.physical_size,
+                "created_utc": name.created.to_string(),
+                "modified_utc": name.modified.to_string(),
+                "mft_modified_utc": name.mft_modified.to_string(),
+                "accessed_utc": name.accessed.to_string(),
+                "flags": name.flags.bits(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let streams = attributes
+        .iter()
+        .filter(|attribute| attribute.header.type_code == mft::attribute::MftAttributeType::DATA)
+        .map(|attribute| match &attribute.header.residential_header {
+            mft::attribute::header::ResidentialHeader::Resident(header) => serde_json::json!({
+                "name": attribute.header.name,
+                "resident": true,
+                "size": header.data_size,
+            }),
+            mft::attribute::header::ResidentialHeader::NonResident(header) => serde_json::json!({
+                "name": attribute.header.name,
+                "resident": false,
+                "size": header.file_size,
+                "allocated_size": header.allocated_length,
+                "valid_data_size": header.valid_data_length,
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "parser": "mft crate 0.7.0",
+        "record_number": entry.header.record_number,
+        "sequence_number": entry.header.sequence,
+        "allocated": entry.is_allocated(),
+        "directory": entry.is_dir(),
+        "hard_link_count": entry.header.hard_link_count,
+        "base_record_number": entry.header.base_reference.entry,
+        "base_record_sequence": entry.header.base_reference.sequence,
+        "fixup_valid": entry.valid_fixup,
+        "used_record_bytes": entry.header.used_entry_size,
+        "record_size": entry.header.total_entry_size,
+        "standard_information": standard.map(|value| serde_json::json!({
+            "created_utc": value.created.to_string(),
+            "modified_utc": value.modified.to_string(),
+            "mft_modified_utc": value.mft_modified.to_string(),
+            "accessed_utc": value.accessed.to_string(),
+            "flags": value.file_flags.bits(),
+            "owner_id": value.owner_id,
+            "security_id": value.security_id,
+            "quota": value.quota,
+            "usn": value.usn,
+        })),
+        "file_names": names,
+        "data_streams": streams,
+    })
+}
+
+fn temp_mft_copy_path() -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_micros())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("kdft-mft-{}-{stamp}.bin", std::process::id()))
+}
+
+fn copy_ntfs_mft_stream_to_temp<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+) -> Result<TempFileGuard> {
+    let mft_file = ntfs
+        .file(fs, ntfs::KnownNtfsFileRecordNumber::MFT as u64)
+        .context("opening NTFS $MFT record")?;
+    let data = mft_file
+        .data(fs, "")
+        .context("opening NTFS $MFT data stream")?
+        .context("NTFS $MFT has no unnamed data stream")?;
+    let attribute = data
+        .to_attribute()
+        .context("opening NTFS $MFT data attribute")?;
+    let value = attribute
+        .value(fs)
+        .context("opening NTFS $MFT stream value")?;
+    let mut reader = value.attach(fs);
+    let path = temp_mft_copy_path();
+    let mut output = fs::File::create(&path)
+        .with_context(|| format!("creating temporary MFT stream {}", path.display()))?;
+    io::copy(&mut reader, &mut output)
+        .with_context(|| format!("copying NTFS $MFT stream to {}", path.display()))?;
+    output.flush()?;
+    Ok(TempFileGuard::new(path))
+}
+
+fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
+    conn: &Connection,
+    evidence_id: i64,
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+) -> Result<()> {
+    let guard = copy_ntfs_mft_stream_to_temp(ntfs, fs)?;
+    let mut parser = mft::MftParser::from_path(&guard.path).with_context(|| {
+        format!(
+            "parsing extracted NTFS $MFT stream {}",
+            guard.path.display()
+        )
+    })?;
+    let mut statement = conn.prepare(
+        "SELECT id, metadata_json FROM filesystem_entries
+         WHERE evidence_id = ?1",
+    )?;
+    let rows = statement
+        .query_map(params![evidence_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut summaries = HashMap::<u64, serde_json::Value>::new();
+    for (entry_id, metadata_text) in rows {
+        let mut metadata: serde_json::Value = serde_json::from_str(&metadata_text)?;
+        let Some(record_number) = metadata["ntfs_file_record_number"].as_u64() else {
+            continue;
+        };
+        let parser_error = if !summaries.contains_key(&record_number) {
+            match parser.get_entry(record_number) {
+                Ok(entry) => {
+                    summaries.insert(record_number, mft_crate_record_summary(&entry));
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            }
+        } else {
+            None
+        };
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "mft_metadata_parser".to_string(),
+                serde_json::json!("mft crate 0.7.0"),
+            );
+            if let Some(summary) = summaries.get(&record_number) {
+                object.insert("mft_parser_record".to_string(), summary.clone());
+            }
+            if let Some(error) = parser_error {
+                object.insert("mft_parser_error".to_string(), serde_json::json!(error));
+            }
+        }
+        conn.execute(
+            "UPDATE filesystem_entries SET metadata_json = ?1 WHERE id = ?2",
+            params![metadata.to_string(), entry_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn ntfs_mft_record_logical_offset(ntfs: &ntfs::Ntfs, file_record_number: u64) -> Option<u64> {
@@ -22049,6 +23022,14 @@ struct FileSignature {
 /// Curated file-signature table covering forensically common types. Ordered most-specific first so
 /// that container formats (ZIP, OLE, ISO-BMFF) that share prefixes resolve deterministically.
 const FILE_SIGNATURES: &[FileSignature] = &[
+    FileSignature {
+        label: "Tencent QQ DIMG",
+        description: "Tencent QQ game graphic/resource container",
+        offset: 0,
+        magic: b"QQF\x1aDIMG",
+        extensions: &["img"],
+        category: "Pictures and Media",
+    },
     FileSignature {
         label: "JPEG",
         description: "JPEG image",
@@ -26601,7 +27582,7 @@ mod tests {
         fs::write(&ansi_path, &ansi_header)?;
         let ansi_status = detect_pst_header(&ansi_path)?;
         assert_eq!(ansi_status.kind, PstHeaderKind::Ansi { version: 14 });
-        assert!(ansi_status.reason.unwrap_or_default().contains("ANSI"));
+        assert!(ansi_status.reason.is_none());
 
         let wrong_magic_path = dir.join("wrong-magic.pst");
         fs::write(&wrong_magic_path, b"NOTAPSTFILE!")?;
@@ -26801,6 +27782,128 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, bytes)?;
         Ok(path)
+    }
+
+    #[test]
+    fn standalone_usrclass_dat_dispatches_to_registry_parser() -> Result<()> {
+        let case_path = unique_case_path("registry-usrclass-single-file");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("registry-usrclass-single-file-source");
+        let path = write_registry_fixture(&dir, "USRCLASS.DAT", b"NOT-A-REGISTRY-HIVE")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].metadata_json["artifact_kind"], "registry_hive");
+        assert_eq!(
+            entries[0].metadata_json["registry_parser_status"],
+            "unsupported"
+        );
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    fn synthetic_mft_record(record_number: u32, name: &str, in_use: bool) -> Vec<u8> {
+        let mut record = vec![0_u8; 1024];
+        record[0..4].copy_from_slice(b"FILE");
+        record[4..6].copy_from_slice(&48_u16.to_le_bytes());
+        record[6..8].copy_from_slice(&3_u16.to_le_bytes());
+        record[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        record[20..22].copy_from_slice(&56_u16.to_le_bytes());
+        record[22..24].copy_from_slice(&(if in_use { 1_u16 } else { 0 }).to_le_bytes());
+        record[24..28].copy_from_slice(&256_u32.to_le_bytes());
+        record[28..32].copy_from_slice(&1024_u32.to_le_bytes());
+        record[44..48].copy_from_slice(&record_number.to_le_bytes());
+        record[48..50].copy_from_slice(&0xAAAA_u16.to_le_bytes());
+        record[50..52].copy_from_slice(&0_u16.to_le_bytes());
+        record[52..54].copy_from_slice(&0_u16.to_le_bytes());
+        record[510..512].copy_from_slice(&0xAAAA_u16.to_le_bytes());
+        record[1022..1024].copy_from_slice(&0xAAAA_u16.to_le_bytes());
+        let name_utf16 = name.encode_utf16().collect::<Vec<_>>();
+        let value_len = 66 + name_utf16.len() * 2;
+        let attr_len = (24 + value_len + 7) & !7;
+        let attr = 56;
+        record[attr..attr + 4].copy_from_slice(&0x30_u32.to_le_bytes());
+        record[attr + 4..attr + 8].copy_from_slice(&(attr_len as u32).to_le_bytes());
+        record[attr + 16..attr + 20].copy_from_slice(&(value_len as u32).to_le_bytes());
+        record[attr + 20..attr + 22].copy_from_slice(&24_u16.to_le_bytes());
+        let value = attr + 24;
+        record[value..value + 8].copy_from_slice(&5_u64.to_le_bytes());
+        record[value + 40..value + 48].copy_from_slice(&1234_u64.to_le_bytes());
+        record[value + 48..value + 56].copy_from_slice(&4096_u64.to_le_bytes());
+        record[value + 64] = name_utf16.len() as u8;
+        record[value + 65] = 1;
+        for (index, ch) in name_utf16.into_iter().enumerate() {
+            let start = value + 66 + index * 2;
+            record[start..start + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        record[attr + attr_len..attr + attr_len + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn standalone_mft_file_is_parsed_into_records() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-source");
+        // Export tools commonly prefix the NTFS metadata filename with a volume label.
+        let path = dir.join("live-vol1-$MFT");
+        let mut bytes = synthetic_mft_record(0, "$MFT", true);
+        bytes.extend(synthetic_mft_record(1, "deleted.txt", false));
+        fs::write(&path, bytes)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "$MFT" && !entry.is_deleted));
+        let deleted = entries
+            .iter()
+            .find(|entry| entry.name == "deleted.txt")
+            .unwrap();
+        assert!(deleted.is_deleted);
+        assert_eq!(deleted.size_bytes, Some(1234));
+        assert_eq!(
+            deleted.metadata_json["filesystem_parser"],
+            "mft crate 0.7.0"
+        );
+        assert_eq!(
+            deleted.metadata_json["virtual_filesystem"],
+            "standalone_mft_reconstruction"
+        );
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]
@@ -28284,6 +29387,16 @@ mod tests {
             "netwlan5.img",
         );
         assert_ne!(img_main, "Archives and Containers");
+        assert_eq!(
+            classify(
+                "/Volumes/001-part0/Program Files/Tencent/QQ_Games/QQ_Bubble_Arena/map/desert01.img",
+                "desert01.img"
+            ),
+            (
+                "Pictures and Media".to_string(),
+                "Graphics and design".to_string()
+            )
+        );
 
         // Real browser paths still classify as browser artifacts / cookies.
         assert_eq!(
@@ -30754,6 +31867,14 @@ mod tests {
         assert!(file.metadata_json["ntfs_file_record_number"]
             .as_u64()
             .is_some());
+        assert_eq!(
+            file.metadata_json["mft_metadata_parser"].as_str(),
+            Some("mft crate 0.7.0")
+        );
+        assert_eq!(
+            file.metadata_json["mft_parser_record"]["record_number"].as_u64(),
+            file.metadata_json["ntfs_file_record_number"].as_u64()
+        );
         let bytes = read_filesystem_entry_bytes(
             &case_path,
             ReadEntryBytesOptions {

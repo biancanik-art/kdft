@@ -3,13 +3,14 @@ resolver = "2"
 members = [
     "crates/bitlocker-decrypt",
     "crates/ext4-vendored",
+    "crates/ewf-vendored",
     "crates/kdft-case",
     "crates/kdft-cli",
     "crates/kdft-ui",
 ]
 
 [workspace.package]
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -25,6 +26,7 @@ evtx = { version = "0.12.2", default-features = false }
 # for why (upstream 0.9.0 rejects CSUM_SEED, which real-world modern ext4 filesystems set).
 ext4 = { path = "crates/ext4-vendored" }
 fatfs = { version = "0.3.6", default-features = false, features = ["alloc", "std"] }
+mft = "0.7.0"
 ntfs = "0.4.0"
 # notatin 1.0.1 declares `nom = ">= 6"` with no upper bound; without this pin Cargo resolves
 # nom 8, whose Parser/count/many0 API notatin 1.0.1's own source does not compile against
@@ -44,3 +46,9 @@ sha2 = "0.10"
 thiserror = "2"
 vdi = "0.2.0"
 zeroize = "1.8"
+
+[patch.crates-io]
+# Upstream 0.2.3 rejects valid >128 GiB E01 acquisitions because its global
+# chunk-count guard is only 4M. The vendored patch keeps bounded cumulative
+# allocation while supporting ordinary 500 GB / 1 TB forensic images.
+ewf = { path = "crates/ewf-vendored" }
